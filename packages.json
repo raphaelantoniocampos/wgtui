@@ -72,16 +72,7 @@
             "Foxit.FoxitReader"
         ]
     },
-    {
-        "package_manager": "Chocolatey",
-        "name": "Office 2019",
-        "package_name": [
-            "office2019proplus",
-            "--params",
-            "'/Language:pt-BR'"
-        ]
-    },
-    {
+        {
         "package_manager": "Winget",
         "name": "Office 365",
         "package_name": [
