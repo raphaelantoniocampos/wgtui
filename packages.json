@@ -1,0 +1,130 @@
+[
+    {
+        "package_manager": "Winget",
+        "name": "CPU-Z",
+        "package_name": [
+            "CPUID.CPU-Z"
+        ]
+    },
+    {
+        "package_manager": "Winget",
+        "name": "Anydesk",
+        "package_name": [
+            "Anydesk"
+        ]
+    },
+    {
+        "package_manager": "Winget",
+        "name": "RustDesk",
+        "package_name": [
+            "RustDesk.RustDesk"
+        ]
+    },
+    {
+        "package_manager": "Winget",
+        "name": "Google Chrome",
+        "package_name": [
+            "Google.Chrome"
+        ]
+    },
+    {
+        "package_manager": "Winget",
+        "name": "Driver Booster",
+        "package_name": [
+            "XPFG20V78LRMWG"
+        ]
+    },
+    {
+        "package_manager": "Winget",
+        "name": "Firefox",
+        "package_name": [
+            "Mozilla.Firefox.pt-BR"
+        ]
+    },
+    {
+        "package_manager": "Winget",
+        "name": "Java",
+        "package_name": [
+            "Java 8"
+        ]
+    },
+    {
+        "package_manager": "Winget",
+        "name": "Java x32",
+        "package_name": [
+            "--Force",
+            "Oracle.JavaRuntimeEnvironment",
+            "-a",
+            "x86"
+        ]
+    },
+    {
+        "package_manager": "Winget",
+        "name": "Winrar",
+        "package_name": [
+            "WinRAR"
+        ]
+    },
+    {
+        "package_manager": "Winget",
+        "name": "Foxit Reader",
+        "package_name": [
+            "Foxit.FoxitReader"
+        ]
+    },
+    {
+        "package_manager": "Chocolatey",
+        "name": "Office 2019",
+        "package_name": [
+            "office2019proplus",
+            "--params",
+            "'/Language:pt-BR'"
+        ]
+    },
+    {
+        "package_manager": "Winget",
+        "name": "Office 365",
+        "package_name": [
+            "Microsoft.Office"
+        ]
+    },
+    {
+        "package_manager": "Custom",
+        "name": "Ativar Office",
+        "package_name": [
+            "powershell",
+            "& ([ScriptBlock]::Create((irm https://get.activated.win)))",
+            "/K-Office"
+        ]
+    },
+    {
+        "package_manager": "Custom",
+        "name": "Ativar Windows",
+        "package_name": [
+            "powershell",
+            "& ([ScriptBlock]::Create((irm https://get.activated.win)))",
+            "/K-Windows"
+        ]
+    },
+    {
+        "package_manager": "Custom",
+        "name": "Ativar Windows+Office",
+        "package_name": [
+            "powershell",
+            "& ([ScriptBlock]::Create((irm https://get.activated.win)))",
+            "/K-WindowsOffice"
+        ]
+    },
+    {
+        "package_manager": "Custom",
+        "name": "Atualizar Todos",
+        "package_name": [
+            "winget",
+            "update",
+            "--all",
+            "--include-unknown",
+            "--accept-package-agreements",
+            "--accept-source-agreements"
+        ]
+    }
+]
