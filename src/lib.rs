@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use regex::Regex;
 
@@ -18,6 +18,7 @@ pub struct WingetPackage {
 pub fn check_winget() -> bool {
     Command::new("winget")
         .arg("--version")
+        .stdout(Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
 }
@@ -28,11 +29,7 @@ pub fn check_winget() -> bool {
 #[must_use]
 pub fn search_packages(query: &str) -> Vec<WingetPackage> {
     let output = Command::new("winget")
-        .args([
-            "search",
-            query,
-            "--accept-source-agreements",
-        ])
+        .args(["search", query, "--accept-source-agreements"])
         .output();
 
     match output {
@@ -106,7 +103,13 @@ pub fn show_package(id: &str) -> Result<String, String> {
 /// Uninstalls a package by its winget ID.
 pub fn uninstall_package(id: &str) -> Result<String, String> {
     let output = Command::new("winget")
-        .args(["uninstall", "--exact", id, "--silent", "--accept-source-agreements"])
+        .args([
+            "uninstall",
+            "--exact",
+            id,
+            "--silent",
+            "--accept-source-agreements",
+        ])
         .output()
         .map_err(|e| format!("Failed to run winget uninstall: {e}"))?;
 
@@ -252,7 +255,10 @@ fn parse_upgrade_table(output: &str) -> Vec<UpgradablePackage> {
                 id: parts[1].trim().to_string(),
                 installed_version: parts[2].trim().to_string(),
                 available_version: parts[3].trim().to_string(),
-                source: parts.get(4).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                source: parts
+                    .get(4)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
             });
         }
     }
@@ -300,8 +306,14 @@ fn parse_winget_table(output: &str) -> Vec<WingetPackage> {
             packages.push(WingetPackage {
                 name: parts[0].trim().to_string(),
                 id: parts[1].trim().to_string(),
-                version: parts.get(2).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
-                source: parts.get(3).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                version: parts
+                    .get(2)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                source: parts
+                    .get(3)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
             });
         }
     }
@@ -344,3 +356,4 @@ Google Chrome         Google.Chrome         134.0.6998.165    winget
         assert!(packages.is_empty());
     }
 }
+

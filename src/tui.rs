@@ -25,7 +25,7 @@ pub enum Tab {
 
 impl Tab {
     const ALL: [Tab; 3] = [Tab::Updates, Tab::Search, Tab::Installed];
-    const STATUS_BAR_STR: &str = " [Tab] change focus  [← ↑→ ↓] navigate  ";
+    const STATUS_BAR_STR: &str = " [Tab] change tabs  [← ↑→ ↓] navigate  [/] filter  ";
 
     fn next(self) -> Self {
         match self {
@@ -54,6 +54,7 @@ impl Tab {
 
 /// A message sent back from a background thread when a blocking winget command finishes.
 enum ActionResult {
+    SearchResults(Vec<WingetPackage>),
     UpgradeList(Vec<UpgradablePackage>),
     SetCommand { command: String, output: String },
     SetError { command: String, error: String },
@@ -161,6 +162,10 @@ impl App {
 
     fn handle_action_result(&mut self, action: ActionResult) {
         match action {
+            ActionResult::SearchResults(list) => {
+                self.search_results = list;
+                self.search_selected = 0;
+            }
             ActionResult::UpgradeList(list) => {
                 self.updates = list;
             }
@@ -259,7 +264,7 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Tab | KeyCode::BackTab => {
+            KeyCode::Char('/') => {
                 self.filter_focused = !self.filter_focused;
                 if !self.filter_focused {
                     self.clamp_selected();
@@ -283,13 +288,13 @@ impl App {
                 self.filter_focused = true;
                 self.clamp_selected();
             }
-            KeyCode::Left => {
+            KeyCode::Left | KeyCode::BackTab => {
                 self.tab = self.tab.prev();
                 self.filter_query.clear();
                 self.filter_focused = true;
                 self.clamp_selected();
             }
-            KeyCode::Right => {
+            KeyCode::Right | KeyCode::Tab => {
                 self.tab = self.tab.next();
                 self.filter_query.clear();
                 self.filter_focused = true;
@@ -331,9 +336,10 @@ impl App {
         } else {
             match key.code {
                 KeyCode::Up => {
-                    let n = self.filtered_search_results().len();
-                    if n > 0 && self.search_selected > 0 {
+                    if self.search_selected > 0 {
                         self.search_selected -= 1;
+                    } else {
+                        self.filter_focused = true;
                     }
                 }
                 KeyCode::Down => {
@@ -356,6 +362,10 @@ impl App {
     fn handle_updates_key(&mut self, key: KeyEvent) {
         if self.filter_focused {
             match key.code {
+                KeyCode::Down => {
+                    self.filter_focused = false;
+                    self.clamp_selected();
+                }
                 KeyCode::Char(c) => {
                     self.filter_query.push(c);
                 }
@@ -368,9 +378,10 @@ impl App {
         } else {
             match key.code {
                 KeyCode::Up => {
-                    let n = self.filtered_updates().len();
-                    if n > 0 {
-                        self.updates_selected = self.updates_selected.saturating_sub(1);
+                    if self.updates_selected > 0 {
+                        self.updates_selected -= 1;
+                    } else {
+                        self.filter_focused = true;
                     }
                 }
                 KeyCode::Down => {
@@ -399,6 +410,10 @@ impl App {
     fn handle_installed_key(&mut self, key: KeyEvent) {
         if self.filter_focused {
             match key.code {
+                KeyCode::Down => {
+                    self.filter_focused = false;
+                    self.clamp_selected();
+                }
                 KeyCode::Char(c) => {
                     self.filter_query.push(c);
                 }
@@ -410,9 +425,10 @@ impl App {
         } else {
             match key.code {
                 KeyCode::Up => {
-                    let n = self.filtered_installed().len();
-                    if n > 0 && self.installed_selected > 0 {
+                    if self.installed_selected > 0 {
                         self.installed_selected -= 1;
+                    } else {
+                        self.filter_focused = true;
                     }
                 }
                 KeyCode::Down => {
@@ -468,6 +484,7 @@ impl App {
             for pkg in &results {
                 output.push_str(&format!("{}  {}\n", pkg.name, pkg.id));
             }
+            let _ = tx.send(ActionResult::SearchResults(results));
             let _ = tx.send(ActionResult::SetCommand {
                 command: cmd,
                 output: output.trim().to_string(),
@@ -671,25 +688,7 @@ impl App {
     }
 
     fn render_tabs(&self, f: &mut Frame<'_>, area: Rect) {
-        let titles: Vec<Line> = Tab::ALL
-            .iter()
-            .map(|t| {
-                let selected = *t == self.tab;
-                let text = t.title();
-                if selected {
-                    Line::from(Span::styled(
-                        text,
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                } else {
-                    Line::from(Span::raw(text))
-                }
-            })
-            .collect();
-
+        let titles: Vec<&str> = Tab::ALL.iter().map(|t| t.title().trim()).collect();
         let tabs = Tabs::new(titles)
             .block(
                 Block::default()
@@ -703,7 +702,7 @@ impl App {
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )
-            .select(0);
+            .select(self.tab as usize);
         f.render_widget(tabs, area);
     }
 
@@ -751,16 +750,15 @@ impl App {
     }
 
     fn render_search_results(&self, f: &mut Frame<'_>, area: Rect) {
-        let filtered = self.filtered_search_results();
-        let items: Vec<ListItem> = if filtered.is_empty() {
-            let msg = if self.search_results.is_empty() {
-                "Type a query and press Enter to search"
-            } else {
-                "No results match the filter"
-            };
-            vec![ListItem::new(msg)]
+        let border_style = if !self.filter_focused {
+            Style::default().fg(Color::Cyan)
         } else {
-            filtered
+            Style::default().fg(Color::DarkGray)
+        };
+        let items: Vec<ListItem> = if self.search_results.is_empty() {
+            vec![ListItem::new("Type a query and press Enter to search")]
+        } else {
+            self.search_results
                 .iter()
                 .map(|pkg| {
                     let v = pkg.version.as_deref().unwrap_or("-");
@@ -769,9 +767,20 @@ impl App {
                 })
                 .collect()
         };
+        let count = self.search_results.len();
+        let title = if count > 0 {
+            format!(" Results ({} found) ", count)
+        } else {
+            " Results ".to_string()
+        };
 
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" Results "))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(border_style),
+            )
             .highlight_style(
                 Style::default()
                     .fg(Color::Black)
@@ -780,16 +789,23 @@ impl App {
             )
             .highlight_symbol("> ");
 
-        let mut state = ListState::default().with_selected(if filtered.is_empty() {
-            None
-        } else {
-            Some(self.search_selected)
-        });
+        let mut state = ListState::default().with_selected(
+            if self.search_results.is_empty() || self.filter_focused {
+                None
+            } else {
+                Some(self.search_selected)
+            },
+        );
         f.render_stateful_widget(list, area, &mut state);
     }
 
     fn render_updates_list(&self, f: &mut Frame<'_>, area: Rect) {
         let filtered = self.filtered_updates();
+        let border_style = if !self.filter_focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
         let count_info = if self.filter_query.is_empty() {
             format!(" Updates ({} available) ", self.updates.len())
         } else {
@@ -823,7 +839,8 @@ impl App {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(count_info.as_str()),
+                    .title(count_info.as_str())
+                    .border_style(border_style),
             )
             .highlight_style(
                 Style::default()
@@ -833,16 +850,22 @@ impl App {
             )
             .highlight_symbol("> ");
 
-        let mut state = ListState::default().with_selected(if filtered.is_empty() {
-            None
-        } else {
-            Some(self.updates_selected)
-        });
+        let mut state =
+            ListState::default().with_selected(if filtered.is_empty() || self.filter_focused {
+                None
+            } else {
+                Some(self.updates_selected)
+            });
         f.render_stateful_widget(list, area, &mut state);
     }
 
     fn render_installed_list(&self, f: &mut Frame<'_>, area: Rect) {
         let filtered = self.filtered_installed();
+        let border_style = if !self.filter_focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
         let count_info = if self.filter_query.is_empty() {
             format!(" Installed Packages ({} total) ", self.installed.len())
         } else {
@@ -874,7 +897,8 @@ impl App {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(count_info.as_str()),
+                    .title(count_info.as_str())
+                    .border_style(border_style),
             )
             .highlight_style(
                 Style::default()
@@ -884,11 +908,12 @@ impl App {
             )
             .highlight_symbol("> ");
 
-        let mut state = ListState::default().with_selected(if filtered.is_empty() {
-            None
-        } else {
-            Some(self.installed_selected)
-        });
+        let mut state =
+            ListState::default().with_selected(if filtered.is_empty() || self.filter_focused {
+                None
+            } else {
+                Some(self.installed_selected)
+            });
         f.render_stateful_widget(list, area, &mut state);
     }
 
