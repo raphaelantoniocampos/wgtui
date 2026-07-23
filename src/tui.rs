@@ -11,9 +11,8 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tab
 use ratatui::{Frame, Terminal};
 
 use wgtui::{
-    UpgradablePackage, WingetPackage, install_package, list_installed, list_upgradable,
-    search_packages, show_package, uninstall_package, upgrade_all_packages, upgrade_all_unknown,
-    upgrade_package,
+    UpgradablePackage, WingetPackage, list_installed, list_upgradable, search_packages,
+    show_package, uninstall_package, upgrade_all_packages, upgrade_all_unknown, upgrade_package,
 };
 
 /// The active tab.
@@ -26,6 +25,7 @@ pub enum Tab {
 
 impl Tab {
     const ALL: [Tab; 3] = [Tab::Updates, Tab::Search, Tab::Installed];
+    const STATUS_BAR_STR: &str = " [Tab] change focus  [← ↑→ ↓] navigate  ";
 
     fn next(self) -> Self {
         match self {
@@ -259,17 +259,11 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Left | KeyCode::BackTab => {
-                self.tab = self.tab.prev();
-                self.filter_query.clear();
-                self.filter_focused = true;
-                self.clamp_selected();
-            }
-            KeyCode::Right | KeyCode::Tab => {
-                self.tab = self.tab.next();
-                self.filter_query.clear();
-                self.filter_focused = true;
-                self.clamp_selected();
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.filter_focused = !self.filter_focused;
+                if !self.filter_focused {
+                    self.clamp_selected();
+                }
             }
             KeyCode::Char('1') => {
                 self.tab = Tab::Updates;
@@ -289,8 +283,24 @@ impl App {
                 self.filter_focused = true;
                 self.clamp_selected();
             }
+            KeyCode::Left => {
+                self.tab = self.tab.prev();
+                self.filter_query.clear();
+                self.filter_focused = true;
+                self.clamp_selected();
+            }
+            KeyCode::Right => {
+                self.tab = self.tab.next();
+                self.filter_query.clear();
+                self.filter_focused = true;
+                self.clamp_selected();
+            }
             KeyCode::Esc => {
-                self.should_quit = true;
+                if self.filter_focused {
+                    self.should_quit = true;
+                } else {
+                    self.filter_focused = true;
+                }
             }
             _ => match self.tab {
                 Tab::Updates => self.handle_updates_key(key),
@@ -304,7 +314,6 @@ impl App {
         if self.filter_focused {
             match key.code {
                 KeyCode::Enter => {
-                    self.filter_focused = false;
                     self.trigger_search();
                 }
                 KeyCode::Down => {
@@ -336,14 +345,8 @@ impl App {
                 KeyCode::Enter => {
                     let filtered = self.filtered_search_results();
                     if let Some(pkg) = filtered.get(self.search_selected) {
-                        self.install_pkg((*pkg).clone());
+                        self.show_pkg((*pkg).clone());
                     }
-                }
-                KeyCode::Esc => {
-                    self.filter_focused = true;
-                }
-                KeyCode::Char('/') => {
-                    self.filter_focused = true;
                 }
                 _ => {}
             }
@@ -353,10 +356,6 @@ impl App {
     fn handle_updates_key(&mut self, key: KeyEvent) {
         if self.filter_focused {
             match key.code {
-                KeyCode::Enter | KeyCode::Down => {
-                    self.filter_focused = false;
-                    self.clamp_selected();
-                }
                 KeyCode::Char(c) => {
                     self.filter_query.push(c);
                 }
@@ -392,12 +391,6 @@ impl App {
                 KeyCode::Char('U') => {
                     self.upgrade_all_unknown();
                 }
-                KeyCode::Esc => {
-                    self.filter_focused = true;
-                }
-                KeyCode::Char('/') => {
-                    self.filter_focused = true;
-                }
                 _ => {}
             }
         }
@@ -406,10 +399,6 @@ impl App {
     fn handle_installed_key(&mut self, key: KeyEvent) {
         if self.filter_focused {
             match key.code {
-                KeyCode::Enter | KeyCode::Down => {
-                    self.filter_focused = false;
-                    self.clamp_selected();
-                }
                 KeyCode::Char(c) => {
                     self.filter_query.push(c);
                 }
@@ -437,12 +426,6 @@ impl App {
                     if let Some(pkg) = filtered.get(self.installed_selected) {
                         self.show_pkg((*pkg).clone());
                     }
-                }
-                KeyCode::Esc => {
-                    self.filter_focused = true;
-                }
-                KeyCode::Char('/') => {
-                    self.filter_focused = true;
                 }
                 KeyCode::Char('r') => {
                     let filtered = self.filtered_installed();
@@ -500,30 +483,6 @@ impl App {
         thread::spawn(move || {
             let cmd = format!("winget show \"{}\"", id);
             match show_package(&id) {
-                Ok(msg) => {
-                    let _ = tx.send(ActionResult::SetCommand {
-                        command: cmd,
-                        output: msg,
-                    });
-                }
-                Err(msg) => {
-                    let _ = tx.send(ActionResult::SetError {
-                        command: cmd,
-                        error: msg,
-                    });
-                }
-            }
-        });
-    }
-
-    fn install_pkg(&mut self, pkg: WingetPackage) {
-        let id = pkg.id.clone();
-        let tx = self.action_tx.clone();
-        self.current_command = Some(format!("winget install \"{}\"", id));
-        self.busy = true;
-        thread::spawn(move || {
-            let cmd = format!("winget install \"{}\"", id);
-            match install_package(&id) {
                 Ok(msg) => {
                     let _ = tx.send(ActionResult::SetCommand {
                         command: cmd,
@@ -948,7 +907,11 @@ impl App {
             .current_command
             .as_deref()
             .unwrap_or("waiting for command...");
-        let line = Line::from(vec![Span::raw(spinner), Span::raw(" $ "), Span::raw(prompt)]);
+        let line = Line::from(vec![
+            Span::raw(spinner),
+            Span::raw(" $ "),
+            Span::raw(prompt),
+        ]);
         f.render_widget(
             Paragraph::new(Text::from(line))
                 .block(Block::default().borders(Borders::ALL).title(" Command ")),
@@ -976,15 +939,17 @@ impl App {
     fn render_status_bar(&self, f: &mut Frame<'_>, area: Rect) {
         let (left, right) = match self.tab {
             Tab::Updates => (
-                " [1/2/3] tabs  [←/→] tabs  [/] filter  [↑↓] navigate  [Enter] upgrade  [u] all  [U] all+unknown ",
+                Tab::STATUS_BAR_STR.to_owned()
+                    + "[Enter] upgrade  [u] update all  [U] update all+unknown ",
                 " [Esc] quit ",
             ),
             Tab::Search => (
-                " [1/2/3] tabs  [←/→] tabs  [/] filter  [↑↓] navigate  [Enter] install ",
+                Tab::STATUS_BAR_STR.to_owned() + "[Enter] install ",
                 " [Esc] quit ",
             ),
             Tab::Installed => (
-                " [1/2/3] tabs  [←/→] tabs  [/] filter  [↑↓] navigate  [Enter] show  [u] upgrade  [r] remove  [R] refresh ",
+                Tab::STATUS_BAR_STR.to_owned()
+                    + "[Enter] show  [u] upgrade  [r] remove  [R] refresh ",
                 " [Esc] quit ",
             ),
         };
