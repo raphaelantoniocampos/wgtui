@@ -148,6 +148,118 @@ pub fn upgrade_package(id: &str) -> Result<String, String> {
     }
 }
 
+/// A package with an available upgrade, returned by `winget upgrade` (list mode).
+#[derive(Debug, Clone)]
+pub struct UpgradablePackage {
+    pub name: String,
+    pub id: String,
+    pub installed_version: String,
+    pub available_version: String,
+    pub source: Option<String>,
+}
+
+/// Runs `winget upgrade` (list mode) to list packages with available upgrades.
+#[must_use]
+pub fn list_upgradable() -> Vec<UpgradablePackage> {
+    let output = Command::new("winget")
+        .args(["upgrade", "--accept-source-agreements"])
+        .output();
+
+    match output {
+        Ok(output) => parse_upgrade_table(&String::from_utf8_lossy(&output.stdout)),
+        Err(_) => vec![],
+    }
+}
+
+/// Runs `winget upgrade --all` to upgrade every package.
+pub fn upgrade_all_packages() -> Result<String, String> {
+    let output = Command::new("winget")
+        .args([
+            "upgrade",
+            "--all",
+            "--silent",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to run winget upgrade --all: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if output.status.success() {
+        Ok(stdout)
+    } else {
+        let msg = if stderr.is_empty() { stdout } else { stderr };
+        Err(msg)
+    }
+}
+
+/// Runs `winget upgrade --all --include-unknown` to upgrade every package including unknown.
+pub fn upgrade_all_unknown() -> Result<String, String> {
+    let output = Command::new("winget")
+        .args([
+            "upgrade",
+            "--all",
+            "--include-unknown",
+            "--silent",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to run winget upgrade --all --include-unknown: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if output.status.success() {
+        Ok(stdout)
+    } else {
+        let msg = if stderr.is_empty() { stdout } else { stderr };
+        Err(msg)
+    }
+}
+
+/// Parses the tabular output of `winget upgrade` (list mode).
+///
+/// Table format: Name, Id, Version, Available, Source
+fn parse_upgrade_table(output: &str) -> Vec<UpgradablePackage> {
+    let re_spaces = Regex::new(r"\s{2,}").expect("regex: two or more whitespace");
+    let lines: Vec<&str> = output.lines().collect();
+
+    let header_idx = lines.iter().position(|line| {
+        let lower = line.to_lowercase();
+        (lower.contains("name") || lower.contains("nome")) && lower.contains("id")
+    });
+
+    let Some(header_idx) = header_idx else {
+        return vec![];
+    };
+
+    let data_lines = &lines[header_idx + 1..];
+    let mut packages = Vec::new();
+
+    for line in data_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.contains("---") {
+            continue;
+        }
+
+        let parts: Vec<&str> = re_spaces.splitn(trimmed, 5).collect();
+        if parts.len() >= 4 {
+            packages.push(UpgradablePackage {
+                name: parts[0].trim().to_string(),
+                id: parts[1].trim().to_string(),
+                installed_version: parts[2].trim().to_string(),
+                available_version: parts[3].trim().to_string(),
+                source: parts.get(4).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            });
+        }
+    }
+
+    packages
+}
+
 /// Parses the tabular output of `winget search` / `winget list` into structured records.
 ///
 /// The table format is:
