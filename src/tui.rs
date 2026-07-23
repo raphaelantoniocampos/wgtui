@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
@@ -11,8 +12,8 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tab
 use ratatui::{Frame, Terminal};
 
 use wgtui::{
-    UpgradablePackage, WingetPackage, list_installed, list_upgradable, search_packages,
-    show_package, uninstall_package, upgrade_all_packages, upgrade_all_unknown, upgrade_package,
+    UpgradablePackage, WingetPackage, list_installed, list_upgradable, run_winget_stdout,
+    search_packages, upgrade_all_packages, upgrade_all_unknown,
 };
 
 /// The active tab.
@@ -25,7 +26,8 @@ pub enum Tab {
 
 impl Tab {
     const ALL: [Tab; 3] = [Tab::Updates, Tab::Search, Tab::Installed];
-    const STATUS_BAR_STR: &str = " [Tab] change tabs  [← ↑→ ↓] navigate  [/] filter  ";
+    const STATUS_BAR_STR: &str =
+        "  [Tab] tabs  [← ↑→ ↓] navigate  [/] filter  [Space] select  [Enter] show  ";
 
     fn next(self) -> Self {
         match self {
@@ -59,6 +61,8 @@ enum ActionResult {
     SetCommand { command: String, output: String },
     SetError { command: String, error: String },
     RefreshInstalled(Vec<WingetPackage>),
+    OutputLine(String),
+    CommandDone,
 }
 
 /// Main application state.
@@ -70,16 +74,22 @@ pub struct App {
     pub filter_query: String,
     /// Results from the last winget search (unfiltered).
     pub search_results: Vec<WingetPackage>,
-    /// Index in the *filtered* search results list.
+    /// Index in the search results list.
     pub search_selected: usize,
+    /// Multi-selected indices in the search results list.
+    search_selected_set: HashSet<usize>,
     /// Packages with available updates from `winget upgrade` (list mode).
     pub updates: Vec<UpgradablePackage>,
-    /// Index in the *filtered* updates list.
+    /// Index in the updates list.
     pub updates_selected: usize,
+    /// Multi-selected indices in the updates list.
+    updates_selected_set: HashSet<usize>,
     /// Currently loaded installed packages (unfiltered).
     pub installed: Vec<WingetPackage>,
-    /// Index in the *filtered* installed list.
+    /// Index in the installed list.
     pub installed_selected: usize,
+    /// Multi-selected indices in the installed list.
+    installed_selected_set: HashSet<usize>,
     /// The last winget command that was run (shown in the command bar).
     pub current_command: Option<String>,
     /// Output lines from the last command (shown in the output panel).
@@ -106,10 +116,13 @@ impl App {
             filter_query: String::new(),
             search_results: vec![],
             search_selected: 0,
+            search_selected_set: HashSet::new(),
             updates,
             updates_selected: 0,
+            updates_selected_set: HashSet::new(),
             installed,
             installed_selected: 0,
+            installed_selected_set: HashSet::new(),
             current_command: None,
             command_output: vec![],
             busy: false,
@@ -183,8 +196,13 @@ impl App {
                 self.current_command = Some("winget list --refresh".to_string());
                 self.command_output = vec!["Package list refreshed.".to_string()];
             }
+            ActionResult::OutputLine(line) => {
+                self.command_output.push(line);
+            }
+            ActionResult::CommandDone => {
+                self.busy = false;
+            }
         }
-        self.busy = false;
     }
 
     // -----------------------------------------------------------------------
@@ -230,6 +248,20 @@ impl App {
             .collect()
     }
 
+    fn selected_line(text: String, selected: bool) -> ListItem<'static> {
+        if selected {
+            ListItem::new(Line::from(Span::styled(
+                text,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )))
+        } else {
+            ListItem::new(Line::from(Span::raw(text)))
+        }
+    }
+
     fn clamp_selected(&mut self) {
         let n = self.filtered_search_results().len();
         if self.search_selected >= n && n > 0 {
@@ -243,6 +275,91 @@ impl App {
         if self.installed_selected >= m && m > 0 {
             self.installed_selected = m - 1;
         }
+    }
+
+    fn selected_ids(&self) -> Vec<String> {
+        match self.tab {
+            Tab::Search => {
+                let filtered = self.filtered_search_results();
+                if self.search_selected_set.is_empty() {
+                    filtered
+                        .get(self.search_selected)
+                        .map(|p| p.id.clone())
+                        .into_iter()
+                        .collect()
+                } else {
+                    self.search_selected_set
+                        .iter()
+                        .filter_map(|&i| filtered.get(i).map(|p| p.id.clone()))
+                        .collect()
+                }
+            }
+            Tab::Updates => {
+                let filtered = self.filtered_updates();
+                if self.updates_selected_set.is_empty() {
+                    filtered
+                        .get(self.updates_selected)
+                        .map(|p| p.id.clone())
+                        .into_iter()
+                        .collect()
+                } else {
+                    self.updates_selected_set
+                        .iter()
+                        .filter_map(|&i| filtered.get(i).map(|p| p.id.clone()))
+                        .collect()
+                }
+            }
+            Tab::Installed => {
+                let filtered = self.filtered_installed();
+                if self.installed_selected_set.is_empty() {
+                    filtered
+                        .get(self.installed_selected)
+                        .map(|p| p.id.clone())
+                        .into_iter()
+                        .collect()
+                } else {
+                    self.installed_selected_set
+                        .iter()
+                        .filter_map(|&i| filtered.get(i).map(|p| p.id.clone()))
+                        .collect()
+                }
+            }
+        }
+    }
+
+    fn toggle_selection(&mut self) {
+        match self.tab {
+            Tab::Search => {
+                if self.search_selected_set.contains(&self.search_selected) {
+                    self.search_selected_set.remove(&self.search_selected);
+                } else {
+                    self.search_selected_set.insert(self.search_selected);
+                }
+            }
+            Tab::Updates => {
+                if self.updates_selected_set.contains(&self.updates_selected) {
+                    self.updates_selected_set.remove(&self.updates_selected);
+                } else {
+                    self.updates_selected_set.insert(self.updates_selected);
+                }
+            }
+            Tab::Installed => {
+                if self
+                    .installed_selected_set
+                    .contains(&self.installed_selected)
+                {
+                    self.installed_selected_set.remove(&self.installed_selected);
+                } else {
+                    self.installed_selected_set.insert(self.installed_selected);
+                }
+            }
+        }
+    }
+
+    fn clear_selections(&mut self) {
+        self.search_selected_set.clear();
+        self.updates_selected_set.clear();
+        self.installed_selected_set.clear();
     }
 
     // -----------------------------------------------------------------------
@@ -270,35 +387,43 @@ impl App {
                     self.clamp_selected();
                 }
             }
+            KeyCode::Char(' ') if !self.filter_focused => {
+                self.toggle_selection();
+            }
             KeyCode::Char('1') => {
                 self.tab = Tab::Updates;
                 self.filter_query.clear();
                 self.filter_focused = true;
                 self.clamp_selected();
+                self.clear_selections();
             }
             KeyCode::Char('2') => {
                 self.tab = Tab::Search;
                 self.filter_query.clear();
                 self.filter_focused = true;
                 self.clamp_selected();
+                self.clear_selections();
             }
             KeyCode::Char('3') => {
                 self.tab = Tab::Installed;
                 self.filter_query.clear();
                 self.filter_focused = true;
                 self.clamp_selected();
+                self.clear_selections();
             }
             KeyCode::Left | KeyCode::BackTab => {
                 self.tab = self.tab.prev();
                 self.filter_query.clear();
                 self.filter_focused = true;
                 self.clamp_selected();
+                self.clear_selections();
             }
             KeyCode::Right | KeyCode::Tab => {
                 self.tab = self.tab.next();
                 self.filter_query.clear();
                 self.filter_focused = true;
                 self.clamp_selected();
+                self.clear_selections();
             }
             KeyCode::Esc => {
                 if self.filter_focused {
@@ -349,9 +474,15 @@ impl App {
                     }
                 }
                 KeyCode::Enter => {
-                    let filtered = self.filtered_search_results();
-                    if let Some(pkg) = filtered.get(self.search_selected) {
-                        self.show_pkg((*pkg).clone());
+                    let ids = self.selected_ids();
+                    if !ids.is_empty() {
+                        self.show_multi_pkg(ids);
+                    }
+                }
+                KeyCode::Char('i') => {
+                    let ids = self.selected_ids();
+                    if !ids.is_empty() {
+                        self.install_multi_pkg(ids);
                     }
                 }
                 _ => {}
@@ -362,6 +493,12 @@ impl App {
     fn handle_updates_key(&mut self, key: KeyEvent) {
         if self.filter_focused {
             match key.code {
+                KeyCode::Enter => {
+                    self.filter_focused = !self.filter_focused;
+                    if !self.filter_focused {
+                        self.clamp_selected();
+                    }
+                }
                 KeyCode::Down => {
                     self.filter_focused = false;
                     self.clamp_selected();
@@ -391,15 +528,21 @@ impl App {
                     }
                 }
                 KeyCode::Enter => {
-                    let filtered = self.filtered_updates();
-                    if let Some(pkg) = filtered.get(self.updates_selected) {
-                        self.upgrade_single_pkg((*pkg).clone());
+                    let ids = self.selected_ids();
+                    if !ids.is_empty() {
+                        self.show_multi_pkg(ids);
+                    }
+                }
+                KeyCode::Char('u') => {
+                    let ids = self.selected_ids();
+                    if !ids.is_empty() {
+                        self.upgrade_multi_pkg(ids);
                     }
                 }
                 KeyCode::Char('a') => {
                     self.upgrade_all();
                 }
-                KeyCode::Char('U') => {
+                KeyCode::Char('A') => {
                     self.upgrade_all_unknown();
                 }
                 _ => {}
@@ -410,6 +553,12 @@ impl App {
     fn handle_installed_key(&mut self, key: KeyEvent) {
         if self.filter_focused {
             match key.code {
+                KeyCode::Enter => {
+                    self.filter_focused = !self.filter_focused;
+                    if !self.filter_focused {
+                        self.clamp_selected();
+                    }
+                }
                 KeyCode::Down => {
                     self.filter_focused = false;
                     self.clamp_selected();
@@ -438,21 +587,21 @@ impl App {
                     }
                 }
                 KeyCode::Enter => {
-                    let filtered = self.filtered_installed();
-                    if let Some(pkg) = filtered.get(self.installed_selected) {
-                        self.show_pkg((*pkg).clone());
+                    let ids = self.selected_ids();
+                    if !ids.is_empty() {
+                        self.show_multi_pkg(ids);
                     }
                 }
                 KeyCode::Char('r') => {
-                    let filtered = self.filtered_installed();
-                    if let Some(pkg) = filtered.get(self.installed_selected) {
-                        self.remove_pkg((*pkg).clone());
+                    let ids = self.selected_ids();
+                    if !ids.is_empty() {
+                        self.remove_multi_pkg(ids);
                     }
                 }
                 KeyCode::Char('u') | KeyCode::Char('U') => {
-                    let filtered = self.filtered_installed();
-                    if let Some(pkg) = filtered.get(self.installed_selected) {
-                        self.upgrade_pkg((*pkg).clone());
+                    let ids = self.selected_ids();
+                    if !ids.is_empty() {
+                        self.upgrade_multi_pkg(ids);
                     }
                 }
                 KeyCode::Char('R') => {
@@ -489,104 +638,128 @@ impl App {
                 command: cmd,
                 output: output.trim().to_string(),
             });
+            let _ = tx.send(ActionResult::CommandDone);
         });
     }
 
-    fn show_pkg(&mut self, pkg: WingetPackage) {
-        let id = pkg.id.clone();
+    fn install_multi_pkg(&mut self, ids: Vec<String>) {
         let tx = self.action_tx.clone();
-        self.current_command = Some(format!("winget show \"{}\"", id));
+        self.command_output.clear();
+        self.current_command = Some(format!("winget install {} packages", ids.len()));
         self.busy = true;
         thread::spawn(move || {
-            let cmd = format!("winget show \"{}\"", id);
-            match show_package(&id) {
-                Ok(msg) => {
-                    let _ = tx.send(ActionResult::SetCommand {
-                        command: cmd,
-                        output: msg,
-                    });
-                }
-                Err(msg) => {
-                    let _ = tx.send(ActionResult::SetError {
-                        command: cmd,
-                        error: msg,
-                    });
-                }
+            for id in &ids {
+                let _ = tx.send(ActionResult::OutputLine(format!("--- install {} ---", id)));
+                let tx2 = tx.clone();
+                let (string_tx, string_rx) = mpsc::channel::<String>();
+                thread::spawn(move || {
+                    while let Ok(line) = string_rx.recv() {
+                        let _ = tx2.send(ActionResult::OutputLine(line));
+                    }
+                });
+                let args = [
+                    "install",
+                    "--exact",
+                    id,
+                    "--silent",
+                    "--accept-package-agreements",
+                    "--accept-source-agreements",
+                    "--scope",
+                    "machine",
+                ];
+                let _ = run_winget_stdout(&args, string_tx);
+                let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
+            let _ = tx.send(ActionResult::CommandDone);
         });
     }
 
-    fn upgrade_pkg(&mut self, pkg: WingetPackage) {
-        let id = pkg.id.clone();
+    fn show_multi_pkg(&mut self, ids: Vec<String>) {
         let tx = self.action_tx.clone();
-        self.current_command = Some(format!("winget upgrade \"{}\"", id));
+        self.command_output.clear();
+        self.current_command = Some(format!("winget show {} packages", ids.len()));
         self.busy = true;
         thread::spawn(move || {
-            let cmd = format!("winget upgrade \"{}\"", id);
-            match upgrade_package(&id) {
-                Ok(msg) => {
-                    let _ = tx.send(ActionResult::SetCommand {
-                        command: cmd,
-                        output: msg,
-                    });
-                }
-                Err(msg) => {
-                    let _ = tx.send(ActionResult::SetError {
-                        command: cmd,
-                        error: msg,
-                    });
-                }
+            for id in &ids {
+                let _ = tx.send(ActionResult::OutputLine(format!("--- {} ---", id)));
+                let tx2 = tx.clone();
+                let (string_tx, string_rx) = mpsc::channel::<String>();
+                thread::spawn(move || {
+                    while let Ok(line) = string_rx.recv() {
+                        let _ = tx2.send(ActionResult::OutputLine(line));
+                    }
+                });
+                let args = ["show", id, "--accept-source-agreements"];
+                let _ = run_winget_stdout(&args, string_tx);
+                let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
+            let _ = tx.send(ActionResult::CommandDone);
         });
     }
 
-    fn remove_pkg(&mut self, pkg: WingetPackage) {
-        let id = pkg.id.clone();
+    fn upgrade_multi_pkg(&mut self, ids: Vec<String>) {
         let tx = self.action_tx.clone();
-        self.current_command = Some(format!("winget uninstall \"{}\"", id));
+        self.command_output.clear();
+        self.current_command = Some(format!("winget upgrade {} packages", ids.len()));
         self.busy = true;
         thread::spawn(move || {
-            let cmd = format!("winget uninstall \"{}\"", id);
-            match uninstall_package(&id) {
-                Ok(msg) => {
-                    let _ = tx.send(ActionResult::SetCommand {
-                        command: cmd,
-                        output: msg,
-                    });
-                }
-                Err(msg) => {
-                    let _ = tx.send(ActionResult::SetError {
-                        command: cmd,
-                        error: msg,
-                    });
-                }
+            for id in &ids {
+                let _ = tx.send(ActionResult::OutputLine(format!("--- upgrade {} ---", id)));
+                let tx2 = tx.clone();
+                let (string_tx, string_rx) = mpsc::channel::<String>();
+                thread::spawn(move || {
+                    while let Ok(line) = string_rx.recv() {
+                        let _ = tx2.send(ActionResult::OutputLine(line));
+                    }
+                });
+                let args = [
+                    "upgrade",
+                    "--exact",
+                    id,
+                    "--silent",
+                    "--accept-package-agreements",
+                    "--accept-source-agreements",
+                ];
+                let _ = run_winget_stdout(&args, string_tx);
+                let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
+            let updates = list_upgradable();
+            let _ = tx.send(ActionResult::UpgradeList(updates));
+            let _ = tx.send(ActionResult::CommandDone);
         });
     }
 
-    fn upgrade_single_pkg(&mut self, pkg: UpgradablePackage) {
-        let id = pkg.id.clone();
+    fn remove_multi_pkg(&mut self, ids: Vec<String>) {
         let tx = self.action_tx.clone();
-        self.current_command = Some(format!("winget upgrade \"{}\"", id));
+        self.command_output.clear();
+        self.current_command = Some(format!("winget uninstall {} packages", ids.len()));
         self.busy = true;
         thread::spawn(move || {
-            let cmd = format!("winget upgrade \"{}\"", id);
-            match upgrade_package(&id) {
-                Ok(msg) => {
-                    let _ = tx.send(ActionResult::SetCommand {
-                        command: cmd,
-                        output: msg.clone(),
-                    });
-                    let updates = list_upgradable();
-                    let _ = tx.send(ActionResult::UpgradeList(updates));
-                }
-                Err(msg) => {
-                    let _ = tx.send(ActionResult::SetError {
-                        command: cmd,
-                        error: msg,
-                    });
-                }
+            for id in &ids {
+                let _ = tx.send(ActionResult::OutputLine(format!(
+                    "--- uninstall {} ---",
+                    id
+                )));
+                let tx2 = tx.clone();
+                let (string_tx, string_rx) = mpsc::channel::<String>();
+                thread::spawn(move || {
+                    while let Ok(line) = string_rx.recv() {
+                        let _ = tx2.send(ActionResult::OutputLine(line));
+                    }
+                });
+                let args = [
+                    "uninstall",
+                    "--exact",
+                    id,
+                    "--silent",
+                    "--accept-source-agreements",
+                ];
+                let _ = run_winget_stdout(&args, string_tx);
+                let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
+            let list = list_installed();
+            let _ = tx.send(ActionResult::RefreshInstalled(list));
+            let _ = tx.send(ActionResult::CommandDone);
         });
     }
 
@@ -612,6 +785,7 @@ impl App {
                     });
                 }
             }
+            let _ = tx.send(ActionResult::CommandDone);
         });
     }
 
@@ -637,6 +811,7 @@ impl App {
                     });
                 }
             }
+            let _ = tx.send(ActionResult::CommandDone);
         });
     }
 
@@ -647,6 +822,7 @@ impl App {
         thread::spawn(move || {
             let list = list_installed();
             let _ = tx.send(ActionResult::RefreshInstalled(list));
+            let _ = tx.send(ActionResult::CommandDone);
         });
     }
 
@@ -760,10 +936,14 @@ impl App {
         } else {
             self.search_results
                 .iter()
-                .map(|pkg| {
+                .enumerate()
+                .map(|(i, pkg)| {
                     let v = pkg.version.as_deref().unwrap_or("-");
                     let s = pkg.source.as_deref().unwrap_or("-");
-                    ListItem::new(format!(" {}  {}  [{}]  ({})", pkg.name, pkg.id, v, s))
+                    Self::selected_line(
+                        format!(" {}  {}  [{}]  ({})", pkg.name, pkg.id, v, s),
+                        self.search_selected_set.contains(&i),
+                    )
                 })
                 .collect()
         };
@@ -826,11 +1006,15 @@ impl App {
         } else {
             filtered
                 .iter()
-                .map(|pkg| {
-                    ListItem::new(format!(
-                        " {}  {}  -> {}",
-                        pkg.name, pkg.installed_version, pkg.available_version
-                    ))
+                .enumerate()
+                .map(|(i, pkg)| {
+                    Self::selected_line(
+                        format!(
+                            " {}  {} -> {}",
+                            pkg.name, pkg.installed_version, pkg.available_version
+                        ),
+                        self.updates_selected_set.contains(&i),
+                    )
                 })
                 .collect()
         };
@@ -886,9 +1070,13 @@ impl App {
         } else {
             filtered
                 .iter()
-                .map(|pkg| {
+                .enumerate()
+                .map(|(i, pkg)| {
                     let v = pkg.version.as_deref().unwrap_or("-");
-                    ListItem::new(format!(" {}  [{}]", pkg.name, v))
+                    Self::selected_line(
+                        format!(" {}  [{}]", pkg.name, v),
+                        self.installed_selected_set.contains(&i),
+                    )
                 })
                 .collect()
         };
@@ -965,16 +1153,15 @@ impl App {
         let (left, right) = match self.tab {
             Tab::Updates => (
                 Tab::STATUS_BAR_STR.to_owned()
-                    + "[Enter] upgrade  [u] update all  [U] update all+unknown ",
+                    + "[u] upgrade  [a] update all  [A] update all+unknown ",
                 " [Esc] quit ",
             ),
             Tab::Search => (
-                Tab::STATUS_BAR_STR.to_owned() + "[Enter] install ",
+                Tab::STATUS_BAR_STR.to_owned() + "[i] install ",
                 " [Esc] quit ",
             ),
             Tab::Installed => (
-                Tab::STATUS_BAR_STR.to_owned()
-                    + "[Enter] show  [u] upgrade  [r] remove  [R] refresh ",
+                Tab::STATUS_BAR_STR.to_owned() + "[u] upgrade  [r] remove  [R] refresh ",
                 " [Esc] quit ",
             ),
         };

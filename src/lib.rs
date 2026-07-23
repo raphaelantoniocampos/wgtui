@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+use std::sync::mpsc;
+
+use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
 use regex::Regex;
@@ -319,6 +322,35 @@ fn parse_winget_table(output: &str) -> Vec<WingetPackage> {
     }
 
     packages
+}
+
+/// Runs a winget command and sends its stdout lines live through the sender.
+/// The sender is dropped when the command finishes, signaling completion.
+pub fn run_winget_stdout(
+    args: &[&str],
+    tx: mpsc::Sender<String>,
+) -> Result<(), String> {
+    let mut child = Command::new("winget")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn winget: {e}"))?;
+
+    let stdout = child.stdout.take().ok_or("No stdout")?;
+    let reader = BufReader::new(stdout);
+    for line in reader.lines() {
+        match line {
+            Ok(l) => {
+                if tx.send(l).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = child.wait();
+    Ok(())
 }
 
 #[cfg(test)]
