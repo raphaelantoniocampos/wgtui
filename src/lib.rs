@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
-
 use regex::Regex;
+use serde::Deserialize;
 
 /// A package returned by `winget search` or `winget list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,6 +328,152 @@ pub fn run_winget_stdout(args: &[&str], tx: mpsc::Sender<String>) -> Result<(), 
     Ok(())
 }
 
+/// A package read from a winget export JSON file.
+#[derive(Debug, Clone)]
+pub struct JsonPackage {
+    pub id: String,
+}
+
+// Serde types matching the winget export schema:
+// https://aka.ms/winget-packages.schema.2.0.json
+#[derive(Deserialize)]
+struct ExportRoot {
+    #[serde(rename = "Sources")]
+    sources: Vec<ExportSource>,
+}
+
+#[derive(Deserialize)]
+struct ExportSource {
+    #[serde(rename = "Packages")]
+    packages: Vec<ExportPackage>,
+}
+
+// Flat format: { "Packages": [{ "PackageIdentifier": "..." }] }
+// No Sources wrapper, used by files like desired.json
+#[derive(Deserialize)]
+struct FlatPackageList {
+    #[serde(rename = "Packages")]
+    packages: Option<Vec<ExportPackage>>,
+}
+
+#[derive(Deserialize)]
+struct ExportPackage {
+    #[serde(rename = "PackageIdentifier")]
+    package_identifier: String,
+}
+
+/// Scans `dir` for `*.json` files that match the winget export schema
+/// and returns a merged deduplicated list of package identifiers.
+/// Never panics — returns an empty vec on any error.
+#[must_use]
+pub fn find_package_json_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Quick validation: try both formats
+        if serde_json::from_str::<ExportRoot>(&content).is_ok()
+            || serde_json::from_str::<FlatPackageList>(&content).is_ok()
+        {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// Loads packages from a single JSON file.
+#[must_use]
+pub fn load_packages_from_file(path: &Path) -> Vec<JsonPackage> {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+
+    // Try full winget export format first
+    if let Ok(root) = serde_json::from_str::<ExportRoot>(&content) {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for source in root.sources {
+            for pkg in source.packages {
+                if seen.insert(pkg.package_identifier.clone()) {
+                    result.push(JsonPackage { id: pkg.package_identifier });
+                }
+            }
+        }
+        return result;
+    }
+
+    // Fall back to flat format
+    if let Ok(flat) = serde_json::from_str::<FlatPackageList>(&content) {
+        if let Some(pkgs) = flat.packages {
+            return pkgs.into_iter().map(|p| JsonPackage { id: p.package_identifier }).collect();
+        }
+    }
+
+    vec![]
+}
+
+/// Scans `dir` for `*.json` files that match the winget export schema
+/// and returns a merged deduplicated list of package identifiers.
+/// Never panics — returns an empty vec on any error.
+#[must_use]
+pub fn load_export_packages(dir: &Path) -> Vec<JsonPackage> {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return result,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Try full winget export format first: { "Sources": [{ "Packages": [...] }] }
+        if let Ok(root) = serde_json::from_str::<ExportRoot>(&content) {
+            for source in root.sources {
+                for pkg in source.packages {
+                    if seen.insert(pkg.package_identifier.clone()) {
+                        result.push(JsonPackage {
+                            id: pkg.package_identifier.clone(),
+                        });
+                    }
+                }
+            }
+        // Fall back to flat format: { "Packages": [{ "PackageIdentifier": "..." }] }
+        } else if let Ok(flat) = serde_json::from_str::<FlatPackageList>(&content) {
+            if let Some(pkgs) = flat.packages {
+                for pkg in pkgs {
+                    if seen.insert(pkg.package_identifier.clone()) {
+                        result.push(JsonPackage {
+                            id: pkg.package_identifier.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +507,96 @@ Google Chrome         Google.Chrome         134.0.6998.165    winget
     fn test_parse_no_header() {
         let packages = parse_winget_table("");
         assert!(packages.is_empty());
+    }
+
+    #[test]
+    fn test_load_export_packages_valid() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            r#"{{
+            "Sources": [
+                {{
+                    "Packages": [
+                        {{ "PackageIdentifier": "7zip.7zip" }},
+                        {{ "PackageIdentifier": "Google.Chrome" }}
+                    ]
+                }}
+            ]
+        }}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let packages = load_export_packages(dir.path());
+        assert_eq!(packages.len(), 2);
+        assert_eq!(packages[0].id, "7zip.7zip");
+        assert_eq!(packages[1].id, "Google.Chrome");
+    }
+
+    #[test]
+    fn test_load_export_packages_skips_invalid_json() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "not json").unwrap();
+        drop(f);
+
+        let packages = load_export_packages(dir.path());
+        assert!(packages.is_empty());
+    }
+
+    #[test]
+    fn test_load_export_packages_dedup() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            r#"{{
+            "Sources": [
+                {{
+                    "Packages": [
+                        {{ "PackageIdentifier": "7zip.7zip" }},
+                        {{ "PackageIdentifier": "7zip.7zip" }}
+                    ]
+                }}
+            ]
+        }}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let packages = load_export_packages(dir.path());
+        assert_eq!(packages.len(), 1);
+    }
+
+    #[test]
+    fn test_load_flat_format() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desired.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            r#"{{
+            "Packages": [
+                {{ "PackageIdentifier": "Google.Chrome" }},
+                {{ "PackageIdentifier": "Mozilla.Firefox" }}
+            ]
+        }}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let packages = load_export_packages(dir.path());
+        assert_eq!(packages.len(), 2);
+        assert_eq!(packages[0].id, "Google.Chrome");
+        assert_eq!(packages[1].id, "Mozilla.Firefox");
     }
 }
