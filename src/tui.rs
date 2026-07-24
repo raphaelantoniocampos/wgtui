@@ -13,7 +13,7 @@ use ratatui::{Frame, Terminal};
 
 use wgtui::{
     UpgradablePackage, WingetPackage, list_installed, list_upgradable, run_winget_stdout,
-    search_packages, upgrade_all_packages, upgrade_all_unknown,
+    search_packages, upgrade_all_packages,
 };
 
 /// The active tab.
@@ -539,11 +539,8 @@ impl App {
                         self.upgrade_multi_pkg(ids);
                     }
                 }
-                KeyCode::Char('a') => {
+                KeyCode::Char('U') => {
                     self.upgrade_all();
-                }
-                KeyCode::Char('A') => {
-                    self.upgrade_all_unknown();
                 }
                 _ => {}
             }
@@ -765,37 +762,11 @@ impl App {
 
     fn upgrade_all(&mut self) {
         let tx = self.action_tx.clone();
-        self.current_command = Some("winget upgrade --all".to_string());
-        self.busy = true;
-        thread::spawn(move || {
-            let cmd = "winget upgrade --all".to_string();
-            match upgrade_all_packages() {
-                Ok(msg) => {
-                    let _ = tx.send(ActionResult::SetCommand {
-                        command: cmd,
-                        output: msg.clone(),
-                    });
-                    let updates = list_upgradable();
-                    let _ = tx.send(ActionResult::UpgradeList(updates));
-                }
-                Err(msg) => {
-                    let _ = tx.send(ActionResult::SetError {
-                        command: cmd,
-                        error: msg,
-                    });
-                }
-            }
-            let _ = tx.send(ActionResult::CommandDone);
-        });
-    }
-
-    fn upgrade_all_unknown(&mut self) {
-        let tx = self.action_tx.clone();
         self.current_command = Some("winget upgrade --all --include-unknown".to_string());
         self.busy = true;
         thread::spawn(move || {
             let cmd = "winget upgrade --all --include-unknown".to_string();
-            match upgrade_all_unknown() {
+            match upgrade_all_packages() {
                 Ok(msg) => {
                     let _ = tx.send(ActionResult::SetCommand {
                         command: cmd,
@@ -1108,10 +1079,10 @@ impl App {
     fn render_command_bar(&self, f: &mut Frame<'_>, area: Rect) {
         let spinner = if self.busy {
             match self.spinner_frame {
-                0 => "⠋",
-                1 => "⠙",
-                2 => "⠸",
-                _ => "⠴",
+                0 => ".",
+                1 => "..",
+                2 => ".",
+                _ => " ",
             }
         } else {
             ""
@@ -1152,16 +1123,15 @@ impl App {
     fn render_status_bar(&self, f: &mut Frame<'_>, area: Rect) {
         let (left, right) = match self.tab {
             Tab::Updates => (
-                Tab::STATUS_BAR_STR.to_owned()
-                    + "[u] upgrade  [a] update all  [A] update all+unknown ",
+                Tab::STATUS_BAR_STR.to_owned() + "[u] upgrade  [U] update all  ",
                 " [Esc] quit ",
             ),
             Tab::Search => (
-                Tab::STATUS_BAR_STR.to_owned() + "[i] install ",
+                Tab::STATUS_BAR_STR.to_owned() + "[i] install  ",
                 " [Esc] quit ",
             ),
             Tab::Installed => (
-                Tab::STATUS_BAR_STR.to_owned() + "[u] upgrade  [r] remove  [R] refresh ",
+                Tab::STATUS_BAR_STR.to_owned() + "[u] upgrade  [r] remove  [R] refresh  ",
                 " [Esc] quit ",
             ),
         };

@@ -177,32 +177,8 @@ pub fn list_upgradable() -> Vec<UpgradablePackage> {
     }
 }
 
-/// Runs `winget upgrade --all` to upgrade every package.
-pub fn upgrade_all_packages() -> Result<String, String> {
-    let output = Command::new("winget")
-        .args([
-            "upgrade",
-            "--all",
-            "--silent",
-            "--accept-package-agreements",
-            "--accept-source-agreements",
-        ])
-        .output()
-        .map_err(|e| format!("Failed to run winget upgrade --all: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if output.status.success() {
-        Ok(stdout)
-    } else {
-        let msg = if stderr.is_empty() { stdout } else { stderr };
-        Err(msg)
-    }
-}
-
 /// Runs `winget upgrade --all --include-unknown` to upgrade every package including unknown.
-pub fn upgrade_all_unknown() -> Result<String, String> {
+pub fn upgrade_all_packages() -> Result<String, String> {
     let output = Command::new("winget")
         .args([
             "upgrade",
@@ -326,10 +302,7 @@ fn parse_winget_table(output: &str) -> Vec<WingetPackage> {
 
 /// Runs a winget command and sends its stdout lines live through the sender.
 /// The sender is dropped when the command finishes, signaling completion.
-pub fn run_winget_stdout(
-    args: &[&str],
-    tx: mpsc::Sender<String>,
-) -> Result<(), String> {
+pub fn run_winget_stdout(args: &[&str], tx: mpsc::Sender<String>) -> Result<(), String> {
     let mut child = Command::new("winget")
         .args(args)
         .stdout(Stdio::piped())
@@ -388,4 +361,3 @@ Google Chrome         Google.Chrome         134.0.6998.165    winget
         assert!(packages.is_empty());
     }
 }
-
