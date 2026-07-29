@@ -332,6 +332,7 @@ pub fn run_winget_stdout(args: &[&str], tx: mpsc::Sender<String>) -> Result<(), 
 #[derive(Debug, Clone)]
 pub struct JsonPackage {
     pub id: String,
+    pub name: String,
 }
 
 // Serde types matching the winget export schema:
@@ -360,6 +361,8 @@ struct FlatPackageList {
 struct ExportPackage {
     #[serde(rename = "PackageIdentifier")]
     package_identifier: String,
+    #[serde(rename = "PackageName", default)]
+    package_name: Option<String>,
 }
 
 /// Scans `dir` for `*.json` files that match the winget export schema
@@ -400,6 +403,12 @@ pub fn load_packages_from_file(path: &Path) -> Vec<JsonPackage> {
         Err(_) => return vec![],
     };
 
+    let mk_pkg = |p: ExportPackage| {
+        let id = p.package_identifier;
+        let name = p.package_name.unwrap_or_else(|| id.clone());
+        JsonPackage { id, name }
+    };
+
     // Try full winget export format first
     if let Ok(root) = serde_json::from_str::<ExportRoot>(&content) {
         let mut seen = std::collections::HashSet::new();
@@ -407,7 +416,7 @@ pub fn load_packages_from_file(path: &Path) -> Vec<JsonPackage> {
         for source in root.sources {
             for pkg in source.packages {
                 if seen.insert(pkg.package_identifier.clone()) {
-                    result.push(JsonPackage { id: pkg.package_identifier });
+                    result.push(mk_pkg(pkg));
                 }
             }
         }
@@ -417,7 +426,7 @@ pub fn load_packages_from_file(path: &Path) -> Vec<JsonPackage> {
     // Fall back to flat format
     if let Ok(flat) = serde_json::from_str::<FlatPackageList>(&content) {
         if let Some(pkgs) = flat.packages {
-            return pkgs.into_iter().map(|p| JsonPackage { id: p.package_identifier }).collect();
+            return pkgs.into_iter().map(mk_pkg).collect();
         }
     }
 
@@ -451,9 +460,8 @@ pub fn load_export_packages(dir: &Path) -> Vec<JsonPackage> {
             for source in root.sources {
                 for pkg in source.packages {
                     if seen.insert(pkg.package_identifier.clone()) {
-                        result.push(JsonPackage {
-                            id: pkg.package_identifier.clone(),
-                        });
+                        let name = pkg.package_name.unwrap_or_else(|| pkg.package_identifier.clone());
+                        result.push(JsonPackage { id: pkg.package_identifier, name });
                     }
                 }
             }
@@ -462,9 +470,8 @@ pub fn load_export_packages(dir: &Path) -> Vec<JsonPackage> {
             if let Some(pkgs) = flat.packages {
                 for pkg in pkgs {
                     if seen.insert(pkg.package_identifier.clone()) {
-                        result.push(JsonPackage {
-                            id: pkg.package_identifier.clone(),
-                        });
+                        let name = pkg.package_name.unwrap_or_else(|| pkg.package_identifier.clone());
+                        result.push(JsonPackage { id: pkg.package_identifier, name });
                     }
                 }
             }
@@ -534,7 +541,9 @@ Google Chrome         Google.Chrome         134.0.6998.165    winget
         let packages = load_export_packages(dir.path());
         assert_eq!(packages.len(), 2);
         assert_eq!(packages[0].id, "7zip.7zip");
+        assert_eq!(packages[0].name, "7zip.7zip");
         assert_eq!(packages[1].id, "Google.Chrome");
+        assert_eq!(packages[1].name, "Google.Chrome");
     }
 
     #[test]
@@ -586,8 +595,8 @@ Google Chrome         Google.Chrome         134.0.6998.165    winget
             f,
             r#"{{
             "Packages": [
-                {{ "PackageIdentifier": "Google.Chrome" }},
-                {{ "PackageIdentifier": "Mozilla.Firefox" }}
+                {{ "PackageIdentifier": "Google.Chrome", "PackageName": "Google Chrome" }},
+                {{ "PackageIdentifier": "Mozilla.Firefox", "PackageName": "Firefox" }}
             ]
         }}"#
         )
@@ -597,6 +606,32 @@ Google Chrome         Google.Chrome         134.0.6998.165    winget
         let packages = load_export_packages(dir.path());
         assert_eq!(packages.len(), 2);
         assert_eq!(packages[0].id, "Google.Chrome");
+        assert_eq!(packages[0].name, "Google Chrome");
         assert_eq!(packages[1].id, "Mozilla.Firefox");
+        assert_eq!(packages[1].name, "Firefox");
+    }
+
+    #[test]
+    fn test_load_packages_from_file_name() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            r#"{{
+            "Packages": [
+                {{ "PackageIdentifier": "AnyDesk.AnyDesk", "PackageName": "Anydesk" }},
+                {{ "PackageIdentifier": "CPUID.CPU-Z" }}
+            ]
+        }}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let packages = load_packages_from_file(&path);
+        assert_eq!(packages.len(), 2);
+        assert_eq!(packages[0].name, "Anydesk");
+        assert_eq!(packages[1].name, "CPUID.CPU-Z"); // falls back to id
     }
 }

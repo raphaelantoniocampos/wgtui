@@ -15,8 +15,8 @@ use ratatui::{Frame, Terminal};
 
 use wgtui::{
     JsonPackage, UpgradablePackage, WingetPackage, find_package_json_files, list_installed,
-    list_upgradable, load_packages_from_file, run_winget_stdout,
-    search_packages, upgrade_all_packages,
+    list_upgradable, load_packages_from_file, run_winget_stdout, search_packages,
+    upgrade_all_packages,
 };
 
 /// Returns the directories to search for JSON package files, in priority order.
@@ -179,10 +179,7 @@ impl App {
             if package_files.is_empty() {
                 diag.push_str("no json files found\n");
             } else {
-                diag.push_str(&format!(
-                    "{} files found, pick one\n",
-                    package_files.len()
-                ));
+                diag.push_str(&format!("{} files found, pick one\n", package_files.len()));
             }
             (vec![], true)
         };
@@ -697,7 +694,10 @@ impl App {
         } else {
             self.packages
                 .iter()
-                .filter(|p| Self::matches_filter(&p.id, &self.filter_query))
+                .filter(|p| {
+                    Self::matches_filter(&p.name, &self.filter_query)
+                        || Self::matches_filter(&p.id, &self.filter_query)
+                })
                 .collect()
         }
     }
@@ -785,8 +785,11 @@ impl App {
                         self.packages_selected = 0;
                         self.packages_selected_set.clear();
                         self.packages_file_picker = false;
-                        self.packages_diagnostic =
-                            format!("loaded {} pkgs from {}", self.packages.len(), path.display());
+                        self.packages_diagnostic = format!(
+                            "loaded {} pkgs from {}",
+                            self.packages.len(),
+                            path.display()
+                        );
                         self.filter_focused = true;
                         self.filter_query.clear();
                     }
@@ -1063,6 +1066,7 @@ impl App {
         self.output_scroll = usize::MAX;
         self.current_command = Some(format!("winget install {} packages", ids.len()));
         self.busy = true;
+        let tx_clone = tx.clone();
         thread::spawn(move || {
             for id in &ids {
                 let _ = tx.send(ActionResult::OutputLine(format!("--- install {} ---", id)));
@@ -1086,12 +1090,14 @@ impl App {
                 let _ = run_winget_stdout(&args, string_tx);
                 let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
+            let _ = tx_clone.send(ActionResult::RefreshInstalled(list_installed()));
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
 
     fn remove_json_multi(&mut self, ids: Vec<String>) {
         let tx = self.action_tx.clone();
+        let tx_refresh = tx.clone();
         self.command_output.clear();
         self.output_scroll = usize::MAX;
         self.current_command = Some(format!("winget uninstall {} packages", ids.len()));
@@ -1119,6 +1125,7 @@ impl App {
                 let _ = run_winget_stdout(&args, string_tx);
                 let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
+            let _ = tx_refresh.send(ActionResult::RefreshInstalled(list_installed()));
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
@@ -1449,7 +1456,11 @@ impl App {
                 self.package_files
                     .iter()
                     .map(|p| {
-                        let name = p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default().to_string();
+                        let name = p
+                            .file_name()
+                            .map(|n| n.to_string_lossy())
+                            .unwrap_or_default()
+                            .to_string();
                         ListItem::new(name)
                     })
                     .collect()
@@ -1470,12 +1481,11 @@ impl App {
                 )
                 .highlight_symbol("> ");
 
-            let mut state =
-                ListState::default().with_selected(if self.package_files.is_empty() {
-                    None
-                } else {
-                    Some(self.package_file_selected)
-                });
+            let mut state = ListState::default().with_selected(if self.package_files.is_empty() {
+                None
+            } else {
+                Some(self.package_file_selected)
+            });
             f.render_stateful_widget(list, area, &mut state);
             return;
         }
@@ -1512,11 +1522,18 @@ impl App {
                 vec![ListItem::new("No packages match the filter")]
             }
         } else {
+            let installed_ids: std::collections::HashSet<&str> =
+                self.installed.iter().map(|p| p.id.as_str()).collect();
             filtered
                 .iter()
                 .enumerate()
                 .map(|(i, pkg)| {
-                    Self::selected_line(pkg.id.clone(), self.packages_selected_set.contains(&i))
+                    let display = if installed_ids.contains(pkg.id.as_str()) {
+                        format!("✓ {}", pkg.name)
+                    } else {
+                        format!("  {}", pkg.name)
+                    };
+                    Self::selected_line(display, self.packages_selected_set.contains(&i))
                 })
                 .collect()
         };
@@ -1581,11 +1598,7 @@ impl App {
         let total = lines.len();
         let height = area.height as usize;
         let scroll = if self.output_scroll == usize::MAX {
-            if total > height {
-                total - height
-            } else {
-                0
-            }
+            if total > height { total - height } else { 0 }
         } else {
             self.output_scroll.min(total.saturating_sub(1))
         };
@@ -1618,7 +1631,8 @@ impl App {
                 " [Esc] quit ",
             ),
             Tab::Packages => (
-                Tab::STATUS_BAR_STR.to_owned() + "[i] install  [I] all  [r] remove  [R] all  [F] file  ",
+                Tab::STATUS_BAR_STR.to_owned()
+                    + "[i] install  [I] install all  [r] remove  [R] remove all  [F] file  ",
                 " [Esc] quit ",
             ),
         };
