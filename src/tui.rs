@@ -79,7 +79,7 @@ impl Tab {
             Tab::Updates => "[1] Updates ",
             Tab::Search => "[2] Search ",
             Tab::Installed => "[3] Installed ",
-            Tab::Packages => "[4] Packages ",
+            Tab::Packages => "[4] Apps/Scripts ",
         }
     }
 }
@@ -186,7 +186,7 @@ impl App {
 
         Self {
             tab: Tab::Updates,
-            filter_focused: true,
+            filter_focused: false,
             filter_query: String::new(),
             search_results: vec![],
             search_selected: 0,
@@ -492,64 +492,100 @@ impl App {
             return;
         }
 
-        match key.code {
-            KeyCode::Char('/') => {
-                self.filter_focused = !self.filter_focused;
-                if !self.filter_focused {
+        // Packages file picker has its own key handling logic first
+        if self.tab == Tab::Packages && self.packages_file_picker {
+            self.handle_packages_key(key);
+            return;
+        }
+
+        if self.filter_focused {
+            match key.code {
+                KeyCode::Esc => {
+                    self.filter_focused = false;
                     self.clamp_selected();
+                    return;
+                }
+                KeyCode::Enter => {
+                    if self.tab == Tab::Search {
+                        self.trigger_search();
+                    } else {
+                        self.filter_focused = false;
+                        self.clamp_selected();
+                    }
+                    return;
+                }
+                KeyCode::Char(c) => {
+                    self.filter_query.push(c);
+                    self.clamp_selected();
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.filter_query.pop();
+                    self.clamp_selected();
+                    return;
+                }
+                // Allow tab navigation and arrows to pass through to the shortcut logic
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {}
+                KeyCode::Up | KeyCode::Down => {
+                    self.filter_focused = false;
+                }
+                _ => {
+                    return;
                 }
             }
-            KeyCode::Char(' ') if !self.filter_focused => {
+        }
+
+        match key.code {
+            KeyCode::Char('/') => {
+                self.filter_focused = true;
+            }
+            KeyCode::Char(' ') => {
                 self.toggle_selection();
             }
             KeyCode::Char('1') => {
                 self.tab = Tab::Updates;
                 self.filter_query.clear();
-                self.filter_focused = true;
+                self.filter_focused = false;
                 self.clamp_selected();
                 self.clear_selections();
             }
             KeyCode::Char('2') => {
                 self.tab = Tab::Search;
                 self.filter_query.clear();
-                self.filter_focused = true;
+                self.filter_focused = false;
                 self.clamp_selected();
                 self.clear_selections();
             }
             KeyCode::Char('3') => {
                 self.tab = Tab::Installed;
                 self.filter_query.clear();
-                self.filter_focused = true;
+                self.filter_focused = false;
                 self.clamp_selected();
                 self.clear_selections();
             }
             KeyCode::Char('4') => {
                 self.tab = Tab::Packages;
                 self.filter_query.clear();
-                self.filter_focused = true;
+                self.filter_focused = false;
                 self.clamp_selected();
                 self.clear_selections();
             }
             KeyCode::Left | KeyCode::BackTab => {
                 self.tab = self.tab.prev();
                 self.filter_query.clear();
-                self.filter_focused = true;
+                self.filter_focused = false;
                 self.clamp_selected();
                 self.clear_selections();
             }
             KeyCode::Right | KeyCode::Tab => {
                 self.tab = self.tab.next();
                 self.filter_query.clear();
-                self.filter_focused = true;
+                self.filter_focused = false;
                 self.clamp_selected();
                 self.clear_selections();
             }
             KeyCode::Esc => {
-                if self.filter_focused {
-                    self.should_quit = true;
-                } else {
-                    self.filter_focused = true;
-                }
+                self.should_quit = true;
             }
             KeyCode::PageUp => {
                 if !self.command_output.is_empty() {
@@ -582,109 +618,67 @@ impl App {
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) {
-        if self.filter_focused {
-            match key.code {
-                KeyCode::Enter => {
-                    self.trigger_search();
+        match key.code {
+            KeyCode::Up => {
+                if self.search_selected > 0 {
+                    self.search_selected -= 1;
+                } else {
+                    self.filter_focused = true;
                 }
-                KeyCode::Down => {
-                    self.filter_focused = false;
-                    self.clamp_selected();
-                }
-                KeyCode::Char(c) => {
-                    self.filter_query.push(c);
-                }
-                KeyCode::Backspace => {
-                    self.filter_query.pop();
-                }
-                _ => {}
             }
-        } else {
-            match key.code {
-                KeyCode::Up => {
-                    if self.search_selected > 0 {
-                        self.search_selected -= 1;
-                    } else {
-                        self.filter_focused = true;
-                    }
+            KeyCode::Down => {
+                let n = self.filtered_search_results().len();
+                if n > 0 && self.search_selected + 1 < n {
+                    self.search_selected += 1;
                 }
-                KeyCode::Down => {
-                    let n = self.filtered_search_results().len();
-                    if n > 0 && self.search_selected + 1 < n {
-                        self.search_selected += 1;
-                    }
-                }
-                KeyCode::Enter => {
-                    let ids = self.selected_ids();
-                    if !ids.is_empty() {
-                        self.show_multi_pkg(ids);
-                    }
-                }
-                KeyCode::Char('i') => {
-                    let ids = self.selected_ids();
-                    if !ids.is_empty() {
-                        self.install_multi_pkg(ids);
-                    }
-                }
-                _ => {}
             }
+            KeyCode::Enter => {
+                let ids = self.selected_ids();
+                if !ids.is_empty() {
+                    self.show_multi_pkg(ids);
+                }
+            }
+            KeyCode::Char('i') => {
+                let ids = self.selected_ids();
+                if !ids.is_empty() {
+                    self.install_multi_pkg(ids);
+                }
+            }
+            _ => {}
         }
     }
 
     fn handle_updates_key(&mut self, key: KeyEvent) {
-        if self.filter_focused {
-            match key.code {
-                KeyCode::Enter => {
-                    self.filter_focused = !self.filter_focused;
-                    if !self.filter_focused {
-                        self.clamp_selected();
-                    }
+        match key.code {
+            KeyCode::Up => {
+                if self.updates_selected > 0 {
+                    self.updates_selected -= 1;
+                } else {
+                    self.filter_focused = true;
                 }
-                KeyCode::Down => {
-                    self.filter_focused = false;
-                    self.clamp_selected();
-                }
-                KeyCode::Char(c) => {
-                    self.filter_query.push(c);
-                }
-                KeyCode::Backspace => {
-                    self.filter_query.pop();
-                    self.clamp_selected();
-                }
-                _ => {}
             }
-        } else {
-            match key.code {
-                KeyCode::Up => {
-                    if self.updates_selected > 0 {
-                        self.updates_selected -= 1;
-                    } else {
-                        self.filter_focused = true;
-                    }
+            KeyCode::Down => {
+                let n = self.filtered_updates().len();
+                if n > 0 && self.updates_selected + 1 < n {
+                    self.updates_selected += 1;
                 }
-                KeyCode::Down => {
-                    let n = self.filtered_updates().len();
-                    if n > 0 && self.updates_selected + 1 < n {
-                        self.updates_selected += 1;
-                    }
-                }
-                KeyCode::Enter => {
-                    let ids = self.selected_ids();
-                    if !ids.is_empty() {
-                        self.show_multi_pkg(ids);
-                    }
-                }
-                KeyCode::Char('u') => {
-                    let ids = self.selected_ids();
-                    if !ids.is_empty() {
-                        self.upgrade_multi_pkg(ids);
-                    }
-                }
-                KeyCode::Char('U') => {
-                    self.upgrade_all();
-                }
-                _ => {}
             }
+            KeyCode::Enter => {
+                let ids = self.selected_ids();
+                if !ids.is_empty() {
+                    self.show_multi_pkg(ids);
+                }
+            }
+            KeyCode::Char('u') => {
+                let ids = self.selected_ids();
+                if !ids.is_empty() {
+                    self.upgrade_multi_pkg(ids);
+                }
+            }
+            KeyCode::Char('U') => {
+                self.upgrade_all();
+            }
+            _ => {}
         }
     }
 
@@ -703,64 +697,42 @@ impl App {
     }
 
     fn handle_installed_key(&mut self, key: KeyEvent) {
-        if self.filter_focused {
-            match key.code {
-                KeyCode::Enter => {
-                    self.filter_focused = !self.filter_focused;
-                    if !self.filter_focused {
-                        self.clamp_selected();
-                    }
+        match key.code {
+            KeyCode::Up => {
+                if self.installed_selected > 0 {
+                    self.installed_selected -= 1;
+                } else {
+                    self.filter_focused = true;
                 }
-                KeyCode::Down => {
-                    self.filter_focused = false;
-                    self.clamp_selected();
-                }
-                KeyCode::Char(c) => {
-                    self.filter_query.push(c);
-                }
-                KeyCode::Backspace => {
-                    self.filter_query.pop();
-                }
-                _ => {}
             }
-        } else {
-            match key.code {
-                KeyCode::Up => {
-                    if self.installed_selected > 0 {
-                        self.installed_selected -= 1;
-                    } else {
-                        self.filter_focused = true;
-                    }
+            KeyCode::Down => {
+                let n = self.filtered_installed().len();
+                if n > 0 && self.installed_selected + 1 < n {
+                    self.installed_selected += 1;
                 }
-                KeyCode::Down => {
-                    let n = self.filtered_installed().len();
-                    if n > 0 && self.installed_selected + 1 < n {
-                        self.installed_selected += 1;
-                    }
-                }
-                KeyCode::Enter => {
-                    let ids = self.selected_ids();
-                    if !ids.is_empty() {
-                        self.show_multi_pkg(ids);
-                    }
-                }
-                KeyCode::Char('r') => {
-                    let ids = self.selected_ids();
-                    if !ids.is_empty() {
-                        self.remove_multi_pkg(ids);
-                    }
-                }
-                KeyCode::Char('u') | KeyCode::Char('U') => {
-                    let ids = self.selected_ids();
-                    if !ids.is_empty() {
-                        self.upgrade_multi_pkg(ids);
-                    }
-                }
-                KeyCode::Char('R') => {
-                    self.refresh_installed();
-                }
-                _ => {}
             }
+            KeyCode::Enter => {
+                let ids = self.selected_ids();
+                if !ids.is_empty() {
+                    self.show_multi_pkg(ids);
+                }
+            }
+            KeyCode::Char('r') => {
+                let ids = self.selected_ids();
+                if !ids.is_empty() {
+                    self.remove_multi_pkg(ids);
+                }
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                let ids = self.selected_ids();
+                if !ids.is_empty() {
+                    self.upgrade_multi_pkg(ids);
+                }
+            }
+            KeyCode::Char('R') => {
+                self.refresh_installed();
+            }
+            _ => {}
         }
     }
 
@@ -790,7 +762,7 @@ impl App {
                             self.packages.len(),
                             path.display()
                         );
-                        self.filter_focused = true;
+                        self.filter_focused = false;
                         self.filter_query.clear();
                     }
                 }
@@ -799,83 +771,61 @@ impl App {
             return;
         }
 
-        if self.filter_focused {
-            match key.code {
-                KeyCode::Enter => {
-                    self.filter_focused = !self.filter_focused;
-                    if !self.filter_focused {
-                        self.clamp_selected();
-                    }
+        match key.code {
+            KeyCode::Up => {
+                if self.packages_selected > 0 {
+                    self.packages_selected -= 1;
+                } else {
+                    self.filter_focused = true;
                 }
-                KeyCode::Down => {
+            }
+            KeyCode::Down => {
+                let n = self.filtered_packages().len();
+                if n > 0 && self.packages_selected + 1 < n {
+                    self.packages_selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let ids = self.selected_ids();
+                if !ids.is_empty() {
+                    self.show_json_package(ids);
+                }
+            }
+            KeyCode::Char('i') => {
+                let ids = self.selected_ids();
+                if !ids.is_empty() {
+                    self.install_json_multi(ids);
+                }
+            }
+            KeyCode::Char('I') => {
+                let all_ids: Vec<String> = self.packages.iter().map(|p| p.id.clone()).collect();
+                if !all_ids.is_empty() {
+                    self.install_json_multi(all_ids);
+                }
+            }
+            KeyCode::Char('r') => {
+                let ids = self.selected_ids();
+                if !ids.is_empty() {
+                    self.remove_json_multi(ids);
+                }
+            }
+            KeyCode::Char('R') => {
+                let all_ids: Vec<String> = self.packages.iter().map(|p| p.id.clone()).collect();
+                if !all_ids.is_empty() {
+                    self.remove_json_multi(all_ids);
+                }
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                if !self.packages_file_picker && self.package_files.len() > 1 {
+                    self.packages_file_picker = true;
+                    self.packages.clear();
+                    self.packages_selected = 0;
+                    self.packages_selected_set.clear();
                     self.filter_focused = false;
-                    self.clamp_selected();
+                    self.filter_query.clear();
                 }
-                KeyCode::Char(c) => {
-                    self.filter_query.push(c);
-                }
-                KeyCode::Backspace => {
-                    self.filter_query.pop();
-                }
-                _ => {}
             }
-        } else {
-            match key.code {
-                KeyCode::Up => {
-                    if self.packages_selected > 0 {
-                        self.packages_selected -= 1;
-                    } else {
-                        self.filter_focused = true;
-                    }
-                }
-                KeyCode::Down => {
-                    let n = self.filtered_packages().len();
-                    if n > 0 && self.packages_selected + 1 < n {
-                        self.packages_selected += 1;
-                    }
-                }
-                KeyCode::Enter => {
-                    let ids = self.selected_ids();
-                    if !ids.is_empty() {
-                        self.show_json_package(ids);
-                    }
-                }
-                KeyCode::Char('i') => {
-                    let ids = self.selected_ids();
-                    if !ids.is_empty() {
-                        self.install_json_multi(ids);
-                    }
-                }
-                KeyCode::Char('I') => {
-                    let all_ids: Vec<String> = self.packages.iter().map(|p| p.id.clone()).collect();
-                    if !all_ids.is_empty() {
-                        self.install_json_multi(all_ids);
-                    }
-                }
-                KeyCode::Char('r') => {
-                    let ids = self.selected_ids();
-                    if !ids.is_empty() {
-                        self.remove_json_multi(ids);
-                    }
-                }
-                KeyCode::Char('R') => {
-                    let all_ids: Vec<String> = self.packages.iter().map(|p| p.id.clone()).collect();
-                    if !all_ids.is_empty() {
-                        self.remove_json_multi(all_ids);
-                    }
-                }
-                KeyCode::Char('f') | KeyCode::Char('F') => {
-                    if !self.packages_file_picker && self.package_files.len() > 1 {
-                        self.packages_file_picker = true;
-                        self.packages.clear();
-                        self.packages_selected = 0;
-                        self.packages_selected_set.clear();
-                        self.filter_focused = true;
-                        self.filter_query.clear();
-                    }
-                }
-                _ => {}
-            }
+            _ => {}
         }
     }
 
@@ -938,6 +888,9 @@ impl App {
                 let _ = run_winget_stdout(&args, string_tx);
                 let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
+            let _ = tx.send(ActionResult::RefreshInstalled(list_installed()));
+            let updates = list_upgradable();
+            let _ = tx.send(ActionResult::UpgradeList(updates));
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
@@ -995,6 +948,7 @@ impl App {
             }
             let updates = list_upgradable();
             let _ = tx.send(ActionResult::UpgradeList(updates));
+            let _ = tx.send(ActionResult::RefreshInstalled(list_installed()));
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
@@ -1048,6 +1002,7 @@ impl App {
                     });
                     let updates = list_upgradable();
                     let _ = tx.send(ActionResult::UpgradeList(updates));
+                    let _ = tx.send(ActionResult::RefreshInstalled(list_installed()));
                 }
                 Err(msg) => {
                     let _ = tx.send(ActionResult::SetError {
@@ -1064,33 +1019,61 @@ impl App {
         let tx = self.action_tx.clone();
         self.command_output.clear();
         self.output_scroll = usize::MAX;
-        self.current_command = Some(format!("winget install {} packages", ids.len()));
+        self.current_command = Some(format!("install/run {} apps/scripts", ids.len()));
         self.busy = true;
         let tx_clone = tx.clone();
+        let packages_clone = self.packages.clone();
         thread::spawn(move || {
             for id in &ids {
-                let _ = tx.send(ActionResult::OutputLine(format!("--- install {} ---", id)));
-                let tx2 = tx.clone();
-                let (string_tx, string_rx) = mpsc::channel::<String>();
-                thread::spawn(move || {
-                    while let Ok(line) = string_rx.recv() {
-                        let _ = tx2.send(ActionResult::OutputLine(line));
+                if let Some(pkg) = packages_clone.iter().find(|p| p.id == *id) {
+                    if pkg.is_script {
+                        let _ = tx.send(ActionResult::OutputLine(format!(
+                            "--- run script: {} ---",
+                            pkg.name
+                        )));
+                        if let Some(ref cmd_args) = pkg.command {
+                            if !cmd_args.is_empty() {
+                                let cmd = &cmd_args[0];
+                                let args: Vec<&str> =
+                                    cmd_args[1..].iter().map(|s| s.as_str()).collect();
+                                let tx2 = tx.clone();
+                                let (string_tx, string_rx) = mpsc::channel::<String>();
+                                thread::spawn(move || {
+                                    while let Ok(line) = string_rx.recv() {
+                                        let _ = tx2.send(ActionResult::OutputLine(line));
+                                    }
+                                });
+                                let _ = wgtui::run_command_stdout(cmd, &args, string_tx);
+                            }
+                        }
+                    } else {
+                        let _ =
+                            tx.send(ActionResult::OutputLine(format!("--- install {} ---", id)));
+                        let tx2 = tx.clone();
+                        let (string_tx, string_rx) = mpsc::channel::<String>();
+                        thread::spawn(move || {
+                            while let Ok(line) = string_rx.recv() {
+                                let _ = tx2.send(ActionResult::OutputLine(line));
+                            }
+                        });
+                        let args = [
+                            "install",
+                            "--exact",
+                            id,
+                            "--silent",
+                            "--accept-package-agreements",
+                            "--accept-source-agreements",
+                            "--scope",
+                            "machine",
+                        ];
+                        let _ = run_winget_stdout(&args, string_tx);
                     }
-                });
-                let args = [
-                    "install",
-                    "--exact",
-                    id,
-                    "--silent",
-                    "--accept-package-agreements",
-                    "--accept-source-agreements",
-                    "--scope",
-                    "machine",
-                ];
-                let _ = run_winget_stdout(&args, string_tx);
-                let _ = tx.send(ActionResult::OutputLine(String::new()));
+                    let _ = tx.send(ActionResult::OutputLine(String::new()));
+                }
             }
             let _ = tx_clone.send(ActionResult::RefreshInstalled(list_installed()));
+            let updates = list_upgradable();
+            let _ = tx_clone.send(ActionResult::UpgradeList(updates));
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
@@ -1100,32 +1083,44 @@ impl App {
         let tx_refresh = tx.clone();
         self.command_output.clear();
         self.output_scroll = usize::MAX;
-        self.current_command = Some(format!("winget uninstall {} packages", ids.len()));
+        self.current_command = Some(format!("uninstall/remove {} apps/scripts", ids.len()));
         self.busy = true;
+        let packages_clone = self.packages.clone();
         thread::spawn(move || {
             for id in &ids {
-                let _ = tx.send(ActionResult::OutputLine(format!(
-                    "--- uninstall {} ---",
-                    id
-                )));
-                let tx2 = tx.clone();
-                let (string_tx, string_rx) = mpsc::channel::<String>();
-                thread::spawn(move || {
-                    while let Ok(line) = string_rx.recv() {
-                        let _ = tx2.send(ActionResult::OutputLine(line));
+                if let Some(pkg) = packages_clone.iter().find(|p| p.id == *id) {
+                    if pkg.is_script {
+                        let _ = tx.send(ActionResult::OutputLine(format!(
+                            "--- remove/uninstall not supported for script: {} ---",
+                            pkg.name
+                        )));
+                    } else {
+                        let _ = tx.send(ActionResult::OutputLine(format!(
+                            "--- uninstall {} ---",
+                            id
+                        )));
+                        let tx2 = tx.clone();
+                        let (string_tx, string_rx) = mpsc::channel::<String>();
+                        thread::spawn(move || {
+                            while let Ok(line) = string_rx.recv() {
+                                let _ = tx2.send(ActionResult::OutputLine(line));
+                            }
+                        });
+                        let args = [
+                            "uninstall",
+                            "--exact",
+                            id,
+                            "--silent",
+                            "--accept-source-agreements",
+                        ];
+                        let _ = run_winget_stdout(&args, string_tx);
                     }
-                });
-                let args = [
-                    "uninstall",
-                    "--exact",
-                    id,
-                    "--silent",
-                    "--accept-source-agreements",
-                ];
-                let _ = run_winget_stdout(&args, string_tx);
-                let _ = tx.send(ActionResult::OutputLine(String::new()));
+                    let _ = tx.send(ActionResult::OutputLine(String::new()));
+                }
             }
             let _ = tx_refresh.send(ActionResult::RefreshInstalled(list_installed()));
+            let updates = list_upgradable();
+            let _ = tx_refresh.send(ActionResult::UpgradeList(updates));
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
@@ -1134,21 +1129,37 @@ impl App {
         let tx = self.action_tx.clone();
         self.command_output.clear();
         self.output_scroll = usize::MAX;
-        self.current_command = Some(format!("winget show {} packages", ids.len()));
+        self.current_command = Some(format!("show {} apps/scripts", ids.len()));
         self.busy = true;
+        let packages_clone = self.packages.clone();
         thread::spawn(move || {
             for id in &ids {
-                let _ = tx.send(ActionResult::OutputLine(format!("--- {} ---", id)));
-                let tx2 = tx.clone();
-                let (string_tx, string_rx) = mpsc::channel::<String>();
-                thread::spawn(move || {
-                    while let Ok(line) = string_rx.recv() {
-                        let _ = tx2.send(ActionResult::OutputLine(line));
+                if let Some(pkg) = packages_clone.iter().find(|p| p.id == *id) {
+                    if pkg.is_script {
+                        let _ = tx.send(ActionResult::OutputLine(format!(
+                            "--- script: {} ---",
+                            pkg.name
+                        )));
+                        if let Some(ref cmd_args) = pkg.command {
+                            let _ = tx.send(ActionResult::OutputLine(format!(
+                                "Command: {}",
+                                cmd_args.join(" ")
+                            )));
+                        }
+                    } else {
+                        let _ = tx.send(ActionResult::OutputLine(format!("--- {} ---", id)));
+                        let tx2 = tx.clone();
+                        let (string_tx, string_rx) = mpsc::channel::<String>();
+                        thread::spawn(move || {
+                            while let Ok(line) = string_rx.recv() {
+                                let _ = tx2.send(ActionResult::OutputLine(line));
+                            }
+                        });
+                        let args = ["show", id, "--accept-source-agreements"];
+                        let _ = run_winget_stdout(&args, string_tx);
                     }
-                });
-                let args = ["show", id, "--accept-source-agreements"];
-                let _ = run_winget_stdout(&args, string_tx);
-                let _ = tx.send(ActionResult::OutputLine(String::new()));
+                    let _ = tx.send(ActionResult::OutputLine(String::new()));
+                }
             }
             let _ = tx.send(ActionResult::CommandDone);
         });
@@ -1226,7 +1237,7 @@ impl App {
             Tab::Updates => " Filter updates ",
             Tab::Search => " Search (Enter to query winget) ",
             Tab::Installed => " Filter installed ",
-            Tab::Packages => " Filter packages ",
+            Tab::Packages => " Filter apps/scripts ",
         };
         let (focused, msg) = match self.tab {
             Tab::Updates => (self.filter_focused, self.filter_query.as_str()),
@@ -1498,10 +1509,10 @@ impl App {
             Style::default().fg(Color::DarkGray)
         };
         let count_info = if self.filter_query.is_empty() {
-            format!(" Packages ({} total) ", self.packages.len())
+            format!(" Apps/Scripts ({} total) ", self.packages.len())
         } else {
             format!(
-                " Packages ({} / {} filtered) ",
+                " Apps/Scripts ({} / {} filtered) ",
                 filtered.len(),
                 self.packages.len()
             )
@@ -1515,7 +1526,7 @@ impl App {
                     .map(|l| ListItem::new(l.to_string()))
                     .collect();
                 if lines.is_empty() {
-                    lines.push(ListItem::new("No packages found"));
+                    lines.push(ListItem::new("No apps/scripts found"));
                 }
                 lines
             } else {
@@ -1528,7 +1539,9 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(i, pkg)| {
-                    let display = if installed_ids.contains(pkg.id.as_str()) {
+                    let display = if pkg.is_script {
+                        format!("▶ {}", pkg.name)
+                    } else if installed_ids.contains(pkg.id.as_str()) {
                         format!("✓ {}", pkg.name)
                     } else {
                         format!("  {}", pkg.name)
@@ -1632,7 +1645,7 @@ impl App {
             ),
             Tab::Packages => (
                 Tab::STATUS_BAR_STR.to_owned()
-                    + "[i] install  [I] install all  [r] remove  [R] remove all  [F] file  ",
+                    + "[i] install/run  [I] install/run all  [r] remove  [R] remove all  [F] file  ",
                 " [Esc] quit ",
             ),
         };

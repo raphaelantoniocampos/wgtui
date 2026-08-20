@@ -304,13 +304,15 @@ fn parse_winget_table(output: &str) -> Vec<WingetPackage> {
 
 /// Runs a winget command and sends its stdout lines live through the sender.
 /// The sender is dropped when the command finishes, signaling completion.
-pub fn run_winget_stdout(args: &[&str], tx: mpsc::Sender<String>) -> Result<(), String> {
-    let mut child = Command::new("winget")
+/// Runs a command and sends its stdout lines live through the sender.
+/// The sender is dropped when the command finishes, signaling completion.
+pub fn run_command_stdout(cmd: &str, args: &[&str], tx: mpsc::Sender<String>) -> Result<(), String> {
+    let mut child = Command::new(cmd)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to spawn winget: {e}"))?;
+        .map_err(|e| format!("Failed to spawn {cmd}: {e}"))?;
 
     let stdout = child.stdout.take().ok_or("No stdout")?;
     let reader = BufReader::new(stdout);
@@ -328,11 +330,18 @@ pub fn run_winget_stdout(args: &[&str], tx: mpsc::Sender<String>) -> Result<(), 
     Ok(())
 }
 
-/// A package read from a winget export JSON file.
+/// Runs a winget command and sends its stdout lines live through the sender.
+pub fn run_winget_stdout(args: &[&str], tx: mpsc::Sender<String>) -> Result<(), String> {
+    run_command_stdout("winget", args, tx)
+}
+
+/// A package or script read from a JSON file.
 #[derive(Debug, Clone)]
 pub struct JsonPackage {
     pub id: String,
     pub name: String,
+    pub command: Option<Vec<String>>,
+    pub is_script: bool,
 }
 
 // Serde types matching the winget export schema:
@@ -365,8 +374,25 @@ struct ExportPackage {
     package_name: Option<String>,
 }
 
-/// Scans `dir` for `*.json` files that match the winget export schema
-/// and returns a merged deduplicated list of package identifiers.
+// New ids.json format with Packages and Scripts:
+#[derive(Deserialize)]
+struct IdsFile {
+    #[serde(rename = "Packages")]
+    packages: Option<Vec<ExportPackage>>,
+    #[serde(rename = "Scripts")]
+    scripts: Option<Vec<ExportScript>>,
+}
+
+#[derive(Deserialize)]
+struct ExportScript {
+    #[serde(rename = "ScriptName")]
+    script_name: String,
+    #[serde(rename = "Command")]
+    command: Vec<String>,
+}
+
+/// Scans `dir` for `*.json` files that match the winget export schema or ids.json schema
+/// and returns a merged list of files.
 /// Never panics — returns an empty vec on any error.
 #[must_use]
 pub fn find_package_json_files(dir: &Path) -> Vec<std::path::PathBuf> {
@@ -385,8 +411,9 @@ pub fn find_package_json_files(dir: &Path) -> Vec<std::path::PathBuf> {
             Ok(c) => c,
             Err(_) => continue,
         };
-        // Quick validation: try both formats
-        if serde_json::from_str::<ExportRoot>(&content).is_ok()
+        // Quick validation: try all formats
+        if serde_json::from_str::<IdsFile>(&content).is_ok()
+            || serde_json::from_str::<ExportRoot>(&content).is_ok()
             || serde_json::from_str::<FlatPackageList>(&content).is_ok()
         {
             files.push(path);
@@ -395,7 +422,7 @@ pub fn find_package_json_files(dir: &Path) -> Vec<std::path::PathBuf> {
     files
 }
 
-/// Loads packages from a single JSON file.
+/// Loads packages and scripts from a single JSON file.
 #[must_use]
 pub fn load_packages_from_file(path: &Path) -> Vec<JsonPackage> {
     let content = match fs::read_to_string(path) {
@@ -403,13 +430,51 @@ pub fn load_packages_from_file(path: &Path) -> Vec<JsonPackage> {
         Err(_) => return vec![],
     };
 
+    // Try ids.json format first (contains Packages and/or Scripts)
+    if let Ok(ids_file) = serde_json::from_str::<IdsFile>(&content) {
+        if ids_file.packages.is_none() && ids_file.scripts.is_none() {
+            // Neither field present — this is not an ids.json file, fall through
+        } else {
+            let mut result = Vec::new();
+            if let Some(pkgs) = ids_file.packages {
+                for pkg in pkgs {
+                    let id = pkg.package_identifier;
+                    let name = pkg.package_name.unwrap_or_else(|| id.clone());
+                    result.push(JsonPackage {
+                        id,
+                        name,
+                        command: None,
+                        is_script: false,
+                    });
+                }
+            }
+            if let Some(scripts) = ids_file.scripts {
+                for script in scripts {
+                    let name = script.script_name;
+                    result.push(JsonPackage {
+                        id: name.clone(),
+                        name,
+                        command: Some(script.command),
+                        is_script: true,
+                    });
+                }
+            }
+            return result;
+        }
+    }
+
     let mk_pkg = |p: ExportPackage| {
         let id = p.package_identifier;
         let name = p.package_name.unwrap_or_else(|| id.clone());
-        JsonPackage { id, name }
+        JsonPackage {
+            id,
+            name,
+            command: None,
+            is_script: false,
+        }
     };
 
-    // Try full winget export format first
+    // Try full winget export format
     if let Ok(root) = serde_json::from_str::<ExportRoot>(&content) {
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
@@ -433,8 +498,8 @@ pub fn load_packages_from_file(path: &Path) -> Vec<JsonPackage> {
     vec![]
 }
 
-/// Scans `dir` for `*.json` files that match the winget export schema
-/// and returns a merged deduplicated list of package identifiers.
+/// Scans `dir` for `*.json` files that match the schemas
+/// and returns a merged deduplicated list of packages and scripts.
 /// Never panics — returns an empty vec on any error.
 #[must_use]
 pub fn load_export_packages(dir: &Path) -> Vec<JsonPackage> {
@@ -448,32 +513,10 @@ pub fn load_export_packages(dir: &Path) -> Vec<JsonPackage> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        // Try full winget export format first: { "Sources": [{ "Packages": [...] }] }
-        if let Ok(root) = serde_json::from_str::<ExportRoot>(&content) {
-            for source in root.sources {
-                for pkg in source.packages {
-                    if seen.insert(pkg.package_identifier.clone()) {
-                        let name = pkg.package_name.unwrap_or_else(|| pkg.package_identifier.clone());
-                        result.push(JsonPackage { id: pkg.package_identifier, name });
-                    }
-                }
-            }
-        // Fall back to flat format: { "Packages": [{ "PackageIdentifier": "..." }] }
-        } else if let Ok(flat) = serde_json::from_str::<FlatPackageList>(&content) {
-            if let Some(pkgs) = flat.packages {
-                for pkg in pkgs {
-                    if seen.insert(pkg.package_identifier.clone()) {
-                        let name = pkg.package_name.unwrap_or_else(|| pkg.package_identifier.clone());
-                        result.push(JsonPackage { id: pkg.package_identifier, name });
-                    }
-                }
+        let pkgs = load_packages_from_file(&path);
+        for pkg in pkgs {
+            if seen.insert(pkg.id.clone()) {
+                result.push(pkg);
             }
         }
     }
@@ -633,5 +676,37 @@ Google Chrome         Google.Chrome         134.0.6998.165    winget
         assert_eq!(packages.len(), 2);
         assert_eq!(packages[0].name, "Anydesk");
         assert_eq!(packages[1].name, "CPUID.CPU-Z"); // falls back to id
+    }
+
+    #[test]
+    fn test_load_ids_json() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ids.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            r#"{{
+            "Packages": [
+                {{ "PackageIdentifier": "Google.Chrome", "PackageName": "Chrome" }}
+            ],
+            "Scripts": [
+                {{
+                    "ScriptName": "Activate Windows",
+                    "Command": ["powershell", "irm https://get.activated.win | iex"]
+                }}
+            ]
+        }}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let packages = load_packages_from_file(&path);
+        assert_eq!(packages.len(), 2);
+        assert_eq!(packages[0].name, "Chrome");
+        assert_eq!(packages[0].is_script, false);
+        assert_eq!(packages[1].name, "Activate Windows");
+        assert_eq!(packages[1].is_script, true);
+        assert_eq!(packages[1].command.as_ref().unwrap()[0], "powershell");
     }
 }
