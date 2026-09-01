@@ -16,7 +16,7 @@ use ratatui::{Frame, Terminal};
 use wgtui::{
     JsonPackage, UpgradablePackage, WingetPackage, find_package_json_files, is_installed,
     list_installed, list_upgradable, load_packages_from_file, run_winget_stdout, search_packages,
-    upgrade_all_packages,
+    update_sources, upgrade_all_packages,
 };
 
 use crate::elevation::{elevation_warning, is_elevated};
@@ -265,8 +265,10 @@ impl App {
         }
     }
 
-    /// Kicks off the startup `winget list` / `winget upgrade` on background
-    /// threads. Results arrive as `InitialInstalled` / `InitialUpdates`.
+    /// Kicks off the startup work on background threads: `winget list` /
+    /// `winget upgrade` (results as `InitialInstalled` / `InitialUpdates`), the
+    /// admin-rights check, and a silent `winget source update` that refreshes
+    /// the upgrade list once the indexes are current.
     fn begin_initial_load(&self) {
         let tx = self.action_tx.clone();
         thread::spawn(move || {
@@ -279,6 +281,12 @@ impl App {
         let tx = self.action_tx.clone();
         thread::spawn(move || {
             let _ = tx.send(ActionResult::Elevation(is_elevated()));
+        });
+        let tx = self.action_tx.clone();
+        thread::spawn(move || {
+            if update_sources() {
+                let _ = tx.send(ActionResult::UpgradeList(list_upgradable()));
+            }
         });
     }
 
@@ -1875,6 +1883,17 @@ mod tests {
         assert!(app.elevated, "assumed elevated until the check reports");
         app.handle_action_result(ActionResult::Elevation(false));
         assert!(!app.elevated);
+    }
+
+    #[test]
+    fn upgrade_list_result_refreshes_updates_without_reloading() {
+        // The startup `winget source update` thread feeds a fresh upgrade list
+        // back through UpgradeList; it must not re-trigger the loading state.
+        let mut app = App::new();
+        app.initial_load_pending = 0;
+        app.handle_action_result(ActionResult::UpgradeList(vec![upkg("a"), upkg("b")]));
+        assert_eq!(app.updates.len(), 2);
+        assert_eq!(app.initial_load_pending, 0);
     }
 
     // ----- vim keybindings -----

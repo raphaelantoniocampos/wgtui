@@ -28,6 +28,19 @@ pub fn check_winget() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Runs `winget source update` to refresh the package source indexes.
+///
+/// Output is discarded. Returns whether it succeeded.
+pub fn update_sources() -> bool {
+    Command::new("winget")
+        .args(["source", "update"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Runs `winget search <query>` and parses the tabular output into a list of packages.
 ///
 /// Returns an empty vec on error.
