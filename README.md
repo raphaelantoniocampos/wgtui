@@ -1,5 +1,7 @@
 # wgtui
 
+[![CI](https://github.com/raphaelantoniocampos/wgtui/actions/workflows/ci.yml/badge.svg)](https://github.com/raphaelantoniocampos/wgtui/actions/workflows/ci.yml)
+
 `wgtui` (**w**in**g**et **TUI**) é uma interface de terminal, controlada por teclado,
 para o gerenciador de pacotes **winget** do Windows: procurar, instalar, atualizar e
 remover pacotes, além de provisionar uma máquina a partir de um manifesto JSON
@@ -24,6 +26,9 @@ agora exclusivamente winget (Chocolatey/Scoop foram descartados) e em Rust.
 cargo run            # desenvolvimento
 cargo build --release # gera target/release/wgtui.exe
 ```
+
+Cada push/PR roda `fmt` + `clippy -D warnings` + `cargo test` no CI. Um push de tag
+`vX.Y.Z` compila em release e publica o `wgtui.exe` numa GitHub Release.
 
 ## Abas e teclas
 
