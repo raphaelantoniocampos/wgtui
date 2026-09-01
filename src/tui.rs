@@ -160,6 +160,78 @@ enum ActionResult {
     CommandDone,
 }
 
+/// Cursor + multi-selection state for one list.
+///
+/// Indices refer to the tab's **filtered** view, so navigation methods take the
+/// current filtered length.
+#[derive(Default)]
+pub struct Selection {
+    /// Cursor row.
+    pub cursor: usize,
+    /// Multi-selected rows. Empty means "act on the cursor row".
+    pub marked: HashSet<usize>,
+}
+
+impl Selection {
+    fn clamp(&mut self, len: usize) {
+        if self.cursor >= len && len > 0 {
+            self.cursor = len - 1;
+        }
+    }
+
+    /// Moves the cursor up. Returns `true` if it was already at the top (the
+    /// caller may then refocus the filter input).
+    fn up(&mut self) -> bool {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn down(&mut self, len: usize) {
+        if len > 0 && self.cursor + 1 < len {
+            self.cursor += 1;
+        }
+    }
+
+    fn toggle_current(&mut self) {
+        if !self.marked.remove(&self.cursor) {
+            self.marked.insert(self.cursor);
+        }
+    }
+
+    /// Selects every row, or clears if all `len` rows are already selected.
+    fn toggle_all(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        if self.marked.len() >= len {
+            self.marked.clear();
+        } else {
+            self.marked = (0..len).collect();
+        }
+    }
+
+    fn reset(&mut self) {
+        self.cursor = 0;
+        self.marked.clear();
+    }
+
+    /// Row indices to act on: the marked set (sorted), or `[cursor]` when
+    /// nothing is marked.
+    fn active(&self) -> Vec<usize> {
+        if self.marked.is_empty() {
+            vec![self.cursor]
+        } else {
+            let mut v: Vec<usize> = self.marked.iter().copied().collect();
+            v.sort_unstable();
+            v
+        }
+    }
+}
+
 /// Main application state.
 pub struct App {
     pub tab: Tab,
@@ -169,22 +241,16 @@ pub struct App {
     pub filter_query: String,
     /// Results from the last winget search (unfiltered).
     pub search_results: Vec<WingetPackage>,
-    /// Index in the search results list.
-    pub search_selected: usize,
-    /// Multi-selected indices in the search results list.
-    search_selected_set: HashSet<usize>,
+    /// Cursor / multi-selection in the search results list.
+    pub search_sel: Selection,
     /// Packages with available updates from `winget upgrade` (list mode).
     pub updates: Vec<UpgradablePackage>,
-    /// Index in the updates list.
-    pub updates_selected: usize,
-    /// Multi-selected indices in the updates list.
-    updates_selected_set: HashSet<usize>,
+    /// Cursor / multi-selection in the updates list.
+    pub updates_sel: Selection,
     /// Currently loaded installed packages (unfiltered).
     pub installed: Vec<WingetPackage>,
-    /// Index in the installed list.
-    pub installed_selected: usize,
-    /// Multi-selected indices in the installed list.
-    installed_selected_set: HashSet<usize>,
+    /// Cursor / multi-selection in the installed list.
+    pub installed_sel: Selection,
     /// Discovered JSON package files (populated at startup).
     pub package_files: Vec<PathBuf>,
     /// Index in the file picker list.
@@ -193,10 +259,8 @@ pub struct App {
     packages_file_picker: bool,
     /// Packages loaded from a selected JSON file.
     pub packages: Vec<JsonPackage>,
-    /// Index in the packages list.
-    pub packages_selected: usize,
-    /// Multi-selected indices in the packages list.
-    packages_selected_set: HashSet<usize>,
+    /// Cursor / multi-selection in the packages list.
+    pub packages_sel: Selection,
     /// Diagnostic message about package loading (for debugging).
     packages_diagnostic: String,
     /// The last winget command that was run (shown in the command bar).
@@ -266,20 +330,16 @@ impl App {
             filter_focused: false,
             filter_query: String::new(),
             search_results: vec![],
-            search_selected: 0,
-            search_selected_set: HashSet::new(),
+            search_sel: Selection::default(),
             updates,
-            updates_selected: 0,
-            updates_selected_set: HashSet::new(),
+            updates_sel: Selection::default(),
             installed,
-            installed_selected: 0,
-            installed_selected_set: HashSet::new(),
+            installed_sel: Selection::default(),
             package_files,
             package_file_selected: 0,
             packages_file_picker,
             packages,
-            packages_selected: 0,
-            packages_selected_set: HashSet::new(),
+            packages_sel: Selection::default(),
             packages_diagnostic: diag,
             current_command: None,
             last_command: None,
@@ -366,7 +426,7 @@ impl App {
         match action {
             ActionResult::SearchResults(list) => {
                 self.search_results = list;
-                self.search_selected = 0;
+                self.search_sel.cursor = 0;
             }
             ActionResult::UpgradeList(list) => {
                 self.updates = list;
@@ -394,7 +454,7 @@ impl App {
             }
             ActionResult::RefreshInstalled(list) => {
                 self.installed = list;
-                self.installed_selected = 0;
+                self.installed_sel.cursor = 0;
                 self.current_command = Some("winget list --refresh".to_string());
                 self.command_output = vec!["Package list refreshed.".to_string()];
                 self.output_scroll = usize::MAX;
@@ -465,155 +525,121 @@ impl App {
         }
     }
 
-    fn clamp_selected(&mut self) {
-        let n = self.filtered_search_results().len();
-        if self.search_selected >= n && n > 0 {
-            self.search_selected = n - 1;
-        }
-        let u = self.filtered_updates().len();
-        if self.updates_selected >= u && u > 0 {
-            self.updates_selected = u - 1;
-        }
-        let m = self.filtered_installed().len();
-        if self.installed_selected >= m && m > 0 {
-            self.installed_selected = m - 1;
-        }
-        let p = self.filtered_packages().len();
-        if self.packages_selected >= p && p > 0 {
-            self.packages_selected = p - 1;
-        }
-    }
-
-    fn selected_ids(&self) -> Vec<String> {
+    /// The current tab's selection state.
+    fn sel(&self) -> &Selection {
         match self.tab {
-            Tab::Search => {
-                let filtered = self.filtered_search_results();
-                if self.search_selected_set.is_empty() {
-                    filtered
-                        .get(self.search_selected)
-                        .map(|p| p.id.clone())
-                        .into_iter()
-                        .collect()
-                } else {
-                    self.search_selected_set
-                        .iter()
-                        .filter_map(|&i| filtered.get(i).map(|p| p.id.clone()))
-                        .collect()
-                }
-            }
-            Tab::Updates => {
-                let filtered = self.filtered_updates();
-                if self.updates_selected_set.is_empty() {
-                    filtered
-                        .get(self.updates_selected)
-                        .map(|p| p.id.clone())
-                        .into_iter()
-                        .collect()
-                } else {
-                    self.updates_selected_set
-                        .iter()
-                        .filter_map(|&i| filtered.get(i).map(|p| p.id.clone()))
-                        .collect()
-                }
-            }
-            Tab::Installed => {
-                let filtered = self.filtered_installed();
-                if self.installed_selected_set.is_empty() {
-                    filtered
-                        .get(self.installed_selected)
-                        .map(|p| p.id.clone())
-                        .into_iter()
-                        .collect()
-                } else {
-                    self.installed_selected_set
-                        .iter()
-                        .filter_map(|&i| filtered.get(i).map(|p| p.id.clone()))
-                        .collect()
-                }
-            }
-            Tab::Packages => {
-                let filtered = self.filtered_packages();
-                if self.packages_selected_set.is_empty() {
-                    filtered
-                        .get(self.packages_selected)
-                        .map(|p| p.id.clone())
-                        .into_iter()
-                        .collect()
-                } else {
-                    self.packages_selected_set
-                        .iter()
-                        .filter_map(|&i| filtered.get(i).map(|p| p.id.clone()))
-                        .collect()
-                }
-            }
+            Tab::Search => &self.search_sel,
+            Tab::Updates => &self.updates_sel,
+            Tab::Installed => &self.installed_sel,
+            Tab::Packages => &self.packages_sel,
         }
     }
 
-    fn toggle_selection(&mut self) {
+    fn sel_mut(&mut self) -> &mut Selection {
         match self.tab {
-            Tab::Search => {
-                if self.search_selected_set.contains(&self.search_selected) {
-                    self.search_selected_set.remove(&self.search_selected);
-                } else {
-                    self.search_selected_set.insert(self.search_selected);
-                }
-            }
-            Tab::Updates => {
-                if self.updates_selected_set.contains(&self.updates_selected) {
-                    self.updates_selected_set.remove(&self.updates_selected);
-                } else {
-                    self.updates_selected_set.insert(self.updates_selected);
-                }
-            }
-            Tab::Installed => {
-                if self
-                    .installed_selected_set
-                    .contains(&self.installed_selected)
-                {
-                    self.installed_selected_set.remove(&self.installed_selected);
-                } else {
-                    self.installed_selected_set.insert(self.installed_selected);
-                }
-            }
-            Tab::Packages => {
-                if self.packages_selected_set.contains(&self.packages_selected) {
-                    self.packages_selected_set.remove(&self.packages_selected);
-                } else {
-                    self.packages_selected_set.insert(self.packages_selected);
-                }
-            }
+            Tab::Search => &mut self.search_sel,
+            Tab::Updates => &mut self.updates_sel,
+            Tab::Installed => &mut self.installed_sel,
+            Tab::Packages => &mut self.packages_sel,
         }
     }
 
-    fn clear_selections(&mut self) {
-        self.search_selected_set.clear();
-        self.updates_selected_set.clear();
-        self.installed_selected_set.clear();
-        self.packages_selected_set.clear();
-    }
-
-    /// Toggles multi-selection of every (filtered) row in the current tab:
-    /// selects all when not all are selected, clears otherwise.
-    fn toggle_select_all(&mut self) {
-        let n = match self.tab {
+    /// Number of rows visible in the current tab (after filtering).
+    fn filtered_len(&self) -> usize {
+        match self.tab {
             Tab::Search => self.filtered_search_results().len(),
             Tab::Updates => self.filtered_updates().len(),
             Tab::Installed => self.filtered_installed().len(),
             Tab::Packages => self.filtered_packages().len(),
+        }
+    }
+
+    fn clamp_selected(&mut self) {
+        let (s, u, i, p) = (
+            self.filtered_search_results().len(),
+            self.filtered_updates().len(),
+            self.filtered_installed().len(),
+            self.filtered_packages().len(),
+        );
+        self.search_sel.clamp(s);
+        self.updates_sel.clamp(u);
+        self.installed_sel.clamp(i);
+        self.packages_sel.clamp(p);
+    }
+
+    fn selected_ids(&self) -> Vec<String> {
+        let idx = self.sel().active();
+        let pick = |ids: Vec<String>| -> Vec<String> {
+            idx.iter().filter_map(|&i| ids.get(i).cloned()).collect()
         };
-        if n == 0 {
+        match self.tab {
+            Tab::Search => pick(
+                self.filtered_search_results()
+                    .iter()
+                    .map(|p| p.id.clone())
+                    .collect(),
+            ),
+            Tab::Updates => pick(
+                self.filtered_updates()
+                    .iter()
+                    .map(|p| p.id.clone())
+                    .collect(),
+            ),
+            Tab::Installed => pick(
+                self.filtered_installed()
+                    .iter()
+                    .map(|p| p.id.clone())
+                    .collect(),
+            ),
+            Tab::Packages => pick(
+                self.filtered_packages()
+                    .iter()
+                    .map(|p| p.id.clone())
+                    .collect(),
+            ),
+        }
+    }
+
+    fn toggle_selection(&mut self) {
+        self.sel_mut().toggle_current();
+    }
+
+    fn clear_selections(&mut self) {
+        for s in [
+            &mut self.search_sel,
+            &mut self.updates_sel,
+            &mut self.installed_sel,
+            &mut self.packages_sel,
+        ] {
+            s.marked.clear();
+        }
+    }
+
+    /// Selects every visible row in the current tab, or clears if all are
+    /// already selected.
+    fn toggle_select_all(&mut self) {
+        let n = self.filtered_len();
+        self.sel_mut().toggle_all(n);
+    }
+
+    /// Switches to `tab`, resetting the shared filter and every tab's marks.
+    fn switch_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.filter_query.clear();
+        self.filter_focused = false;
+        self.clamp_selected();
+        self.clear_selections();
+    }
+
+    /// `winget show` (or script details) for the current selection.
+    fn show_selected(&mut self) {
+        let ids = self.selected_ids();
+        if ids.is_empty() {
             return;
         }
-        let set = match self.tab {
-            Tab::Search => &mut self.search_selected_set,
-            Tab::Updates => &mut self.updates_selected_set,
-            Tab::Installed => &mut self.installed_selected_set,
-            Tab::Packages => &mut self.packages_selected_set,
-        };
-        if set.len() >= n {
-            set.clear();
-        } else {
-            *set = (0..n).collect();
+        match self.tab {
+            Tab::Packages => self.show_json_package(ids),
+            _ => self.show_multi_pkg(ids),
         }
     }
 
@@ -731,51 +757,29 @@ impl App {
                         .unwrap_or_else(|| "winget ".to_string()),
                 );
             }
-            KeyCode::Char('1') => {
-                self.tab = Tab::Updates;
-                self.filter_query.clear();
-                self.filter_focused = false;
-                self.clamp_selected();
-                self.clear_selections();
-            }
-            KeyCode::Char('2') => {
-                self.tab = Tab::Search;
-                self.filter_query.clear();
-                self.filter_focused = false;
-                self.clamp_selected();
-                self.clear_selections();
-            }
-            KeyCode::Char('3') => {
-                self.tab = Tab::Installed;
-                self.filter_query.clear();
-                self.filter_focused = false;
-                self.clamp_selected();
-                self.clear_selections();
-            }
-            KeyCode::Char('4') => {
-                self.tab = Tab::Packages;
-                self.filter_query.clear();
-                self.filter_focused = false;
-                self.clamp_selected();
-                self.clear_selections();
-            }
+            KeyCode::Char('1') => self.switch_tab(Tab::Updates),
+            KeyCode::Char('2') => self.switch_tab(Tab::Search),
+            KeyCode::Char('3') => self.switch_tab(Tab::Installed),
+            KeyCode::Char('4') => self.switch_tab(Tab::Packages),
             KeyCode::Left | KeyCode::BackTab | KeyCode::Char('h') => {
-                self.tab = self.tab.prev();
-                self.filter_query.clear();
-                self.filter_focused = false;
-                self.clamp_selected();
-                self.clear_selections();
+                self.switch_tab(self.tab.prev());
             }
             KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => {
-                self.tab = self.tab.next();
-                self.filter_query.clear();
-                self.filter_focused = false;
-                self.clamp_selected();
-                self.clear_selections();
+                self.switch_tab(self.tab.next());
             }
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.should_quit = true;
             }
+            KeyCode::Up => {
+                if self.sel_mut().up() {
+                    self.filter_focused = true;
+                }
+            }
+            KeyCode::Down => {
+                let n = self.filtered_len();
+                self.sel_mut().down(n);
+            }
+            KeyCode::Enter => self.show_selected(),
             KeyCode::PageUp => {
                 if !self.command_output.is_empty() {
                     self.output_scroll = if self.output_scroll == usize::MAX {
@@ -805,57 +809,16 @@ impl App {
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Up => {
-                if self.search_selected > 0 {
-                    self.search_selected -= 1;
-                } else {
-                    self.filter_focused = true;
-                }
+        if let KeyCode::Char('i') = key.code {
+            let ids = self.selected_ids();
+            if !ids.is_empty() {
+                self.install_multi_pkg(ids);
             }
-            KeyCode::Down => {
-                let n = self.filtered_search_results().len();
-                if n > 0 && self.search_selected + 1 < n {
-                    self.search_selected += 1;
-                }
-            }
-            KeyCode::Enter => {
-                let ids = self.selected_ids();
-                if !ids.is_empty() {
-                    self.show_multi_pkg(ids);
-                }
-            }
-            KeyCode::Char('i') => {
-                let ids = self.selected_ids();
-                if !ids.is_empty() {
-                    self.install_multi_pkg(ids);
-                }
-            }
-            _ => {}
         }
     }
 
     fn handle_updates_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Up => {
-                if self.updates_selected > 0 {
-                    self.updates_selected -= 1;
-                } else {
-                    self.filter_focused = true;
-                }
-            }
-            KeyCode::Down => {
-                let n = self.filtered_updates().len();
-                if n > 0 && self.updates_selected + 1 < n {
-                    self.updates_selected += 1;
-                }
-            }
-            KeyCode::Enter => {
-                let ids = self.selected_ids();
-                if !ids.is_empty() {
-                    self.show_multi_pkg(ids);
-                }
-            }
             KeyCode::Char('u') => {
                 let ids = self.selected_ids();
                 if !ids.is_empty() {
@@ -885,25 +848,6 @@ impl App {
 
     fn handle_installed_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Up => {
-                if self.installed_selected > 0 {
-                    self.installed_selected -= 1;
-                } else {
-                    self.filter_focused = true;
-                }
-            }
-            KeyCode::Down => {
-                let n = self.filtered_installed().len();
-                if n > 0 && self.installed_selected + 1 < n {
-                    self.installed_selected += 1;
-                }
-            }
-            KeyCode::Enter => {
-                let ids = self.selected_ids();
-                if !ids.is_empty() {
-                    self.show_multi_pkg(ids);
-                }
-            }
             KeyCode::Char('r') => {
                 let ids = self.selected_ids();
                 if !ids.is_empty() {
@@ -941,8 +885,7 @@ impl App {
                     if let Some(path) = self.package_files.get(self.package_file_selected) {
                         let pkgs = load_packages_from_file(path);
                         self.packages = pkgs;
-                        self.packages_selected = 0;
-                        self.packages_selected_set.clear();
+                        self.packages_sel.reset();
                         self.packages_file_picker = false;
                         self.packages_diagnostic = format!(
                             "loaded {} pkgs from {}",
@@ -959,25 +902,6 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Up => {
-                if self.packages_selected > 0 {
-                    self.packages_selected -= 1;
-                } else {
-                    self.filter_focused = true;
-                }
-            }
-            KeyCode::Down => {
-                let n = self.filtered_packages().len();
-                if n > 0 && self.packages_selected + 1 < n {
-                    self.packages_selected += 1;
-                }
-            }
-            KeyCode::Enter => {
-                let ids = self.selected_ids();
-                if !ids.is_empty() {
-                    self.show_json_package(ids);
-                }
-            }
             KeyCode::Char('i') => {
                 let ids = self.selected_ids();
                 if !ids.is_empty() {
@@ -1006,8 +930,7 @@ impl App {
                 if !self.packages_file_picker && self.package_files.len() > 1 {
                     self.packages_file_picker = true;
                     self.packages.clear();
-                    self.packages_selected = 0;
-                    self.packages_selected_set.clear();
+                    self.packages_sel.reset();
                     self.filter_focused = false;
                     self.filter_query.clear();
                 }
@@ -1023,7 +946,7 @@ impl App {
     fn trigger_search(&mut self) {
         if self.filter_query.is_empty() {
             self.search_results.clear();
-            self.search_selected = 0;
+            self.search_sel.cursor = 0;
             return;
         }
         let query = self.filter_query.clone();
@@ -1568,7 +1491,7 @@ impl App {
                     let s = pkg.source.as_deref().unwrap_or("-");
                     Self::selected_line(
                         format!(" {}  {}  [{}]  ({})", pkg.name, pkg.id, v, s),
-                        self.search_selected_set.contains(&i),
+                        self.search_sel.marked.contains(&i),
                     )
                 })
                 .collect()
@@ -1599,7 +1522,7 @@ impl App {
             if self.search_results.is_empty() || self.filter_focused {
                 None
             } else {
-                Some(self.search_selected)
+                Some(self.search_sel.cursor)
             },
         );
         f.render_stateful_widget(list, area, &mut state);
@@ -1641,7 +1564,7 @@ impl App {
                             " {}  {} -> {}",
                             pkg.name, pkg.installed_version, pkg.available_version
                         ),
-                        self.updates_selected_set.contains(&i),
+                        self.updates_sel.marked.contains(&i),
                     )
                 })
                 .collect()
@@ -1666,7 +1589,7 @@ impl App {
             ListState::default().with_selected(if filtered.is_empty() || self.filter_focused {
                 None
             } else {
-                Some(self.updates_selected)
+                Some(self.updates_sel.cursor)
             });
         f.render_stateful_widget(list, area, &mut state);
     }
@@ -1705,7 +1628,7 @@ impl App {
                     let v = pkg.version.as_deref().unwrap_or("-");
                     Self::selected_line(
                         format!(" {}  [{}]", pkg.name, v),
-                        self.installed_selected_set.contains(&i),
+                        self.installed_sel.marked.contains(&i),
                     )
                 })
                 .collect()
@@ -1730,7 +1653,7 @@ impl App {
             ListState::default().with_selected(if filtered.is_empty() || self.filter_focused {
                 None
             } else {
-                Some(self.installed_selected)
+                Some(self.installed_sel.cursor)
             });
         f.render_stateful_widget(list, area, &mut state);
     }
@@ -1819,7 +1742,7 @@ impl App {
                     } else {
                         format!("  {}", pkg.name)
                     };
-                    Self::selected_line(display, self.packages_selected_set.contains(&i))
+                    Self::selected_line(display, self.packages_sel.marked.contains(&i))
                 })
                 .collect()
         };
@@ -1843,7 +1766,7 @@ impl App {
             ListState::default().with_selected(if filtered.is_empty() || self.filter_focused {
                 None
             } else {
-                Some(self.packages_selected)
+                Some(self.packages_sel.cursor)
             });
         f.render_stateful_widget(list, area, &mut state);
     }
@@ -2038,11 +1961,11 @@ mod tests {
     fn toggle_selection_adds_then_removes_current_row() {
         let mut app = App::new();
         app.tab = Tab::Installed;
-        app.installed_selected = 2;
+        app.installed_sel.cursor = 2;
         app.toggle_selection();
-        assert!(app.installed_selected_set.contains(&2));
+        assert!(app.installed_sel.marked.contains(&2));
         app.toggle_selection();
-        assert!(!app.installed_selected_set.contains(&2));
+        assert!(!app.installed_sel.marked.contains(&2));
     }
 
     #[test]
@@ -2124,21 +2047,21 @@ mod tests {
         app.tab = Tab::Updates;
         app.handle_key(ke(KeyCode::Char('j')));
         app.handle_key(ke(KeyCode::Char('j')));
-        assert_eq!(app.updates_selected, 2);
+        assert_eq!(app.updates_sel.cursor, 2);
         app.handle_key(ke(KeyCode::Char('k')));
-        assert_eq!(app.updates_selected, 1);
+        assert_eq!(app.updates_sel.cursor, 1);
 
         app.installed = vec![wpkg("a"), wpkg("b")];
         app.tab = Tab::Installed;
         app.filter_focused = false;
         app.handle_key(ke(KeyCode::Char('j')));
-        assert_eq!(app.installed_selected, 1);
+        assert_eq!(app.installed_sel.cursor, 1);
 
         app.packages = vec![jpkg("a"), jpkg("b"), jpkg("c")];
         app.tab = Tab::Packages;
         app.filter_focused = false;
         app.handle_key(ke(KeyCode::Char('j')));
-        assert_eq!(app.packages_selected, 1);
+        assert_eq!(app.packages_sel.cursor, 1);
     }
 
     #[test]
@@ -2148,9 +2071,9 @@ mod tests {
         app.tab = Tab::Search;
         app.filter_focused = false;
         app.handle_key(ke(KeyCode::Char('j')));
-        assert_eq!(app.search_selected, 1);
+        assert_eq!(app.search_sel.cursor, 1);
         app.handle_key(ke(KeyCode::Char('k')));
-        assert_eq!(app.search_selected, 0);
+        assert_eq!(app.search_sel.cursor, 0);
     }
 
     #[test]
@@ -2279,10 +2202,10 @@ mod tests {
         app.filter_focused = false;
 
         app.handle_key(ke(KeyCode::Char('a')));
-        assert_eq!(app.installed_selected_set.len(), 3);
+        assert_eq!(app.installed_sel.marked.len(), 3);
         // second press clears
         app.handle_key(ke(KeyCode::Char('a')));
-        assert!(app.installed_selected_set.is_empty());
+        assert!(app.installed_sel.marked.is_empty());
     }
 
     #[test]
@@ -2294,7 +2217,7 @@ mod tests {
         app.filter_focused = false;
 
         app.handle_key(ke(KeyCode::Char('a')));
-        assert_eq!(app.packages_selected_set.len(), 2);
+        assert_eq!(app.packages_sel.marked.len(), 2);
     }
 
     #[test]
@@ -2306,6 +2229,6 @@ mod tests {
             app.handle_key(ke(KeyCode::Char(c)));
         }
         assert_eq!(app.filter_query, "anydesk");
-        assert!(app.search_selected_set.is_empty());
+        assert!(app.search_sel.marked.is_empty());
     }
 }
