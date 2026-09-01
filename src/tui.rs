@@ -34,12 +34,30 @@ fn detect_package_dirs() -> Vec<PathBuf> {
         }
     }
     // 3. Current working directory
-    if let Ok(cwd) = std::env::current_dir() {
-        if !dirs.iter().any(|d| d == &cwd) {
-            dirs.push(cwd);
-        }
+    if let Ok(cwd) = std::env::current_dir()
+        && !dirs.iter().any(|d| d == &cwd)
+    {
+        dirs.push(cwd);
     }
     dirs
+}
+
+/// Env var that surfaces the raw package-discovery diagnostic in the UI.
+const DEBUG_ENV: &str = "WGTUI_DEBUG";
+
+/// Lines shown in the Apps/Scripts pane when no manifest could be loaded.
+///
+/// With `debug` set and a non-empty `diagnostic`, the raw discovery trace is
+/// shown; otherwise a short hint pointing at the README.
+fn empty_packages_lines(diagnostic: &str, debug: bool) -> Vec<String> {
+    if debug && !diagnostic.trim().is_empty() {
+        return diagnostic.lines().map(str::to_string).collect();
+    }
+    vec![
+        "Nenhum manifesto encontrado.".to_string(),
+        "Coloque um packages.json na pasta do executável (veja o README).".to_string(),
+        format!("Defina {DEBUG_ENV}=1 para ver os diretórios verificados."),
+    ]
 }
 
 /// The active tab.
@@ -88,8 +106,18 @@ impl Tab {
 enum ActionResult {
     SearchResults(Vec<WingetPackage>),
     UpgradeList(Vec<UpgradablePackage>),
-    SetCommand { command: String, output: String },
-    SetError { command: String, error: String },
+    /// First `winget list` at startup (quiet: no command-bar / output noise).
+    InitialInstalled(Vec<WingetPackage>),
+    /// First `winget upgrade` at startup (quiet).
+    InitialUpdates(Vec<UpgradablePackage>),
+    SetCommand {
+        command: String,
+        output: String,
+    },
+    SetError {
+        command: String,
+        error: String,
+    },
     RefreshInstalled(Vec<WingetPackage>),
     OutputLine(String),
     CommandDone,
@@ -142,6 +170,9 @@ pub struct App {
     output_scroll: usize,
     /// True while a blocking winget command is running.
     pub busy: bool,
+    /// Count of startup list loads (`winget list` + `winget upgrade`) not yet
+    /// finished. Non-zero drives a "loading" spinner without blocking input.
+    initial_load_pending: u8,
     /// Cycles 0..3 for the spinner animation.
     pub spinner_frame: u8,
     /// Sender for background thread results.
@@ -153,8 +184,10 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        let installed = list_installed();
-        let updates = list_upgradable();
+        // Package lists are loaded off-thread (see `begin_initial_load`) so the
+        // first frame paints immediately.
+        let installed = Vec::new();
+        let updates = Vec::new();
         let (tx, rx) = mpsc::channel();
 
         // Discover JSON package files.
@@ -208,6 +241,7 @@ impl App {
             command_output: vec![],
             output_scroll: usize::MAX,
             busy: false,
+            initial_load_pending: 2,
             spinner_frame: 0,
             action_tx: tx,
             action_rx: rx,
@@ -215,11 +249,25 @@ impl App {
         }
     }
 
+    /// Kicks off the startup `winget list` / `winget upgrade` on background
+    /// threads. Results arrive as `InitialInstalled` / `InitialUpdates`.
+    fn begin_initial_load(&self) {
+        let tx = self.action_tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(ActionResult::InitialInstalled(list_installed()));
+        });
+        let tx = self.action_tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(ActionResult::InitialUpdates(list_upgradable()));
+        });
+    }
+
     /// Run the main event loop.
     pub fn run(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.begin_initial_load();
         loop {
             terminal.draw(|f| self.render(f))?;
 
@@ -240,7 +288,7 @@ impl App {
             }
 
             // Advance spinner and poll keyboard
-            if self.busy {
+            if self.busy || self.initial_load_pending > 0 {
                 self.spinner_frame = (self.spinner_frame + 1) % 4;
             }
             if event::poll(Duration::from_millis(100))? {
@@ -263,6 +311,14 @@ impl App {
             }
             ActionResult::UpgradeList(list) => {
                 self.updates = list;
+            }
+            ActionResult::InitialInstalled(list) => {
+                self.installed = list;
+                self.initial_load_pending = self.initial_load_pending.saturating_sub(1);
+            }
+            ActionResult::InitialUpdates(list) => {
+                self.updates = list;
+                self.initial_load_pending = self.initial_load_pending.saturating_sub(1);
             }
             ActionResult::SetCommand { command, output } => {
                 self.current_command = Some(command);
@@ -597,14 +653,12 @@ impl App {
                 }
             }
             KeyCode::PageDown => {
-                if !self.command_output.is_empty() {
-                    if self.output_scroll != usize::MAX {
-                        let new_scroll = self.output_scroll + 5;
-                        if new_scroll >= self.command_output.len() {
-                            self.output_scroll = usize::MAX;
-                        } else {
-                            self.output_scroll = new_scroll;
-                        }
+                if !self.command_output.is_empty() && self.output_scroll != usize::MAX {
+                    let new_scroll = self.output_scroll + 5;
+                    if new_scroll >= self.command_output.len() {
+                        self.output_scroll = usize::MAX;
+                    } else {
+                        self.output_scroll = new_scroll;
                     }
                 }
             }
@@ -1031,20 +1085,20 @@ impl App {
                             "--- run script: {} ---",
                             pkg.name
                         )));
-                        if let Some(ref cmd_args) = pkg.command {
-                            if !cmd_args.is_empty() {
-                                let cmd = &cmd_args[0];
-                                let args: Vec<&str> =
-                                    cmd_args[1..].iter().map(|s| s.as_str()).collect();
-                                let tx2 = tx.clone();
-                                let (string_tx, string_rx) = mpsc::channel::<String>();
-                                thread::spawn(move || {
-                                    while let Ok(line) = string_rx.recv() {
-                                        let _ = tx2.send(ActionResult::OutputLine(line));
-                                    }
-                                });
-                                let _ = wgtui::run_command_stdout(cmd, &args, string_tx);
-                            }
+                        if let Some(ref cmd_args) = pkg.command
+                            && !cmd_args.is_empty()
+                        {
+                            let cmd = &cmd_args[0];
+                            let args: Vec<&str> =
+                                cmd_args[1..].iter().map(|s| s.as_str()).collect();
+                            let tx2 = tx.clone();
+                            let (string_tx, string_rx) = mpsc::channel::<String>();
+                            thread::spawn(move || {
+                                while let Ok(line) = string_rx.recv() {
+                                    let _ = tx2.send(ActionResult::OutputLine(line));
+                                }
+                            });
+                            let _ = wgtui::run_command_stdout(cmd, &args, string_tx);
                         }
                     } else {
                         let _ =
@@ -1239,12 +1293,8 @@ impl App {
             Tab::Installed => " Filter installed ",
             Tab::Packages => " Filter apps/scripts ",
         };
-        let (focused, msg) = match self.tab {
-            Tab::Updates => (self.filter_focused, self.filter_query.as_str()),
-            Tab::Search => (self.filter_focused, self.filter_query.as_str()),
-            Tab::Installed => (self.filter_focused, self.filter_query.as_str()),
-            Tab::Packages => (self.filter_focused, self.filter_query.as_str()),
-        };
+        let focused = self.filter_focused;
+        let msg = self.filter_query.as_str();
 
         let border_style = if focused {
             Style::default().fg(Color::Cyan)
@@ -1350,7 +1400,9 @@ impl App {
         };
 
         let items: Vec<ListItem> = if filtered.is_empty() {
-            let msg = if self.updates.is_empty() {
+            let msg = if self.initial_load_pending > 0 {
+                "Carregando..."
+            } else if self.updates.is_empty() {
                 "All packages are up to date"
             } else {
                 "No packages match the filter"
@@ -1414,7 +1466,9 @@ impl App {
         };
 
         let items: Vec<ListItem> = if filtered.is_empty() {
-            let msg = if self.installed.is_empty() {
+            let msg = if self.initial_load_pending > 0 {
+                "Carregando..."
+            } else if self.installed.is_empty() {
                 "No packages installed via winget"
             } else {
                 "No packages match the filter"
@@ -1520,15 +1574,13 @@ impl App {
 
         let items: Vec<ListItem> = if filtered.is_empty() {
             if self.packages.is_empty() {
-                let mut lines: Vec<ListItem> = self
-                    .packages_diagnostic
-                    .lines()
-                    .map(|l| ListItem::new(l.to_string()))
-                    .collect();
-                if lines.is_empty() {
-                    lines.push(ListItem::new("No apps/scripts found"));
-                }
-                lines
+                empty_packages_lines(
+                    &self.packages_diagnostic,
+                    std::env::var_os(DEBUG_ENV).is_some(),
+                )
+                .into_iter()
+                .map(ListItem::new)
+                .collect()
             } else {
                 vec![ListItem::new("No packages match the filter")]
             }
@@ -1576,7 +1628,8 @@ impl App {
     }
 
     fn render_command_bar(&self, f: &mut Frame<'_>, area: Rect) {
-        let spinner = if self.busy {
+        let loading = self.initial_load_pending > 0;
+        let spinner = if self.busy || loading {
             match self.spinner_frame {
                 0 => ".",
                 1 => "..",
@@ -1586,10 +1639,13 @@ impl App {
         } else {
             ""
         };
-        let prompt = self
-            .current_command
-            .as_deref()
-            .unwrap_or("waiting for command...");
+        let prompt = if loading && self.current_command.is_none() {
+            "carregando listas de pacotes..."
+        } else {
+            self.current_command
+                .as_deref()
+                .unwrap_or("waiting for command...")
+        };
         let line = Line::from(vec![
             Span::raw(spinner),
             Span::raw(" $ "),
@@ -1611,7 +1667,7 @@ impl App {
         let total = lines.len();
         let height = area.height as usize;
         let scroll = if self.output_scroll == usize::MAX {
-            if total > height { total - height } else { 0 }
+            total.saturating_sub(height)
         } else {
             self.output_scroll.min(total.saturating_sub(1))
         };
@@ -1661,5 +1717,86 @@ impl App {
         ]);
 
         f.render_widget(Paragraph::new(Text::from(line)), area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DIAG: &str = "dir: C:\\x\n  -> 0 files\nno json files found\n";
+
+    #[test]
+    fn empty_packages_lines_shows_hint_by_default() {
+        let lines = empty_packages_lines(DIAG, false);
+        assert!(lines.iter().any(|l| l.contains("README")));
+        assert!(!lines.iter().any(|l| l.contains("0 files")));
+    }
+
+    #[test]
+    fn empty_packages_lines_shows_diagnostic_in_debug() {
+        let lines = empty_packages_lines(DIAG, true);
+        assert!(lines.iter().any(|l| l.contains("0 files")));
+    }
+
+    #[test]
+    fn empty_packages_lines_falls_back_when_diagnostic_blank() {
+        let lines = empty_packages_lines("   \n  ", true);
+        assert!(lines.iter().any(|l| l.contains("README")));
+    }
+
+    #[test]
+    fn app_new_does_not_block_on_winget() {
+        // `new()` must not shell out to winget: it returns immediately with
+        // empty lists and the initial load still pending.
+        let app = App::new();
+        assert!(app.installed.is_empty());
+        assert!(app.updates.is_empty());
+        assert!(!app.busy);
+        assert_eq!(app.initial_load_pending, 2);
+    }
+
+    #[test]
+    fn matches_filter_is_fuzzy_and_case_insensitive() {
+        assert!(App::matches_filter("Google Chrome", ""));
+        assert!(App::matches_filter("Google Chrome", "gc"));
+        assert!(App::matches_filter("Google Chrome", "GOOG"));
+        assert!(!App::matches_filter("Google Chrome", "xyz"));
+        assert!(!App::matches_filter("abc", "abcd"));
+    }
+
+    #[test]
+    fn tab_navigation_is_reversible_and_cyclic() {
+        for t in Tab::ALL {
+            assert_eq!(t.next().prev(), t);
+        }
+        assert_eq!(Tab::Packages.next(), Tab::Updates);
+        assert_eq!(Tab::Updates.prev(), Tab::Packages);
+    }
+
+    #[test]
+    fn toggle_selection_adds_then_removes_current_row() {
+        let mut app = App::new();
+        app.tab = Tab::Installed;
+        app.installed_selected = 2;
+        app.toggle_selection();
+        assert!(app.installed_selected_set.contains(&2));
+        app.toggle_selection();
+        assert!(!app.installed_selected_set.contains(&2));
+    }
+
+    #[test]
+    fn initial_result_clears_pending_flag() {
+        let mut app = App::new();
+        app.handle_action_result(ActionResult::InitialInstalled(vec![WingetPackage {
+            name: "X".into(),
+            id: "X.Y".into(),
+            version: None,
+            source: None,
+        }]));
+        assert_eq!(app.initial_load_pending, 1);
+        app.handle_action_result(ActionResult::InitialUpdates(vec![]));
+        assert_eq!(app.initial_load_pending, 0);
+        assert_eq!(app.installed.len(), 1);
     }
 }

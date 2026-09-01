@@ -1,10 +1,12 @@
 mod tui;
 
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
-use ratatui::backend::CrosstermBackend;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::Terminal;
-use std::io::{stdout, Write};
+use ratatui::backend::CrosstermBackend;
+use std::io::{Write, stdout};
 
 use tui::App;
 use wgtui::check_winget;

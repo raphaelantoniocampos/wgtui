@@ -58,104 +58,6 @@ pub fn list_installed() -> Vec<WingetPackage> {
     }
 }
 
-/// Installs a package by its winget ID.
-///
-/// Returns `Ok(())` on success, `Err(message)` on failure.
-pub fn install_package(id: &str) -> Result<String, String> {
-    let output = Command::new("winget")
-        .args([
-            "install",
-            "--exact",
-            id,
-            "--silent",
-            "--accept-package-agreements",
-            "--accept-source-agreements",
-            "--scope",
-            "machine",
-        ])
-        .output()
-        .map_err(|e| format!("Failed to run winget install: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if output.status.success() {
-        Ok(stdout)
-    } else {
-        let msg = if stderr.is_empty() { stdout } else { stderr };
-        Err(msg)
-    }
-}
-
-/// Runs `winget show <id>` to display package info.
-pub fn show_package(id: &str) -> Result<String, String> {
-    let output = Command::new("winget")
-        .args(["show", id, "--accept-source-agreements"])
-        .output()
-        .map_err(|e| format!("Failed to run winget show: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if output.status.success() {
-        Ok(stdout)
-    } else {
-        let msg = if stderr.is_empty() { stdout } else { stderr };
-        Err(msg)
-    }
-}
-
-/// Uninstalls a package by its winget ID.
-pub fn uninstall_package(id: &str) -> Result<String, String> {
-    let output = Command::new("winget")
-        .args([
-            "uninstall",
-            "--exact",
-            id,
-            "--silent",
-            "--accept-source-agreements",
-        ])
-        .output()
-        .map_err(|e| format!("Failed to run winget uninstall: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if output.status.success() {
-        Ok(stdout)
-    } else {
-        let msg = if stderr.is_empty() { stdout } else { stderr };
-        Err(msg)
-    }
-}
-
-/// Upgrades a package by its winget ID.
-///
-/// Returns `Ok(())` on success, `Err(message)` on failure.
-pub fn upgrade_package(id: &str) -> Result<String, String> {
-    let output = Command::new("winget")
-        .args([
-            "upgrade",
-            "--exact",
-            id,
-            "--silent",
-            "--accept-package-agreements",
-            "--accept-source-agreements",
-        ])
-        .output()
-        .map_err(|e| format!("Failed to run winget upgrade: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if output.status.success() {
-        Ok(stdout)
-    } else {
-        let msg = if stderr.is_empty() { stdout } else { stderr };
-        Err(msg)
-    }
-}
-
 /// A package with an available upgrade, returned by `winget upgrade` (list mode).
 #[derive(Debug, Clone)]
 pub struct UpgradablePackage {
@@ -302,11 +204,16 @@ fn parse_winget_table(output: &str) -> Vec<WingetPackage> {
     packages
 }
 
-/// Runs a winget command and sends its stdout lines live through the sender.
-/// The sender is dropped when the command finishes, signaling completion.
-/// Runs a command and sends its stdout lines live through the sender.
-/// The sender is dropped when the command finishes, signaling completion.
-pub fn run_command_stdout(cmd: &str, args: &[&str], tx: mpsc::Sender<String>) -> Result<(), String> {
+/// Runs a command and sends its output lines live through the sender.
+///
+/// Both stdout and stderr are forwarded (stderr is read on its own thread so a
+/// full stderr pipe can't deadlock stdout). The sender is dropped when the
+/// command finishes, signaling completion.
+pub fn run_command_stdout(
+    cmd: &str,
+    args: &[&str],
+    tx: mpsc::Sender<String>,
+) -> Result<(), String> {
     let mut child = Command::new(cmd)
         .args(args)
         .stdout(Stdio::piped())
@@ -315,6 +222,23 @@ pub fn run_command_stdout(cmd: &str, args: &[&str], tx: mpsc::Sender<String>) ->
         .map_err(|e| format!("Failed to spawn {cmd}: {e}"))?;
 
     let stdout = child.stdout.take().ok_or("No stdout")?;
+    let stderr = child.stderr.take().ok_or("No stderr")?;
+
+    let stderr_tx = tx.clone();
+    let stderr_handle = std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(l) => {
+                    if stderr_tx.send(l).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     let reader = BufReader::new(stdout);
     for line in reader.lines() {
         match line {
@@ -326,6 +250,7 @@ pub fn run_command_stdout(cmd: &str, args: &[&str], tx: mpsc::Sender<String>) ->
             Err(_) => break,
         }
     }
+    let _ = stderr_handle.join();
     let _ = child.wait();
     Ok(())
 }
@@ -489,10 +414,10 @@ pub fn load_packages_from_file(path: &Path) -> Vec<JsonPackage> {
     }
 
     // Fall back to flat format
-    if let Ok(flat) = serde_json::from_str::<FlatPackageList>(&content) {
-        if let Some(pkgs) = flat.packages {
-            return pkgs.into_iter().map(mk_pkg).collect();
-        }
+    if let Ok(flat) = serde_json::from_str::<FlatPackageList>(&content)
+        && let Some(pkgs) = flat.packages
+    {
+        return pkgs.into_iter().map(mk_pkg).collect();
     }
 
     vec![]
@@ -527,6 +452,31 @@ pub fn load_export_packages(dir: &Path) -> Vec<JsonPackage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn test_run_command_stdout_captures_stdout() {
+        let (tx, rx) = mpsc::channel();
+        run_command_stdout("cmd", &["/C", "echo", "hello_out"], tx).unwrap();
+        let lines: Vec<String> = rx.iter().collect();
+        assert!(
+            lines.iter().any(|l| l.contains("hello_out")),
+            "stdout line missing, got: {lines:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_run_command_stdout_captures_stderr() {
+        let (tx, rx) = mpsc::channel();
+        // `echo` piped to stderr via cmd redirection.
+        run_command_stdout("cmd", &["/C", "echo hello_err 1>&2"], tx).unwrap();
+        let lines: Vec<String> = rx.iter().collect();
+        assert!(
+            lines.iter().any(|l| l.contains("hello_err")),
+            "stderr line missing, got: {lines:?}"
+        );
+    }
 
     #[test]
     fn test_parse_winget_table() {
@@ -704,9 +654,9 @@ Google Chrome         Google.Chrome         134.0.6998.165    winget
         let packages = load_packages_from_file(&path);
         assert_eq!(packages.len(), 2);
         assert_eq!(packages[0].name, "Chrome");
-        assert_eq!(packages[0].is_script, false);
+        assert!(!packages[0].is_script);
         assert_eq!(packages[1].name, "Activate Windows");
-        assert_eq!(packages[1].is_script, true);
+        assert!(packages[1].is_script);
         assert_eq!(packages[1].command.as_ref().unwrap()[0], "powershell");
     }
 }
