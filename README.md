@@ -17,7 +17,7 @@ agora exclusivamente winget (Chocolatey/Scoop foram descartados) e em Rust.
   `Repair-WinGetPackageManager`) no primeiro uso.
 - Rust (edition 2024) para compilar da fonte.
 - Execute como **Administrador** para instalar em `--scope machine` (o padrão). Sem
-  elevação a status bar mostra `⚠ sem admin` e você deve usar `"scope": "user"` nos
+  elevação a status bar mostra `not admin` e você deve usar `"scope": "user"` nos
   pacotes do manifesto.
 
 ## Compilar e rodar
@@ -43,7 +43,7 @@ Navegação global: `Tab`/`Shift+Tab`, `←`/`→` ou `h`/`l` trocam de aba · `
 a aba · `↑`/`↓` ou `j`/`k` navegam a lista · `/` foca o filtro · `Space` marca/desmarca ·
 `a` marca/desmarca todos · `Enter` mostra detalhes · `PageUp`/`PageDown` rolam o painel
 Output · `q`, `Esc` ou `Ctrl+C` saem.
-`▶` = script · `✓` = já instalado.
+Na coluna à esquerda: `●` = marcado · `✓` = já instalado · `▶` = script.
 
 **`c` — editar comando:** abre o painel Command com o último comando winget executado,
 para você ajustar e rodar à mão (ex.: acrescentar `--all-versions` ou `--version X` quando

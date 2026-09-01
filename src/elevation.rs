@@ -23,15 +23,11 @@ pub fn is_elevated() -> bool {
 
 /// The short status-bar marker to show, or `None` when elevated.
 ///
-/// (Kept short so it fits next to `[q] quit`; the README explains the impact —
+/// (Kept short so it fits next to `q quit`; the README explains the impact —
 /// `--scope machine` installs need admin, use `"scope": "user"` otherwise.)
 #[must_use]
 pub fn elevation_warning(elevated: bool) -> Option<&'static str> {
-    if elevated {
-        None
-    } else {
-        Some(" ⚠ sem admin ")
-    }
+    if elevated { None } else { Some(" not admin ") }
 }
 
 #[cfg(test)]

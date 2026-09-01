@@ -6,12 +6,16 @@ use std::time::Duration;
 use std::path::PathBuf;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use ratatui::Frame;
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs};
-use ratatui::{Frame, Terminal};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{
+    Block, BorderType, Cell, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Table, TableState, Tabs,
+};
 
 use wgtui::{
     JsonPackage, UpgradablePackage, WingetPackage, find_package_json_files, is_installed,
@@ -95,6 +99,55 @@ fn parse_command_line(line: &str) -> Vec<String> {
     argv
 }
 
+/// Braille spinner frames, shown while a command runs.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// One place for every colour and reusable style, so the UI reads as one system.
+mod theme {
+    use ratatui::style::{Color, Modifier, Style};
+
+    /// Focus, active tab, cursor row.
+    pub const ACCENT: Color = Color::Cyan;
+    /// Multi-selected rows.
+    pub const MARK: Color = Color::Magenta;
+    /// Idle borders and secondary text.
+    pub const MUTED: Color = Color::DarkGray;
+    pub const OK: Color = Color::Green;
+    pub const WARN: Color = Color::Yellow;
+
+    /// Border colour: bright when the pane is focused, muted otherwise.
+    pub fn border(focused: bool) -> Style {
+        Style::default().fg(if focused { ACCENT } else { MUTED })
+    }
+
+    /// Pane title.
+    pub fn title(focused: bool) -> Style {
+        Style::default()
+            .fg(if focused { ACCENT } else { MUTED })
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Table header row.
+    pub fn header() -> Style {
+        Style::default()
+            .fg(MUTED)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    }
+
+    /// The row under the cursor.
+    pub fn cursor_row() -> Style {
+        Style::default()
+            .bg(ACCENT)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Dim / secondary text.
+    pub fn dim() -> Style {
+        Style::default().fg(MUTED)
+    }
+}
+
 /// The active tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -106,8 +159,6 @@ pub enum Tab {
 
 impl Tab {
     const ALL: [Tab; 4] = [Tab::Updates, Tab::Search, Tab::Installed, Tab::Packages];
-    const STATUS_BAR_STR: &str =
-        "  [Tab/h l] tabs  [↑↓/j k] nav  [/] filter  [Space/a] select  [Enter] show  [c] cmd  ";
 
     fn next(self) -> Self {
         match self {
@@ -127,12 +178,40 @@ impl Tab {
         }
     }
 
-    fn title(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
-            Tab::Updates => "[1] Updates ",
-            Tab::Search => "[2] Search ",
-            Tab::Installed => "[3] Installed ",
-            Tab::Packages => "[4] Apps/Scripts ",
+            Tab::Updates => "1 Updates",
+            Tab::Search => "2 Search",
+            Tab::Installed => "3 Installed",
+            Tab::Packages => "4 Apps/Scripts",
+        }
+    }
+
+    /// Context-sensitive `(key, action)` hints for the status bar.
+    fn hints(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Tab::Updates => &[
+                ("space", "mark"),
+                ("a", "all"),
+                ("u", "upgrade"),
+                ("U", "upgrade all"),
+                ("enter", "details"),
+            ],
+            Tab::Search => &[("enter", "search"), ("space", "mark"), ("i", "install")],
+            Tab::Installed => &[
+                ("space", "mark"),
+                ("a", "all"),
+                ("u", "upgrade"),
+                ("r", "remove"),
+                ("R", "refresh"),
+            ],
+            Tab::Packages => &[
+                ("space", "mark"),
+                ("i", "install"),
+                ("I", "all"),
+                ("r", "remove"),
+                ("F", "file"),
+            ],
         }
     }
 }
@@ -408,7 +487,7 @@ impl App {
 
             // Advance spinner and poll keyboard
             if self.busy || self.initial_load_pending > 0 {
-                self.spinner_frame = (self.spinner_frame + 1) % 4;
+                self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len() as u8;
             }
             if event::poll(Duration::from_millis(100))? {
                 let event = event::read()?;
@@ -509,20 +588,6 @@ impl App {
             .iter()
             .filter(|p| Self::matches_filter(&p.name, &self.filter_query))
             .collect()
-    }
-
-    fn selected_line(text: String, selected: bool) -> ListItem<'static> {
-        if selected {
-            ListItem::new(Line::from(Span::styled(
-                text,
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )))
-        } else {
-            ListItem::new(Line::from(Span::raw(text)))
-        }
     }
 
     /// The current tab's selection state.
@@ -1381,517 +1446,536 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn render(&self, f: &mut Frame<'_>) {
-        let area = f.area();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Min(1),
-                Constraint::Length(3),
-            ])
-            .split(area);
+        let rows = Layout::vertical([
+            Constraint::Length(3), // tab bar
+            Constraint::Length(1), // filter / search line
+            Constraint::Min(3),    // content + terminal
+            Constraint::Length(1), // status bar
+        ])
+        .split(f.area());
 
-        self.render_tabs(f, chunks[0]);
-        self.render_filter_bar(f, chunks[1]);
+        self.render_tabs(f, rows[0]);
+        self.render_filter_bar(f, rows[1]);
 
-        // Split content area vertically: main content + terminal panel at bottom
-        let content_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Percentage(30)])
-            .split(chunks[2]);
-
-        // Split terminal panel into command bar + output
-        let term_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(1)])
-            .split(content_chunks[1]);
-
-        self.render_content(f, content_chunks[0]);
-        self.render_command_bar(f, term_chunks[0]);
-        self.render_terminal_output(f, term_chunks[1]);
-        self.render_status_bar(f, chunks[3]);
+        let body =
+            Layout::vertical([Constraint::Min(3), Constraint::Percentage(34)]).split(rows[2]);
+        self.render_content(f, body[0]);
+        self.render_terminal(f, body[1]);
+        self.render_status_bar(f, rows[3]);
     }
 
     fn render_tabs(&self, f: &mut Frame<'_>, area: Rect) {
-        let titles: Vec<&str> = Tab::ALL.iter().map(|t| t.title().trim()).collect();
-        let tabs = Tabs::new(titles)
+        let tabs = Tabs::new(Tab::ALL.iter().map(|t| format!(" {} ", t.label())))
             .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" wgtui ")
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(theme::border(false))
+                    .title(Span::styled(
+                        " wgtui ",
+                        Style::default()
+                            .fg(theme::ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    ))
                     .title_alignment(Alignment::Center),
             )
+            .style(theme::dim())
             .highlight_style(
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .bg(theme::ACCENT)
                     .add_modifier(Modifier::BOLD),
             )
+            .divider(Span::styled("│", theme::dim()))
             .select(self.tab as usize);
         f.render_widget(tabs, area);
     }
 
     fn render_filter_bar(&self, f: &mut Frame<'_>, area: Rect) {
-        let title = match self.tab {
-            Tab::Updates => " Filter updates ",
-            Tab::Search => " Search (Enter to query winget) ",
-            Tab::Installed => " Filter installed ",
-            Tab::Packages => " Filter apps/scripts ",
-        };
         let focused = self.filter_focused;
-        let msg = self.filter_query.as_str();
+        let prompt = Style::default()
+            .fg(if focused { theme::ACCENT } else { theme::MUTED })
+            .add_modifier(Modifier::BOLD);
 
-        let border_style = if focused {
-            Style::default().fg(Color::Cyan)
+        let mut spans = vec![Span::styled(" ❯ ", prompt)];
+        if self.filter_query.is_empty() && !focused {
+            let hint = match self.tab {
+                Tab::Search => "search winget — type a query, then Enter",
+                _ => "filter — type to narrow the list",
+            };
+            spans.push(Span::styled(
+                hint,
+                theme::dim().add_modifier(Modifier::ITALIC),
+            ));
         } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let prefix = Span::styled("> ", border_style);
-        let cursor = if focused {
-            Span::styled("█", Style::default().fg(Color::Cyan))
-        } else {
-            Span::raw("")
-        };
-        let query = Span::raw(msg);
-        let line = Line::from(vec![prefix, query, cursor]);
-
-        let widget = Paragraph::new(Text::from(line)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .border_style(border_style),
-        );
-        f.render_widget(widget, area);
+            spans.push(Span::raw(self.filter_query.clone()));
+            if focused {
+                spans.push(Span::styled("▏", Style::default().fg(theme::ACCENT)));
+            }
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn render_content(&self, f: &mut Frame<'_>, area: Rect) {
+        if self.tab == Tab::Packages && self.packages_file_picker {
+            self.render_file_picker(f, area);
+            return;
+        }
         match self.tab {
-            Tab::Updates => self.render_updates_list(f, area),
-            Tab::Search => self.render_search_results(f, area),
-            Tab::Installed => self.render_installed_list(f, area),
-            Tab::Packages => self.render_packages_list(f, area),
+            Tab::Updates => self.render_updates(f, area),
+            Tab::Search => self.render_search(f, area),
+            Tab::Installed => self.render_installed(f, area),
+            Tab::Packages => self.render_packages(f, area),
         }
     }
 
-    fn render_search_results(&self, f: &mut Frame<'_>, area: Rect) {
-        let border_style = if !self.filter_focused {
-            Style::default().fg(Color::Cyan)
+    /// Shared list-pane renderer: bordered block, right-aligned count, cursor
+    /// highlight, scrollbar, and a centered empty state.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_table(
+        &self,
+        f: &mut Frame<'_>,
+        area: Rect,
+        title: &str,
+        total: usize,
+        header: Row<'static>,
+        widths: Vec<Constraint>,
+        table_rows: Vec<Row<'static>>,
+        sel: &Selection,
+        empty: &str,
+    ) {
+        let focused = !self.filter_focused;
+        let shown = table_rows.len();
+        let count = if total == shown {
+            format!(" {total} ")
         } else {
-            Style::default().fg(Color::DarkGray)
+            format!(" {shown}/{total} ")
         };
-        let items: Vec<ListItem> = if self.search_results.is_empty() {
-            vec![ListItem::new("Type a query and press Enter to search")]
-        } else {
-            self.search_results
-                .iter()
-                .enumerate()
-                .map(|(i, pkg)| {
-                    let v = pkg.version.as_deref().unwrap_or("-");
-                    let s = pkg.source.as_deref().unwrap_or("-");
-                    Self::selected_line(
-                        format!(" {}  {}  [{}]  ({})", pkg.name, pkg.id, v, s),
-                        self.search_sel.marked.contains(&i),
-                    )
-                })
-                .collect()
-        };
-        let count = self.search_results.len();
-        let title = if count > 0 {
-            format!(" Results ({} found) ", count)
-        } else {
-            " Results ".to_string()
-        };
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(theme::border(focused))
+            .title(Span::styled(format!(" {title} "), theme::title(focused)))
+            .title(Line::from(Span::styled(count, theme::dim())).right_aligned())
+            .padding(Padding::horizontal(1));
 
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .border_style(border_style),
-            )
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("> ");
-
-        let mut state = ListState::default().with_selected(
-            if self.search_results.is_empty() || self.filter_focused {
-                None
-            } else {
-                Some(self.search_sel.cursor)
-            },
-        );
-        f.render_stateful_widget(list, area, &mut state);
-    }
-
-    fn render_updates_list(&self, f: &mut Frame<'_>, area: Rect) {
-        let filtered = self.filtered_updates();
-        let border_style = if !self.filter_focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let count_info = if self.filter_query.is_empty() {
-            format!(" Updates ({} available) ", self.updates.len())
-        } else {
-            format!(
-                " Updates ({} / {} filtered) ",
-                filtered.len(),
-                self.updates.len()
-            )
-        };
-
-        let items: Vec<ListItem> = if filtered.is_empty() {
-            let msg = if self.initial_load_pending > 0 {
-                "Carregando..."
-            } else if self.updates.is_empty() {
-                "All packages are up to date"
-            } else {
-                "No packages match the filter"
-            };
-            vec![ListItem::new(msg)]
-        } else {
-            filtered
-                .iter()
-                .enumerate()
-                .map(|(i, pkg)| {
-                    Self::selected_line(
-                        format!(
-                            " {}  {} -> {}",
-                            pkg.name, pkg.installed_version, pkg.available_version
-                        ),
-                        self.updates_sel.marked.contains(&i),
-                    )
-                })
-                .collect()
-        };
-
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(count_info.as_str())
-                    .border_style(border_style),
-            )
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("> ");
-
-        let mut state =
-            ListState::default().with_selected(if filtered.is_empty() || self.filter_focused {
-                None
-            } else {
-                Some(self.updates_sel.cursor)
-            });
-        f.render_stateful_widget(list, area, &mut state);
-    }
-
-    fn render_installed_list(&self, f: &mut Frame<'_>, area: Rect) {
-        let filtered = self.filtered_installed();
-        let border_style = if !self.filter_focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let count_info = if self.filter_query.is_empty() {
-            format!(" Installed Packages ({} total) ", self.installed.len())
-        } else {
-            format!(
-                " Installed Packages ({} / {} filtered) ",
-                filtered.len(),
-                self.installed.len()
-            )
-        };
-
-        let items: Vec<ListItem> = if filtered.is_empty() {
-            let msg = if self.initial_load_pending > 0 {
-                "Carregando..."
-            } else if self.installed.is_empty() {
-                "No packages installed via winget"
-            } else {
-                "No packages match the filter"
-            };
-            vec![ListItem::new(msg)]
-        } else {
-            filtered
-                .iter()
-                .enumerate()
-                .map(|(i, pkg)| {
-                    let v = pkg.version.as_deref().unwrap_or("-");
-                    Self::selected_line(
-                        format!(" {}  [{}]", pkg.name, v),
-                        self.installed_sel.marked.contains(&i),
-                    )
-                })
-                .collect()
-        };
-
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(count_info.as_str())
-                    .border_style(border_style),
-            )
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("> ");
-
-        let mut state =
-            ListState::default().with_selected(if filtered.is_empty() || self.filter_focused {
-                None
-            } else {
-                Some(self.installed_sel.cursor)
-            });
-        f.render_stateful_widget(list, area, &mut state);
-    }
-
-    fn render_packages_list(&self, f: &mut Frame<'_>, area: Rect) {
-        // File picker: show available JSON files
-        if self.packages_file_picker {
-            let items: Vec<ListItem> = if self.package_files.is_empty() {
-                vec![ListItem::new("No JSON package files found")]
-            } else {
-                self.package_files
-                    .iter()
-                    .map(|p| {
-                        let name = p
-                            .file_name()
-                            .map(|n| n.to_string_lossy())
-                            .unwrap_or_default()
-                            .to_string();
-                        ListItem::new(name)
-                    })
-                    .collect()
-            };
-
-            let list = List::new(items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Select a package file (Enter to load) ")
-                        .border_style(Style::default().fg(Color::Cyan)),
-                )
-                .highlight_style(
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .highlight_symbol("> ");
-
-            let mut state = ListState::default().with_selected(if self.package_files.is_empty() {
-                None
-            } else {
-                Some(self.package_file_selected)
-            });
-            f.render_stateful_widget(list, area, &mut state);
+        if table_rows.is_empty() {
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            if inner.height > 0 {
+                let mid = Rect {
+                    x: inner.x,
+                    y: inner.y + inner.height / 2,
+                    width: inner.width,
+                    height: 1,
+                };
+                f.render_widget(
+                    Paragraph::new(Span::styled(empty, theme::dim())).alignment(Alignment::Center),
+                    mid,
+                );
+            }
             return;
         }
 
-        // Normal package list render
-        let filtered = self.filtered_packages();
-        let border_style = if !self.filter_focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let count_info = if self.filter_query.is_empty() {
-            format!(" Apps/Scripts ({} total) ", self.packages.len())
-        } else {
-            format!(
-                " Apps/Scripts ({} / {} filtered) ",
-                filtered.len(),
-                self.packages.len()
-            )
-        };
+        let table = Table::new(table_rows, widths)
+            .header(header.style(theme::header()))
+            .row_highlight_style(theme::cursor_row())
+            .column_spacing(2)
+            .block(block);
 
-        let items: Vec<ListItem> = if filtered.is_empty() {
-            if self.packages.is_empty() {
-                empty_packages_lines(
-                    &self.packages_diagnostic,
-                    std::env::var_os(DEBUG_ENV).is_some(),
-                )
-                .into_iter()
-                .map(ListItem::new)
-                .collect()
-            } else {
-                vec![ListItem::new("No packages match the filter")]
-            }
-        } else {
-            filtered
-                .iter()
-                .enumerate()
-                .map(|(i, pkg)| {
-                    let display = if pkg.is_script {
-                        format!("▶ {}", pkg.name)
-                    } else if is_installed(&pkg.id, &pkg.name, &self.installed) {
-                        format!("✓ {}", pkg.name)
-                    } else {
-                        format!("  {}", pkg.name)
-                    };
-                    Self::selected_line(display, self.packages_sel.marked.contains(&i))
-                })
-                .collect()
-        };
+        let mut ts = TableState::default();
+        if focused {
+            ts.select(Some(sel.cursor.min(shown.saturating_sub(1))));
+        }
+        f.render_stateful_widget(table, area, &mut ts);
 
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(count_info.as_str())
-                    .border_style(border_style),
-            )
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("> ");
-
-        let mut state =
-            ListState::default().with_selected(if filtered.is_empty() || self.filter_focused {
-                None
-            } else {
-                Some(self.packages_sel.cursor)
-            });
-        f.render_stateful_widget(list, area, &mut state);
+        if shown > area.height.saturating_sub(4) as usize {
+            let mut sb = ScrollbarState::new(shown).position(sel.cursor);
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .thumb_style(Style::default().fg(theme::ACCENT))
+                    .track_style(theme::dim()),
+                area.inner(Margin::new(0, 1)),
+                &mut sb,
+            );
+        }
     }
 
-    fn render_command_bar(&self, f: &mut Frame<'_>, area: Rect) {
-        if let Some(input) = &self.command_input {
-            let line = Line::from(vec![
-                Span::styled(
-                    " edit ",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" $ "),
-                Span::raw(input.as_str()),
-                Span::styled("█", Style::default().fg(Color::Yellow)),
-            ]);
-            f.render_widget(
-                Paragraph::new(Text::from(line)).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Yellow))
-                        .title(" Command  [Enter] run  [Esc] cancel "),
-                ),
+    /// One-cell gutter: `●` when the row is multi-selected, else `fallback`.
+    fn gutter(marked: bool, fallback: &'static str) -> Cell<'static> {
+        if marked {
+            Cell::from(Span::styled("●", Style::default().fg(theme::MARK)))
+        } else {
+            Cell::from(Span::styled(fallback, theme::dim()))
+        }
+    }
+
+    fn render_search(&self, f: &mut Frame<'_>, area: Rect) {
+        let rows: Vec<Row> = self
+            .search_results
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                Row::new(vec![
+                    Self::gutter(self.search_sel.marked.contains(&i), " "),
+                    Cell::from(p.name.clone()),
+                    Cell::from(Span::styled(p.id.clone(), theme::dim())),
+                    Cell::from(Span::styled(
+                        p.version.clone().unwrap_or_default(),
+                        theme::dim(),
+                    )),
+                    Cell::from(Span::styled(
+                        p.source.clone().unwrap_or_default(),
+                        theme::dim(),
+                    )),
+                ])
+            })
+            .collect();
+        self.draw_table(
+            f,
+            area,
+            "Search results",
+            self.search_results.len(),
+            Row::new(vec!["", "NAME", "ID", "VERSION", "SOURCE"]),
+            vec![
+                Constraint::Length(1),
+                Constraint::Percentage(38),
+                Constraint::Percentage(40),
+                Constraint::Length(14),
+                Constraint::Length(8),
+            ],
+            rows,
+            &self.search_sel,
+            "Type a query above and press Enter to search winget",
+        );
+    }
+
+    fn render_updates(&self, f: &mut Frame<'_>, area: Rect) {
+        let filtered = self.filtered_updates();
+        let rows: Vec<Row> = filtered
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                Row::new(vec![
+                    Self::gutter(self.updates_sel.marked.contains(&i), " "),
+                    Cell::from(p.name.clone()),
+                    Cell::from(Span::styled(p.installed_version.clone(), theme::dim())),
+                    Cell::from(Span::styled("→", Style::default().fg(theme::ACCENT))),
+                    Cell::from(Span::styled(
+                        p.available_version.clone(),
+                        Style::default().fg(theme::OK).add_modifier(Modifier::BOLD),
+                    )),
+                ])
+            })
+            .collect();
+        let empty = if self.initial_load_pending > 0 {
+            "Loading…"
+        } else {
+            "Everything is up to date"
+        };
+        self.draw_table(
+            f,
+            area,
+            "Updates",
+            self.updates.len(),
+            Row::new(vec!["", "NAME", "CURRENT", "", "AVAILABLE"]),
+            vec![
+                Constraint::Length(1),
+                Constraint::Percentage(52),
+                Constraint::Length(16),
+                Constraint::Length(3),
+                Constraint::Length(16),
+            ],
+            rows,
+            &self.updates_sel,
+            empty,
+        );
+    }
+
+    fn render_installed(&self, f: &mut Frame<'_>, area: Rect) {
+        let filtered = self.filtered_installed();
+        let rows: Vec<Row> = filtered
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                Row::new(vec![
+                    Self::gutter(self.installed_sel.marked.contains(&i), " "),
+                    Cell::from(p.name.clone()),
+                    Cell::from(Span::styled(p.id.clone(), theme::dim())),
+                    Cell::from(Span::styled(
+                        p.version.clone().unwrap_or_default(),
+                        theme::dim(),
+                    )),
+                ])
+            })
+            .collect();
+        let empty = if self.initial_load_pending > 0 {
+            "Loading…"
+        } else {
+            "No packages installed through winget"
+        };
+        self.draw_table(
+            f,
+            area,
+            "Installed",
+            self.installed.len(),
+            Row::new(vec!["", "NAME", "ID", "VERSION"]),
+            vec![
+                Constraint::Length(1),
+                Constraint::Percentage(45),
+                Constraint::Percentage(40),
+                Constraint::Length(16),
+            ],
+            rows,
+            &self.installed_sel,
+            empty,
+        );
+    }
+
+    fn render_packages(&self, f: &mut Frame<'_>, area: Rect) {
+        let filtered = self.filtered_packages();
+
+        if filtered.is_empty() && self.packages.is_empty() {
+            let lines = empty_packages_lines(
+                &self.packages_diagnostic,
+                std::env::var_os(DEBUG_ENV).is_some(),
+            );
+            self.draw_table(
+                f,
                 area,
+                "Apps / Scripts",
+                0,
+                Row::new(vec![""]),
+                vec![Constraint::Percentage(100)],
+                Vec::new(),
+                &self.packages_sel,
+                &lines.join("  •  "),
             );
             return;
         }
 
-        let loading = self.initial_load_pending > 0;
-        let spinner = if self.busy || loading {
-            match self.spinner_frame {
-                0 => ".",
-                1 => "..",
-                2 => ".",
-                _ => " ",
-            }
-        } else {
-            ""
-        };
-        let prompt = if loading && self.current_command.is_none() {
-            "carregando listas de pacotes..."
-        } else {
-            self.current_command
-                .as_deref()
-                .unwrap_or("waiting for command...")
-        };
-        let line = Line::from(vec![
-            Span::raw(spinner),
-            Span::raw(" $ "),
-            Span::raw(prompt),
-        ]);
-        f.render_widget(
-            Paragraph::new(Text::from(line))
-                .block(Block::default().borders(Borders::ALL).title(" Command ")),
+        let rows: Vec<Row> = filtered
+            .iter()
+            .enumerate()
+            .map(|(i, pkg)| {
+                let marked = self.packages_sel.marked.contains(&i);
+                let (glyph, gstyle) = if pkg.is_script {
+                    ("▶", Style::default().fg(theme::ACCENT))
+                } else if is_installed(&pkg.id, &pkg.name, &self.installed) {
+                    ("✓", Style::default().fg(theme::OK))
+                } else {
+                    ("·", theme::dim())
+                };
+                let gutter = if marked {
+                    Cell::from(Span::styled("●", Style::default().fg(theme::MARK)))
+                } else {
+                    Cell::from(Span::styled(glyph, gstyle))
+                };
+                Row::new(vec![
+                    gutter,
+                    Cell::from(pkg.name.clone()),
+                    Cell::from(Span::styled(
+                        if pkg.is_script {
+                            "script".to_string()
+                        } else {
+                            pkg.id.clone()
+                        },
+                        theme::dim(),
+                    )),
+                ])
+            })
+            .collect();
+
+        self.draw_table(
+            f,
             area,
+            "Apps / Scripts",
+            self.packages.len(),
+            Row::new(vec!["", "NAME", "ID"]),
+            vec![
+                Constraint::Length(1),
+                Constraint::Percentage(55),
+                Constraint::Percentage(45),
+            ],
+            rows,
+            &self.packages_sel,
+            "No entries match the filter",
         );
     }
 
-    fn render_terminal_output(&self, f: &mut Frame<'_>, area: Rect) {
-        let lines: Vec<Line> = self
-            .command_output
+    fn render_file_picker(&self, f: &mut Frame<'_>, area: Rect) {
+        let rows: Vec<Row> = self
+            .package_files
             .iter()
-            .map(|l| Line::from(Span::raw(l.as_str())))
+            .map(|p| {
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let dir = p
+                    .parent()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Row::new(vec![
+                    Cell::from(Span::styled(
+                        name,
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+                    Cell::from(Span::styled(dir, theme::dim())),
+                ])
+            })
             .collect();
-        let total = lines.len();
-        let height = area.height as usize;
+
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(theme::border(true))
+            .title(Span::styled(" Choose a manifest ", theme::title(true)))
+            .title(Line::from(Span::styled(" Enter to load ", theme::dim())).right_aligned())
+            .padding(Padding::horizontal(1));
+
+        let table = Table::new(
+            rows,
+            [Constraint::Percentage(45), Constraint::Percentage(55)],
+        )
+        .header(Row::new(vec!["FILE", "DIRECTORY"]).style(theme::header()))
+        .row_highlight_style(theme::cursor_row())
+        .column_spacing(2)
+        .block(block);
+
+        let mut ts = TableState::default();
+        if !self.package_files.is_empty() {
+            ts.select(Some(self.package_file_selected));
+        }
+        f.render_stateful_widget(table, area, &mut ts);
+    }
+
+    /// The bottom panel: the running command as the pane title, its live output
+    /// as the body. Doubles as the `[c]` command editor.
+    fn render_terminal(&self, f: &mut Frame<'_>, area: Rect) {
+        let editing = self.command_input.is_some();
+        let busy = self.busy || self.initial_load_pending > 0;
+
+        let title = if let Some(input) = &self.command_input {
+            Line::from(vec![
+                Span::styled(
+                    " edit ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(theme::WARN)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(input.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled("▏ ", Style::default().fg(theme::WARN)),
+            ])
+        } else {
+            let icon = if busy {
+                SPINNER[self.spinner_frame as usize % SPINNER.len()]
+            } else {
+                "❯"
+            };
+            let cmd = if busy && self.current_command.is_none() {
+                "loading package lists…".to_string()
+            } else {
+                self.current_command
+                    .clone()
+                    .unwrap_or_else(|| "ready".to_string())
+            };
+            Line::from(vec![
+                Span::styled(format!(" {icon} "), Style::default().fg(theme::ACCENT)),
+                Span::styled(format!("{cmd} "), theme::title(false)),
+            ])
+        };
+
+        let border_col = if editing { theme::WARN } else { theme::MUTED };
+        let hint = if editing {
+            " enter run · esc cancel "
+        } else {
+            " output "
+        };
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_col))
+            .title(title)
+            .title(Line::from(Span::styled(hint, theme::dim())).right_aligned())
+            .padding(Padding::horizontal(1));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.height == 0 {
+            return;
+        }
+
+        let total = self.command_output.len();
+        let h = inner.height as usize;
         let scroll = if self.output_scroll == usize::MAX {
-            total.saturating_sub(height)
+            total.saturating_sub(h)
         } else {
             self.output_scroll.min(total.saturating_sub(1))
         };
-
-        let text = if lines.is_empty() {
-            Text::raw("")
+        let body: Vec<Line> = if self.command_output.is_empty() {
+            vec![Line::from(Span::styled(
+                "winget output shows up here",
+                theme::dim().add_modifier(Modifier::ITALIC),
+            ))]
         } else {
-            Text::from(lines)
+            self.command_output
+                .iter()
+                .map(|l| Line::raw(l.as_str()))
+                .collect()
         };
-        f.render_widget(
-            Paragraph::new(text)
-                .block(Block::default().borders(Borders::ALL).title(" Output "))
-                .scroll((scroll as u16, 0)),
-            area,
-        );
+        f.render_widget(Paragraph::new(body).scroll((scroll as u16, 0)), inner);
+
+        if total > h {
+            let mut sb = ScrollbarState::new(total).position(scroll);
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .thumb_style(Style::default().fg(theme::MUTED)),
+                area.inner(Margin::new(0, 1)),
+                &mut sb,
+            );
+        }
     }
 
     fn render_status_bar(&self, f: &mut Frame<'_>, area: Rect) {
-        let (left, right) = match self.tab {
-            Tab::Updates => (
-                Tab::STATUS_BAR_STR.to_owned() + "[u] upgrade  [U] upgrade all  ",
-                " [q] quit ",
-            ),
-            Tab::Search => (
-                Tab::STATUS_BAR_STR.to_owned() + "[i] install  ",
-                " [q] quit ",
-            ),
-            Tab::Installed => (
-                Tab::STATUS_BAR_STR.to_owned() + "[u] upgrade  [r] remove  [R] refresh  ",
-                " [q] quit ",
-            ),
-            Tab::Packages => (
-                Tab::STATUS_BAR_STR.to_owned()
-                    + "[i] install/run  [I] install/run all  [r] remove  [R] remove all  [F] file  ",
-                " [q] quit ",
-            ),
+        let key = Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD);
+        let push_hint = |spans: &mut Vec<Span<'static>>, k: &'static str, d: &'static str| {
+            spans.push(Span::styled(format!("  {k}"), key));
+            spans.push(Span::styled(format!(" {d}"), theme::dim()));
         };
 
-        let base = Style::default().fg(Color::White).bg(Color::Blue);
-        let warn = elevation_warning(self.elevated).unwrap_or("");
-        let warn_style = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD);
+        let mut left: Vec<Span> = Vec::new();
+        for (k, d) in [("j/k", "move"), ("h/l", "tabs"), ("/", "filter")] {
+            push_hint(&mut left, k, d);
+        }
+        for (k, d) in self.tab.hints() {
+            push_hint(&mut left, k, d);
+        }
+        push_hint(&mut left, "c", "cmd");
 
-        let used = left.len() + warn.len() + right.len();
-        let padding = " ".repeat((area.width as usize).saturating_sub(used));
-        let line = Line::from(vec![
-            Span::styled(left, base),
-            Span::styled(padding, base),
-            Span::styled(warn, warn_style),
-            Span::styled(right, base),
-        ]);
+        let mut right: Vec<Span> = Vec::new();
+        if let Some(hint) = elevation_warning(self.elevated) {
+            right.push(Span::styled(
+                hint,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme::WARN)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        right.push(Span::styled("  q", key));
+        right.push(Span::styled(" quit  ", theme::dim()));
 
-        f.render_widget(Paragraph::new(Text::from(line)), area);
+        let rw: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
+        let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(rw)]).split(area);
+        f.render_widget(Paragraph::new(Line::from(left)), cols[0]);
+        f.render_widget(
+            Paragraph::new(Line::from(right)).alignment(Alignment::Right),
+            cols[1],
+        );
     }
 }
 
@@ -2230,5 +2314,64 @@ mod tests {
         }
         assert_eq!(app.filter_query, "anydesk");
         assert!(app.search_sel.marked.is_empty());
+    }
+
+    // ----- rendering -----
+
+    fn draw(app: &App, w: u16, h: u16) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+    }
+
+    fn populated() -> App {
+        let mut app = App::new();
+        app.installed = vec![wpkg("Chrome"), wpkg("Firefox"), wpkg("7zip")];
+        app.updates = vec![upkg("Chrome")];
+        app.search_results = vec![wpkg("ripgrep"), wpkg("fd")];
+        app.packages = vec![jpkg("Chrome"), {
+            let mut s = jpkg("Activate");
+            s.is_script = true;
+            s.command = Some(vec!["powershell".into()]);
+            s
+        }];
+        app.command_output = vec!["--- install X ---".into(), "Found X".into()];
+        app.updates_sel.marked.insert(0);
+        app
+    }
+
+    #[test]
+    fn renders_every_tab_without_panicking() {
+        for tab in Tab::ALL {
+            let mut app = populated();
+            app.tab = tab;
+            draw(&app, 100, 30);
+            app.filter_focused = true;
+            draw(&app, 100, 30);
+        }
+    }
+
+    #[test]
+    fn renders_empty_editor_picker_and_tiny_frames() {
+        let empty = App::new();
+        draw(&empty, 120, 40);
+        draw(&empty, 24, 8);
+        draw(&empty, 8, 4);
+
+        let mut editing = populated();
+        editing.command_input = Some("winget uninstall --exact X --all-versions".into());
+        draw(&editing, 90, 20);
+        draw(&editing, 30, 6);
+
+        let mut picker = App::new();
+        picker.tab = Tab::Packages;
+        picker.packages_file_picker = true;
+        picker.package_files = vec![PathBuf::from("a.json"), PathBuf::from("sub/b.json")];
+        draw(&picker, 80, 20);
+
+        let mut not_admin = populated();
+        not_admin.elevated = false;
+        draw(&not_admin, 100, 30);
     }
 }
