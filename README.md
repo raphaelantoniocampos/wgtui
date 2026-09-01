@@ -39,10 +39,15 @@ Cada push/PR roda `fmt` + `clippy -D warnings` + `cargo test` no CI. Um push de 
 | **[3] Installed** | `winget list` | `u` atualizar · `r` remover · `R` recarregar · `Enter` detalhes |
 | **[4] Apps/Scripts** | manifesto JSON | `i` instalar/rodar selecionado(s) · `I` todos · `r`/`R` remover · `F` trocar de arquivo |
 
-Navegação global: `Tab`/`Shift+Tab` ou `←`/`→` trocam de aba · `1`–`4` pulam para a aba ·
-`/` foca o filtro · `Space` marca/desmarca · `Enter` mostra detalhes ·
-`PageUp`/`PageDown` rolam o painel Output · `Esc` ou `Ctrl+C` saem.
+Navegação global: `Tab`/`Shift+Tab`, `←`/`→` ou `h`/`l` trocam de aba · `1`–`4` pulam para
+a aba · `↑`/`↓` ou `j`/`k` navegam a lista · `/` foca o filtro · `Space` marca/desmarca ·
+`a` marca/desmarca todos · `Enter` mostra detalhes · `PageUp`/`PageDown` rolam o painel
+Output · `q`, `Esc` ou `Ctrl+C` saem.
 `▶` = script · `✓` = já instalado.
+
+**`c` — editar comando:** abre o painel Command com o último comando winget executado,
+para você ajustar e rodar à mão (ex.: acrescentar `--all-versions` ou `--version X` quando
+o winget reclama de múltiplas versões instaladas). `Enter` roda, `Esc` cancela.
 
 Defina `WGTUI_DEBUG=1` para ver, na aba Apps/Scripts vazia, os diretórios verificados.
 

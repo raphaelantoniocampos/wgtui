@@ -70,6 +70,31 @@ fn empty_packages_lines(diagnostic: &str, debug: bool) -> Vec<String> {
     ]
 }
 
+/// Splits a command line into argv, honoring double-quoted groups.
+///
+/// No shell is involved when the command runs, so this only needs to group
+/// tokens: `foo --bar "a b"` -> `["foo", "--bar", "a b"]`.
+fn parse_command_line(line: &str) -> Vec<String> {
+    let mut argv = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    for ch in line.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !cur.is_empty() {
+                    argv.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        argv.push(cur);
+    }
+    argv
+}
+
 /// The active tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -82,7 +107,7 @@ pub enum Tab {
 impl Tab {
     const ALL: [Tab; 4] = [Tab::Updates, Tab::Search, Tab::Installed, Tab::Packages];
     const STATUS_BAR_STR: &str =
-        "  [Tab/h l] tabs  [↑↓/j k] nav  [/] filter  [Space] select  [a] all  [Enter] show  ";
+        "  [Tab/h l] tabs  [↑↓/j k] nav  [/] filter  [Space/a] select  [Enter] show  [c] cmd  ";
 
     fn next(self) -> Self {
         match self {
@@ -176,6 +201,10 @@ pub struct App {
     packages_diagnostic: String,
     /// The last winget command that was run (shown in the command bar).
     pub current_command: Option<String>,
+    /// The full command line last executed, verbatim — the seed for `[c]` edit.
+    last_command: Option<String>,
+    /// `Some` while the manual-command editor (`[c]`) is open.
+    command_input: Option<String>,
     /// Output lines from the last command (shown in the output panel).
     pub command_output: Vec<String>,
     /// Scroll offset for terminal output (usize::MAX = auto-scroll to bottom).
@@ -253,6 +282,8 @@ impl App {
             packages_selected_set: HashSet::new(),
             packages_diagnostic: diag,
             current_command: None,
+            last_command: None,
+            command_input: None,
             command_output: vec![],
             output_scroll: usize::MAX,
             busy: false,
@@ -604,6 +635,30 @@ impl App {
             return;
         }
 
+        // Manual-command editor ([c]) captures all input while open.
+        if self.command_input.is_some() {
+            match key.code {
+                KeyCode::Esc => self.command_input = None,
+                KeyCode::Enter => {
+                    if let Some(line) = self.command_input.take() {
+                        self.run_manual_command(line);
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if let Some(buf) = self.command_input.as_mut() {
+                        buf.push(c);
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(buf) = self.command_input.as_mut() {
+                        buf.pop();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // vim: outside the filter input, `j`/`k` are list Down/Up. While the
         // filter is focused they are plain text (handled below).
         let key = if self.filter_focused {
@@ -668,6 +723,13 @@ impl App {
             }
             KeyCode::Char('a') => {
                 self.toggle_select_all();
+            }
+            KeyCode::Char('c') => {
+                self.command_input = Some(
+                    self.last_command
+                        .clone()
+                        .unwrap_or_else(|| "winget ".to_string()),
+                );
             }
             KeyCode::Char('1') => {
                 self.tab = Tab::Updates;
@@ -989,6 +1051,19 @@ impl App {
         self.command_output.clear();
         self.output_scroll = usize::MAX;
         self.current_command = Some(format!("winget install {} packages", ids.len()));
+        if let Some(id) = ids.first() {
+            self.set_last_command([
+                "winget",
+                "install",
+                "--exact",
+                id.as_str(),
+                "--silent",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+                "--scope",
+                "machine",
+            ]);
+        }
         self.busy = true;
         thread::spawn(move || {
             for id in &ids {
@@ -1049,6 +1124,17 @@ impl App {
         self.command_output.clear();
         self.output_scroll = usize::MAX;
         self.current_command = Some(format!("winget upgrade {} packages", ids.len()));
+        if let Some(id) = ids.first() {
+            self.set_last_command([
+                "winget",
+                "upgrade",
+                "--exact",
+                id.as_str(),
+                "--silent",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+            ]);
+        }
         self.busy = true;
         thread::spawn(move || {
             for id in &ids {
@@ -1083,6 +1169,16 @@ impl App {
         self.command_output.clear();
         self.output_scroll = usize::MAX;
         self.current_command = Some(format!("winget uninstall {} packages", ids.len()));
+        if let Some(id) = ids.first() {
+            self.set_last_command([
+                "winget",
+                "uninstall",
+                "--exact",
+                id.as_str(),
+                "--silent",
+                "--accept-source-agreements",
+            ]);
+        }
         self.busy = true;
         thread::spawn(move || {
             for id in &ids {
@@ -1116,6 +1212,11 @@ impl App {
     fn upgrade_all(&mut self) {
         let tx = self.action_tx.clone();
         self.current_command = Some("winget upgrade --all --include-unknown".to_string());
+        self.last_command = Some(
+            "winget upgrade --all --include-unknown --silent \
+             --accept-package-agreements --accept-source-agreements"
+                .to_string(),
+        );
         self.busy = true;
         thread::spawn(move || {
             let cmd = "winget upgrade --all --include-unknown".to_string();
@@ -1145,6 +1246,19 @@ impl App {
         self.command_output.clear();
         self.output_scroll = usize::MAX;
         self.current_command = Some(format!("install/run {} apps/scripts", ids.len()));
+        if let Some(seed) = ids
+            .first()
+            .and_then(|id| self.packages.iter().find(|p| &p.id == id))
+            .map(|pkg| {
+                if pkg.is_script {
+                    pkg.command.clone().unwrap_or_default().join(" ")
+                } else {
+                    format!("winget {}", pkg.install_args().join(" "))
+                }
+            })
+        {
+            self.last_command = Some(seed);
+        }
         self.busy = true;
         let tx_clone = tx.clone();
         let packages_clone = self.packages.clone();
@@ -1291,6 +1405,50 @@ impl App {
         thread::spawn(move || {
             let list = list_installed();
             let _ = tx.send(ActionResult::RefreshInstalled(list));
+            let _ = tx.send(ActionResult::CommandDone);
+        });
+    }
+
+    /// Records the exact command line last run, so `[c]` can seed its editor.
+    fn set_last_command<S: AsRef<str>>(&mut self, parts: impl IntoIterator<Item = S>) {
+        let joined = parts
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.last_command = Some(joined);
+    }
+
+    /// Runs an arbitrary command line typed in the `[c]` editor, streaming its
+    /// output, then refreshes the installed / upgrade lists.
+    fn run_manual_command(&mut self, line: String) {
+        let argv = parse_command_line(&line);
+        if argv.is_empty() {
+            return;
+        }
+        self.last_command = Some(line.clone());
+        self.command_output.clear();
+        self.output_scroll = usize::MAX;
+        self.current_command = Some(line);
+        self.busy = true;
+
+        let tx = self.action_tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(ActionResult::OutputLine(format!(
+                "--- {} ---",
+                argv.join(" ")
+            )));
+            let (string_tx, string_rx) = mpsc::channel::<String>();
+            let tx2 = tx.clone();
+            thread::spawn(move || {
+                while let Ok(l) = string_rx.recv() {
+                    let _ = tx2.send(ActionResult::OutputLine(l));
+                }
+            });
+            let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+            let _ = wgtui::run_command_stdout(&argv[0], &args, string_tx);
+            let _ = tx.send(ActionResult::RefreshInstalled(list_installed()));
+            let _ = tx.send(ActionResult::UpgradeList(list_upgradable()));
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
@@ -1691,6 +1849,31 @@ impl App {
     }
 
     fn render_command_bar(&self, f: &mut Frame<'_>, area: Rect) {
+        if let Some(input) = &self.command_input {
+            let line = Line::from(vec![
+                Span::styled(
+                    " edit ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" $ "),
+                Span::raw(input.as_str()),
+                Span::styled("█", Style::default().fg(Color::Yellow)),
+            ]);
+            f.render_widget(
+                Paragraph::new(Text::from(line)).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow))
+                        .title(" Command  [Enter] run  [Esc] cancel "),
+                ),
+                area,
+            );
+            return;
+        }
+
         let loading = self.initial_load_pending > 0;
         let spinner = if self.busy || loading {
             match self.spinner_frame {
@@ -2008,6 +2191,71 @@ mod tests {
             app.handle_key(ke(KeyCode::Char(c)));
         }
         assert_eq!(app.filter_query, "jetbrains");
+    }
+
+    #[test]
+    fn parse_command_line_groups_quotes_and_trims() {
+        assert_eq!(
+            parse_command_line("  winget   list "),
+            vec!["winget", "list"]
+        );
+        assert_eq!(
+            parse_command_line(r#"winget install X --params "/Language:pt-BR""#),
+            vec!["winget", "install", "X", "--params", "/Language:pt-BR"]
+        );
+        assert!(parse_command_line("   ").is_empty());
+    }
+
+    #[test]
+    fn set_last_command_joins_argv() {
+        let mut app = App::new();
+        app.set_last_command(["winget", "uninstall", "--exact", "sharkdp.bat"]);
+        assert_eq!(
+            app.last_command.as_deref(),
+            Some("winget uninstall --exact sharkdp.bat")
+        );
+    }
+
+    #[test]
+    fn c_opens_command_editor_seeded_with_last_command() {
+        let mut app = App::new();
+        app.filter_focused = false;
+        app.handle_key(ke(KeyCode::Char('c')));
+        assert_eq!(app.command_input.as_deref(), Some("winget ")); // no prior command
+
+        app.command_input = None;
+        app.last_command = Some("winget uninstall --exact sharkdp.bat --silent".into());
+        app.handle_key(ke(KeyCode::Char('c')));
+        assert_eq!(
+            app.command_input.as_deref(),
+            Some("winget uninstall --exact sharkdp.bat --silent")
+        );
+    }
+
+    #[test]
+    fn command_editor_typing_backspace_and_cancel() {
+        let mut app = App::new();
+        app.command_input = Some("winget ".into());
+        for c in "list".chars() {
+            app.handle_key(ke(KeyCode::Char(c)));
+        }
+        assert_eq!(app.command_input.as_deref(), Some("winget list"));
+        app.handle_key(ke(KeyCode::Backspace));
+        assert_eq!(app.command_input.as_deref(), Some("winget lis"));
+        app.handle_key(ke(KeyCode::Esc));
+        assert!(app.command_input.is_none());
+    }
+
+    #[test]
+    fn c_is_plain_text_while_the_filter_is_focused() {
+        let mut app = App::new();
+        app.tab = Tab::Search;
+        app.filter_focused = true;
+        for c in "cpuz".chars() {
+            app.handle_key(ke(KeyCode::Char(c)));
+        }
+        assert_eq!(app.filter_query, "cpuz");
+        assert!(app.command_input.is_none());
     }
 
     #[test]
