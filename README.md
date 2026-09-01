@@ -10,11 +10,9 @@ agora exclusivamente winget (Chocolatey/Scoop foram descartados) e em Rust.
 
 ## Pré-requisitos
 
-- Windows 10/11 com **winget** (App Installer). Se faltar, instale com:
-  ```powershell
-  Install-Module Microsoft.WinGet.Client -Force -Scope CurrentUser
-  Repair-WinGetPackageManager
-  ```
+- Windows 10/11 com **winget** (App Installer). Se faltar, o wgtui pergunta se pode
+  instalar via PowerShell (`Install-Module Microsoft.WinGet.Client` +
+  `Repair-WinGetPackageManager`) no primeiro uso.
 - Rust (edition 2024) para compilar da fonte.
 - Execute como **Administrador** para instalar em `--scope machine` (o padrão).
 

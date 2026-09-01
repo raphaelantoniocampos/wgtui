@@ -1,3 +1,4 @@
+mod bootstrap;
 mod tui;
 
 use crossterm::ExecutableCommand;
@@ -8,13 +9,25 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io::{Write, stdout};
 
+use bootstrap::{
+    Bootstrap, ensure_winget, manual_instructions, prompt_yes_no, run_powershell_bootstrap,
+};
 use tui::App;
 use wgtui::check_winget;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if !check_winget() {
-        eprintln!("Winget not found. Please install winget first.");
-        eprintln!("Recommend: Install-Module -Name Microsoft.Winget.Client -Force");
+    let winget = ensure_winget(
+        check_winget,
+        || {
+            eprintln!("winget não foi encontrado no PATH.");
+            prompt_yes_no("Instalar o cliente winget agora via PowerShell?")
+        },
+        run_powershell_bootstrap,
+    );
+    if winget == Bootstrap::Unavailable {
+        for line in manual_instructions() {
+            eprintln!("{line}");
+        }
         std::process::exit(1);
     }
 
