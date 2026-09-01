@@ -80,7 +80,7 @@ pub enum Tab {
 impl Tab {
     const ALL: [Tab; 4] = [Tab::Updates, Tab::Search, Tab::Installed, Tab::Packages];
     const STATUS_BAR_STR: &str =
-        "  [Tab] tabs  [← ↑→ ↓] navigate  [/] filter  [Space] select  [Enter] show  ";
+        "  [Tab/h l] tabs  [↑↓/j k] nav  [/] filter  [Space] select  [Enter] show  ";
 
     fn next(self) -> Self {
         match self {
@@ -556,6 +556,18 @@ impl App {
             return;
         }
 
+        // vim: outside the filter input, `j`/`k` are list Down/Up. While the
+        // filter is focused they are plain text (handled below).
+        let key = if self.filter_focused {
+            key
+        } else {
+            match key.code {
+                KeyCode::Char('j') => KeyEvent::new(KeyCode::Down, key.modifiers),
+                KeyCode::Char('k') => KeyEvent::new(KeyCode::Up, key.modifiers),
+                _ => key,
+            }
+        };
+
         // Packages file picker has its own key handling logic first
         if self.tab == Tab::Packages && self.packages_file_picker {
             self.handle_packages_key(key);
@@ -564,7 +576,7 @@ impl App {
 
         if self.filter_focused {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
+                KeyCode::Esc => {
                     self.filter_focused = false;
                     self.clamp_selected();
                     return;
@@ -681,14 +693,14 @@ impl App {
 
     fn handle_search_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 if self.search_selected > 0 {
                     self.search_selected -= 1;
                 } else {
                     self.filter_focused = true;
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 let n = self.filtered_search_results().len();
                 if n > 0 && self.search_selected + 1 < n {
                     self.search_selected += 1;
@@ -1806,5 +1818,132 @@ mod tests {
         app.handle_action_result(ActionResult::InitialUpdates(vec![]));
         assert_eq!(app.initial_load_pending, 0);
         assert_eq!(app.installed.len(), 1);
+    }
+
+    // ----- vim keybindings -----
+
+    fn ke(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    fn wpkg(name: &str) -> WingetPackage {
+        WingetPackage {
+            name: name.to_string(),
+            id: format!("{name}.{name}"),
+            version: None,
+            source: None,
+        }
+    }
+
+    fn upkg(name: &str) -> UpgradablePackage {
+        UpgradablePackage {
+            name: name.to_string(),
+            id: format!("{name}.{name}"),
+            installed_version: "1".into(),
+            available_version: "2".into(),
+            source: None,
+        }
+    }
+
+    fn jpkg(name: &str) -> JsonPackage {
+        JsonPackage {
+            id: format!("{name}.{name}"),
+            name: name.to_string(),
+            command: None,
+            is_script: false,
+            args: Vec::new(),
+            scope: None,
+            locale: None,
+        }
+    }
+
+    #[test]
+    fn vim_jk_navigates_updates_installed_and_packages() {
+        let mut app = App::new();
+
+        app.updates = vec![upkg("a"), upkg("b"), upkg("c")];
+        app.tab = Tab::Updates;
+        app.handle_key(ke(KeyCode::Char('j')));
+        app.handle_key(ke(KeyCode::Char('j')));
+        assert_eq!(app.updates_selected, 2);
+        app.handle_key(ke(KeyCode::Char('k')));
+        assert_eq!(app.updates_selected, 1);
+
+        app.installed = vec![wpkg("a"), wpkg("b")];
+        app.tab = Tab::Installed;
+        app.filter_focused = false;
+        app.handle_key(ke(KeyCode::Char('j')));
+        assert_eq!(app.installed_selected, 1);
+
+        app.packages = vec![jpkg("a"), jpkg("b"), jpkg("c")];
+        app.tab = Tab::Packages;
+        app.filter_focused = false;
+        app.handle_key(ke(KeyCode::Char('j')));
+        assert_eq!(app.packages_selected, 1);
+    }
+
+    #[test]
+    fn vim_jk_navigates_search_results() {
+        let mut app = App::new();
+        app.search_results = vec![wpkg("a"), wpkg("b")];
+        app.tab = Tab::Search;
+        app.filter_focused = false;
+        app.handle_key(ke(KeyCode::Char('j')));
+        assert_eq!(app.search_selected, 1);
+        app.handle_key(ke(KeyCode::Char('k')));
+        assert_eq!(app.search_selected, 0);
+    }
+
+    #[test]
+    fn vim_hl_switches_tabs_from_any_tab() {
+        let mut app = App::new();
+        app.tab = Tab::Updates;
+        app.handle_key(ke(KeyCode::Char('l')));
+        assert_eq!(app.tab, Tab::Search);
+        app.handle_key(ke(KeyCode::Char('l')));
+        assert_eq!(app.tab, Tab::Installed);
+        app.handle_key(ke(KeyCode::Char('h')));
+        assert_eq!(app.tab, Tab::Search);
+    }
+
+    #[test]
+    fn q_quits_only_from_normal_mode_and_is_typable_in_filter() {
+        let mut app = App::new();
+        app.tab = Tab::Search;
+        app.filter_focused = true;
+        for c in "qbittorrent".chars() {
+            app.handle_key(ke(KeyCode::Char(c)));
+        }
+        assert_eq!(app.filter_query, "qbittorrent");
+        assert!(app.filter_focused);
+        assert!(!app.should_quit);
+
+        app.filter_focused = false;
+        app.handle_key(ke(KeyCode::Char('q')));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn jk_are_typable_in_filter() {
+        let mut app = App::new();
+        app.tab = Tab::Installed;
+        app.filter_focused = true;
+        for c in "jetbrains".chars() {
+            app.handle_key(ke(KeyCode::Char(c)));
+        }
+        assert_eq!(app.filter_query, "jetbrains");
+    }
+
+    #[test]
+    fn vim_jk_in_file_picker() {
+        let mut app = App::new();
+        app.tab = Tab::Packages;
+        app.packages_file_picker = true;
+        app.package_files = vec![PathBuf::from("a.json"), PathBuf::from("b.json")];
+        app.filter_focused = false;
+        app.handle_key(ke(KeyCode::Char('j')));
+        assert_eq!(app.package_file_selected, 1);
+        app.handle_key(ke(KeyCode::Char('k')));
+        assert_eq!(app.package_file_selected, 0);
     }
 }
