@@ -260,6 +260,29 @@ pub fn run_winget_stdout(args: &[&str], tx: mpsc::Sender<String>) -> Result<(), 
     run_command_stdout("winget", args, tx)
 }
 
+/// Whether the manifest entry `id` / `name` matches something in `installed`.
+///
+/// `winget list` output routinely differs in case from `winget search`, and
+/// truncates long names/IDs with an ellipsis, so the match is case-insensitive
+/// on both fields with an ellipsis-prefix fallback.
+#[must_use]
+pub fn is_installed(id: &str, name: &str, installed: &[WingetPackage]) -> bool {
+    let id_l = id.trim().to_lowercase();
+    let name_l = name.trim().to_lowercase();
+
+    let prefix_match = |listed: &str, full: &str| {
+        let stem = listed.trim_end_matches(['…', '.']).trim();
+        stem.len() >= 4 && full.starts_with(stem)
+    };
+
+    installed.iter().any(|p| {
+        let p_id = p.id.to_lowercase();
+        let p_name = p.name.to_lowercase();
+        (!id_l.is_empty() && (p_id == id_l || prefix_match(&p_id, &id_l)))
+            || (!name_l.is_empty() && (p_name == name_l || prefix_match(&p_name, &name_l)))
+    })
+}
+
 /// A package or script read from a manifest file.
 #[derive(Debug, Clone)]
 pub struct JsonPackage {
@@ -560,6 +583,37 @@ Google Chrome         Google.Chrome         134.0.6998.165    winget
         f.write_all(content.as_bytes()).unwrap();
         drop(f);
         (dir, path)
+    }
+
+    fn wp(name: &str, id: &str) -> WingetPackage {
+        WingetPackage {
+            name: name.to_string(),
+            id: id.to_string(),
+            version: None,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn test_is_installed_matches_case_and_truncation() {
+        let installed = vec![
+            wp("Google Chrome", "Google.Chrome"),
+            wp("Microsoft Visual Studio Code", "Microsoft.VisualStudioCo…"),
+        ];
+        // exact id, different case
+        assert!(is_installed("google.chrome", "whatever", &installed));
+        // name match, different case
+        assert!(is_installed("Some.Other.Id", "GOOGLE CHROME", &installed));
+        // winget-truncated id in the installed list
+        assert!(is_installed(
+            "Microsoft.VisualStudioCode",
+            "VS Code",
+            &installed
+        ));
+        // no match
+        assert!(!is_installed("Mozilla.Firefox", "Firefox", &installed));
+        // empty list
+        assert!(!is_installed("Google.Chrome", "Google Chrome", &[]));
     }
 
     #[test]
