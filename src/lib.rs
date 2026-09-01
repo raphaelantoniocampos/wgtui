@@ -260,17 +260,85 @@ pub fn run_winget_stdout(args: &[&str], tx: mpsc::Sender<String>) -> Result<(), 
     run_command_stdout("winget", args, tx)
 }
 
-/// A package or script read from a JSON file.
+/// A package or script read from a manifest file.
 #[derive(Debug, Clone)]
 pub struct JsonPackage {
     pub id: String,
     pub name: String,
+    /// For scripts: the argv to run. `None` for winget packages.
     pub command: Option<Vec<String>>,
     pub is_script: bool,
+    /// Extra args appended to `winget install` (e.g. `["-a", "x86"]`).
+    pub args: Vec<String>,
+    /// `--scope` value; defaults to `machine` when `None`.
+    pub scope: Option<String>,
+    /// `--locale` value; omitted when `None`.
+    pub locale: Option<String>,
 }
 
-// Serde types matching the winget export schema:
+impl JsonPackage {
+    /// The full `winget` argument list to install this package.
+    ///
+    /// Only meaningful for non-script entries.
+    #[must_use]
+    pub fn install_args(&self) -> Vec<String> {
+        let mut a: Vec<String> = [
+            "install",
+            "--exact",
+            &self.id,
+            "--silent",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+        a.push("--scope".to_string());
+        a.push(self.scope.clone().unwrap_or_else(|| "machine".to_string()));
+
+        if let Some(locale) = &self.locale {
+            a.push("--locale".to_string());
+            a.push(locale.clone());
+        }
+
+        a.extend(self.args.iter().cloned());
+        a
+    }
+}
+
+// -------- canonical wgtui manifest schema --------
+// { "packages": [{ "id", "name?", "args?", "scope?", "locale?" }],
+//   "scripts":  [{ "name", "command": [..] }] }
+
+#[derive(Deserialize)]
+struct Manifest {
+    packages: Option<Vec<ManifestPackage>>,
+    scripts: Option<Vec<ManifestScript>>,
+}
+
+#[derive(Deserialize)]
+struct ManifestPackage {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    locale: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ManifestScript {
+    name: String,
+    command: Vec<String>,
+}
+
+// -------- winget export schema (import interop only) --------
 // https://aka.ms/winget-packages.schema.2.0.json
+
 #[derive(Deserialize)]
 struct ExportRoot {
     #[serde(rename = "Sources")]
@@ -283,14 +351,6 @@ struct ExportSource {
     packages: Vec<ExportPackage>,
 }
 
-// Flat format: { "Packages": [{ "PackageIdentifier": "..." }] }
-// No Sources wrapper, used by files like desired.json
-#[derive(Deserialize)]
-struct FlatPackageList {
-    #[serde(rename = "Packages")]
-    packages: Option<Vec<ExportPackage>>,
-}
-
 #[derive(Deserialize)]
 struct ExportPackage {
     #[serde(rename = "PackageIdentifier")]
@@ -299,25 +359,19 @@ struct ExportPackage {
     package_name: Option<String>,
 }
 
-// New ids.json format with Packages and Scripts:
-#[derive(Deserialize)]
-struct IdsFile {
-    #[serde(rename = "Packages")]
-    packages: Option<Vec<ExportPackage>>,
-    #[serde(rename = "Scripts")]
-    scripts: Option<Vec<ExportScript>>,
+/// True if `content` parses as JSON and carries a key of a recognized manifest
+/// schema (`packages`/`scripts` for the wgtui format, `Sources` for winget export).
+fn looks_like_manifest(content: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(v) => {
+            v.get("packages").is_some() || v.get("scripts").is_some() || v.get("Sources").is_some()
+        }
+        Err(_) => false,
+    }
 }
 
-#[derive(Deserialize)]
-struct ExportScript {
-    #[serde(rename = "ScriptName")]
-    script_name: String,
-    #[serde(rename = "Command")]
-    command: Vec<String>,
-}
-
-/// Scans `dir` for `*.json` files that match the winget export schema or ids.json schema
-/// and returns a merged list of files.
+/// Scans `dir` for `*.json` files that look like a wgtui manifest or a winget
+/// export, returning their paths.
 /// Never panics — returns an empty vec on any error.
 #[must_use]
 pub fn find_package_json_files(dir: &Path) -> Vec<std::path::PathBuf> {
@@ -332,14 +386,9 @@ pub fn find_package_json_files(dir: &Path) -> Vec<std::path::PathBuf> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        // Quick validation: try all formats
-        if serde_json::from_str::<IdsFile>(&content).is_ok()
-            || serde_json::from_str::<ExportRoot>(&content).is_ok()
-            || serde_json::from_str::<FlatPackageList>(&content).is_ok()
+        if fs::read_to_string(&path)
+            .map(|c| looks_like_manifest(&c))
+            .unwrap_or(false)
         {
             files.push(path);
         }
@@ -347,7 +396,10 @@ pub fn find_package_json_files(dir: &Path) -> Vec<std::path::PathBuf> {
     files
 }
 
-/// Loads packages and scripts from a single JSON file.
+/// Loads packages and scripts from a single manifest file.
+///
+/// Accepts the canonical wgtui schema first; falls back to importing a
+/// `winget export` file. Returns an empty vec for anything else.
 #[must_use]
 pub fn load_packages_from_file(path: &Path) -> Vec<JsonPackage> {
     let content = match fs::read_to_string(path) {
@@ -355,69 +407,60 @@ pub fn load_packages_from_file(path: &Path) -> Vec<JsonPackage> {
         Err(_) => return vec![],
     };
 
-    // Try ids.json format first (contains Packages and/or Scripts)
-    if let Ok(ids_file) = serde_json::from_str::<IdsFile>(&content) {
-        if ids_file.packages.is_none() && ids_file.scripts.is_none() {
-            // Neither field present — this is not an ids.json file, fall through
-        } else {
-            let mut result = Vec::new();
-            if let Some(pkgs) = ids_file.packages {
-                for pkg in pkgs {
-                    let id = pkg.package_identifier;
-                    let name = pkg.package_name.unwrap_or_else(|| id.clone());
-                    result.push(JsonPackage {
-                        id,
-                        name,
-                        command: None,
-                        is_script: false,
-                    });
-                }
-            }
-            if let Some(scripts) = ids_file.scripts {
-                for script in scripts {
-                    let name = script.script_name;
-                    result.push(JsonPackage {
-                        id: name.clone(),
-                        name,
-                        command: Some(script.command),
-                        is_script: true,
-                    });
-                }
-            }
-            return result;
+    // Canonical wgtui manifest (at least one of `packages` / `scripts` present).
+    if let Ok(manifest) = serde_json::from_str::<Manifest>(&content)
+        && (manifest.packages.is_some() || manifest.scripts.is_some())
+    {
+        let mut result = Vec::new();
+        for pkg in manifest.packages.unwrap_or_default() {
+            let name = pkg.name.unwrap_or_else(|| pkg.id.clone());
+            result.push(JsonPackage {
+                id: pkg.id,
+                name,
+                command: None,
+                is_script: false,
+                args: pkg.args,
+                scope: pkg.scope,
+                locale: pkg.locale,
+            });
         }
+        for script in manifest.scripts.unwrap_or_default() {
+            result.push(JsonPackage {
+                id: script.name.clone(),
+                name: script.name,
+                command: Some(script.command),
+                is_script: true,
+                args: Vec::new(),
+                scope: None,
+                locale: None,
+            });
+        }
+        return result;
     }
 
-    let mk_pkg = |p: ExportPackage| {
-        let id = p.package_identifier;
-        let name = p.package_name.unwrap_or_else(|| id.clone());
-        JsonPackage {
-            id,
-            name,
-            command: None,
-            is_script: false,
-        }
-    };
-
-    // Try full winget export format
+    // winget export import.
     if let Ok(root) = serde_json::from_str::<ExportRoot>(&content) {
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
         for source in root.sources {
             for pkg in source.packages {
                 if seen.insert(pkg.package_identifier.clone()) {
-                    result.push(mk_pkg(pkg));
+                    let name = pkg
+                        .package_name
+                        .unwrap_or_else(|| pkg.package_identifier.clone());
+                    result.push(JsonPackage {
+                        id: pkg.package_identifier,
+                        name,
+                        command: None,
+                        is_script: false,
+                        args: Vec::new(),
+                        scope: None,
+                        locale: None,
+                    });
                 }
             }
         }
         return result;
-    }
-
-    // Fall back to flat format
-    if let Ok(flat) = serde_json::from_str::<FlatPackageList>(&content)
-        && let Some(pkgs) = flat.packages
-    {
-        return pkgs.into_iter().map(mk_pkg).collect();
     }
 
     vec![]
@@ -509,154 +552,145 @@ Google Chrome         Google.Chrome         134.0.6998.165    winget
         assert!(packages.is_empty());
     }
 
-    #[test]
-    fn test_load_export_packages_valid() {
+    fn write_tmp(name: &str, content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.json");
+        let path = dir.path().join(name);
         let mut f = std::fs::File::create(&path).unwrap();
-        write!(
-            f,
-            r#"{{
-            "Sources": [
-                {{
-                    "Packages": [
-                        {{ "PackageIdentifier": "7zip.7zip" }},
-                        {{ "PackageIdentifier": "Google.Chrome" }}
-                    ]
-                }}
-            ]
-        }}"#
-        )
-        .unwrap();
+        f.write_all(content.as_bytes()).unwrap();
         drop(f);
+        (dir, path)
+    }
 
-        let packages = load_export_packages(dir.path());
+    #[test]
+    fn test_load_canonical_manifest() {
+        let (_d, path) = write_tmp(
+            "packages.json",
+            r#"{
+                "packages": [
+                    { "id": "Google.Chrome", "name": "Google Chrome" },
+                    { "id": "CPUID.CPU-Z" }
+                ],
+                "scripts": [
+                    { "name": "Ativar Windows",
+                      "command": ["powershell", "-Command", "irm https://get.activated.win | iex"] }
+                ]
+            }"#,
+        );
+
+        let packages = load_packages_from_file(&path);
+        assert_eq!(packages.len(), 3);
+        assert_eq!(packages[0].name, "Google Chrome");
+        assert!(!packages[0].is_script);
+        assert_eq!(packages[1].name, "CPUID.CPU-Z"); // name falls back to id
+        assert!(packages[2].is_script);
+        assert_eq!(packages[2].command.as_ref().unwrap()[0], "powershell");
+    }
+
+    #[test]
+    fn test_manifest_install_args_scope_locale_and_extra() {
+        let (_d, path) = write_tmp(
+            "packages.json",
+            r#"{
+                "packages": [
+                    { "id": "Oracle.JavaRuntimeEnvironment", "name": "Java x86",
+                      "args": ["-a", "x86", "--force"], "scope": "user", "locale": "pt-BR" }
+                ]
+            }"#,
+        );
+
+        let pkg = &load_packages_from_file(&path)[0];
+        let args = pkg.install_args();
+        let pair = |a: &str, b: &str| args.windows(2).any(|w| w[0] == a && w[1] == b);
+        assert!(args.starts_with(&["install".to_string(), "--exact".to_string()]));
+        assert!(pair("--scope", "user"));
+        assert!(pair("--locale", "pt-BR"));
+        assert!(pair("-a", "x86"));
+        assert!(args.contains(&"--force".to_string()));
+    }
+
+    #[test]
+    fn test_install_args_default_scope_is_machine() {
+        let pkg = JsonPackage {
+            id: "Google.Chrome".to_string(),
+            name: "Google Chrome".to_string(),
+            command: None,
+            is_script: false,
+            args: Vec::new(),
+            scope: None,
+            locale: None,
+        };
+        let args = pkg.install_args();
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--scope" && w[1] == "machine")
+        );
+        assert!(!args.iter().any(|a| a == "--locale"));
+    }
+
+    #[test]
+    fn test_load_winget_export_import_with_dedup() {
+        let (_d, path) = write_tmp(
+            "exported.json",
+            r#"{
+                "Sources": [
+                    { "Packages": [
+                        { "PackageIdentifier": "7zip.7zip" },
+                        { "PackageIdentifier": "Google.Chrome", "PackageName": "Chrome" },
+                        { "PackageIdentifier": "7zip.7zip" }
+                    ] }
+                ]
+            }"#,
+        );
+
+        let packages = load_packages_from_file(&path);
         assert_eq!(packages.len(), 2);
         assert_eq!(packages[0].id, "7zip.7zip");
-        assert_eq!(packages[0].name, "7zip.7zip");
-        assert_eq!(packages[1].id, "Google.Chrome");
-        assert_eq!(packages[1].name, "Google.Chrome");
+        assert_eq!(packages[0].name, "7zip.7zip"); // name falls back to id
+        assert_eq!(packages[1].name, "Chrome");
+        assert!(packages.iter().all(|p| p.args.is_empty()));
     }
 
     #[test]
-    fn test_load_export_packages_skips_invalid_json() {
+    fn test_load_rejects_plain_json_and_missing_file() {
+        let (_d, path) = write_tmp("random.json", r#"{ "hello": "world" }"#);
+        assert!(load_packages_from_file(&path).is_empty());
+        assert!(load_packages_from_file(std::path::Path::new("does-not-exist.json")).is_empty());
+    }
+
+    #[test]
+    fn test_find_package_json_files_recognizes_schemas() {
+        let (dir, _p) = write_tmp("manifest.json", r#"{ "packages": [{ "id": "A.B" }] }"#);
+        write_tmp_in(dir.path(), "export.json", r#"{ "Sources": [] }"#);
+        write_tmp_in(dir.path(), "notes.json", r#"{ "unrelated": true }"#);
+        write_tmp_in(dir.path(), "readme.txt", "not json at all");
+
+        let mut names: Vec<String> = find_package_json_files(dir.path())
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["export.json", "manifest.json"]);
+    }
+
+    fn write_tmp_in(dir: &std::path::Path, name: &str, content: &str) {
         use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bad.json");
-        let mut f = std::fs::File::create(&path).unwrap();
-        write!(f, "not json").unwrap();
-        drop(f);
+        let mut f = std::fs::File::create(dir.join(name)).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn test_load_export_packages_merges_directory() {
+        let (dir, _p) = write_tmp("a.json", r#"{ "packages": [{ "id": "A.One" }] }"#);
+        write_tmp_in(
+            dir.path(),
+            "b.json",
+            r#"{ "packages": [{ "id": "B.Two" }, { "id": "A.One" }] }"#,
+        );
 
         let packages = load_export_packages(dir.path());
-        assert!(packages.is_empty());
-    }
-
-    #[test]
-    fn test_load_export_packages_dedup() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.json");
-        let mut f = std::fs::File::create(&path).unwrap();
-        write!(
-            f,
-            r#"{{
-            "Sources": [
-                {{
-                    "Packages": [
-                        {{ "PackageIdentifier": "7zip.7zip" }},
-                        {{ "PackageIdentifier": "7zip.7zip" }}
-                    ]
-                }}
-            ]
-        }}"#
-        )
-        .unwrap();
-        drop(f);
-
-        let packages = load_export_packages(dir.path());
-        assert_eq!(packages.len(), 1);
-    }
-
-    #[test]
-    fn test_load_flat_format() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("desired.json");
-        let mut f = std::fs::File::create(&path).unwrap();
-        write!(
-            f,
-            r#"{{
-            "Packages": [
-                {{ "PackageIdentifier": "Google.Chrome", "PackageName": "Google Chrome" }},
-                {{ "PackageIdentifier": "Mozilla.Firefox", "PackageName": "Firefox" }}
-            ]
-        }}"#
-        )
-        .unwrap();
-        drop(f);
-
-        let packages = load_export_packages(dir.path());
-        assert_eq!(packages.len(), 2);
-        assert_eq!(packages[0].id, "Google.Chrome");
-        assert_eq!(packages[0].name, "Google Chrome");
-        assert_eq!(packages[1].id, "Mozilla.Firefox");
-        assert_eq!(packages[1].name, "Firefox");
-    }
-
-    #[test]
-    fn test_load_packages_from_file_name() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.json");
-        let mut f = std::fs::File::create(&path).unwrap();
-        write!(
-            f,
-            r#"{{
-            "Packages": [
-                {{ "PackageIdentifier": "AnyDesk.AnyDesk", "PackageName": "Anydesk" }},
-                {{ "PackageIdentifier": "CPUID.CPU-Z" }}
-            ]
-        }}"#
-        )
-        .unwrap();
-        drop(f);
-
-        let packages = load_packages_from_file(&path);
-        assert_eq!(packages.len(), 2);
-        assert_eq!(packages[0].name, "Anydesk");
-        assert_eq!(packages[1].name, "CPUID.CPU-Z"); // falls back to id
-    }
-
-    #[test]
-    fn test_load_ids_json() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ids.json");
-        let mut f = std::fs::File::create(&path).unwrap();
-        write!(
-            f,
-            r#"{{
-            "Packages": [
-                {{ "PackageIdentifier": "Google.Chrome", "PackageName": "Chrome" }}
-            ],
-            "Scripts": [
-                {{
-                    "ScriptName": "Activate Windows",
-                    "Command": ["powershell", "irm https://get.activated.win | iex"]
-                }}
-            ]
-        }}"#
-        )
-        .unwrap();
-        drop(f);
-
-        let packages = load_packages_from_file(&path);
-        assert_eq!(packages.len(), 2);
-        assert_eq!(packages[0].name, "Chrome");
-        assert!(!packages[0].is_script);
-        assert_eq!(packages[1].name, "Activate Windows");
-        assert!(packages[1].is_script);
-        assert_eq!(packages[1].command.as_ref().unwrap()[0], "powershell");
+        let ids: std::collections::HashSet<&str> = packages.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(packages.len(), 2); // A.One deduped across files
+        assert!(ids.contains("A.One") && ids.contains("B.Two"));
     }
 }

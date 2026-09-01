@@ -19,25 +19,33 @@ use wgtui::{
     upgrade_all_packages,
 };
 
-/// Returns the directories to search for JSON package files, in priority order.
+/// Returns the directories to search for manifest JSON files, in priority order.
+///
+/// For each base (exe dir, project root during dev, cwd) both the base itself
+/// and its `examples/` and `manifests/` subdirectories are searched.
 fn detect_package_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    // 1. Exe directory
+    let mut bases: Vec<PathBuf> = Vec::new();
     if let Some(exe_dir) = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
     {
-        dirs.push(exe_dir.clone());
-        // 2. Project root (parent of target/debug/) during dev
-        if let Some(parent) = exe_dir.parent().and_then(|p| p.parent()) {
-            dirs.push(parent.to_path_buf());
+        bases.push(exe_dir.clone());
+        // Project root (parent of target/debug/) during dev.
+        if let Some(root) = exe_dir.parent().and_then(|p| p.parent()) {
+            bases.push(root.to_path_buf());
         }
     }
-    // 3. Current working directory
-    if let Ok(cwd) = std::env::current_dir()
-        && !dirs.iter().any(|d| d == &cwd)
-    {
-        dirs.push(cwd);
+    if let Ok(cwd) = std::env::current_dir() {
+        bases.push(cwd);
+    }
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for base in bases {
+        for cand in [base.join("examples"), base.join("manifests"), base] {
+            if !dirs.contains(&cand) {
+                dirs.push(cand);
+            }
+        }
     }
     dirs
 }
@@ -626,14 +634,14 @@ impl App {
                 self.clamp_selected();
                 self.clear_selections();
             }
-            KeyCode::Left | KeyCode::BackTab => {
+            KeyCode::Left | KeyCode::BackTab | KeyCode::Char('h') => {
                 self.tab = self.tab.prev();
                 self.filter_query.clear();
                 self.filter_focused = false;
                 self.clamp_selected();
                 self.clear_selections();
             }
-            KeyCode::Right | KeyCode::Tab => {
+            KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => {
                 self.tab = self.tab.next();
                 self.filter_query.clear();
                 self.filter_focused = false;
@@ -673,14 +681,14 @@ impl App {
 
     fn handle_search_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 if self.search_selected > 0 {
                     self.search_selected -= 1;
                 } else {
                     self.filter_focused = true;
                 }
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 let n = self.filtered_search_results().len();
                 if n > 0 && self.search_selected + 1 < n {
                     self.search_selected += 1;
@@ -1101,8 +1109,11 @@ impl App {
                             let _ = wgtui::run_command_stdout(cmd, &args, string_tx);
                         }
                     } else {
-                        let _ =
-                            tx.send(ActionResult::OutputLine(format!("--- install {} ---", id)));
+                        let args = pkg.install_args();
+                        let _ = tx.send(ActionResult::OutputLine(format!(
+                            "--- winget {} ---",
+                            args.join(" ")
+                        )));
                         let tx2 = tx.clone();
                         let (string_tx, string_rx) = mpsc::channel::<String>();
                         thread::spawn(move || {
@@ -1110,17 +1121,8 @@ impl App {
                                 let _ = tx2.send(ActionResult::OutputLine(line));
                             }
                         });
-                        let args = [
-                            "install",
-                            "--exact",
-                            id,
-                            "--silent",
-                            "--accept-package-agreements",
-                            "--accept-source-agreements",
-                            "--scope",
-                            "machine",
-                        ];
-                        let _ = run_winget_stdout(&args, string_tx);
+                        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                        let _ = run_winget_stdout(&arg_refs, string_tx);
                     }
                     let _ = tx.send(ActionResult::OutputLine(String::new()));
                 }
@@ -1743,6 +1745,14 @@ mod tests {
     fn empty_packages_lines_falls_back_when_diagnostic_blank() {
         let lines = empty_packages_lines("   \n  ", true);
         assert!(lines.iter().any(|l| l.contains("README")));
+    }
+
+    #[test]
+    fn detect_package_dirs_covers_cwd_and_examples() {
+        let dirs = detect_package_dirs();
+        let cwd = std::env::current_dir().unwrap();
+        assert!(dirs.contains(&cwd));
+        assert!(dirs.contains(&cwd.join("examples")));
     }
 
     #[test]

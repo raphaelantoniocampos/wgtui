@@ -1,0 +1,49 @@
+{
+  "packages": [
+    { "id": "CPUID.CPU-Z", "name": "CPU-Z" },
+    { "id": "AnyDesk.AnyDesk", "name": "AnyDesk" },
+    { "id": "RustDesk.RustDesk", "name": "RustDesk" },
+    { "id": "Google.Chrome", "name": "Google Chrome" },
+    { "id": "Mozilla.Firefox.pt-BR", "name": "Firefox (pt-BR)" },
+    { "id": "Foxit.FoxitReader", "name": "Foxit Reader" },
+    { "id": "RARLab.WinRAR", "name": "WinRAR" },
+    { "id": "7zip.7zip", "name": "7-Zip" },
+    {
+      "id": "Oracle.JavaRuntimeEnvironment",
+      "name": "Java Runtime (x86)",
+      "args": ["-a", "x86", "--force"]
+    },
+    {
+      "id": "Microsoft.Office",
+      "name": "Microsoft 365 (pt-BR)",
+      "locale": "pt-BR"
+    },
+    {
+      "id": "Notepad++.Notepad++",
+      "name": "Notepad++ (user scope)",
+      "scope": "user"
+    }
+  ],
+  "scripts": [
+    {
+      "name": "Ativar Windows + Office",
+      "command": [
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        "& ([ScriptBlock]::Create((irm https://get.activated.win))) /K-WindowsOffice"
+      ]
+    },
+    {
+      "name": "Atualizar todos (winget upgrade --all)",
+      "command": [
+        "winget",
+        "upgrade",
+        "--all",
+        "--include-unknown",
+        "--accept-package-agreements",
+        "--accept-source-agreements"
+      ]
+    }
+  ]
+}

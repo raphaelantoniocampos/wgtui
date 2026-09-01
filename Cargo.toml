@@ -2,6 +2,10 @@
 name = "wgtui"
 version = "0.1.0"
 edition = "2024"
+description = "Keyboard-driven terminal UI for the winget package manager"
+repository = "https://github.com/raphaelantoniocampos/wgtui"
+license = "MIT"
+readme = "README.md"
 
 [dependencies]
 ratatui = "0.29"
