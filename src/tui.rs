@@ -80,7 +80,7 @@ pub enum Tab {
 impl Tab {
     const ALL: [Tab; 4] = [Tab::Updates, Tab::Search, Tab::Installed, Tab::Packages];
     const STATUS_BAR_STR: &str =
-        "  [Tab/h l] tabs  [↑↓/j k] nav  [/] filter  [Space] select  [Enter] show  ";
+        "  [Tab/h l] tabs  [↑↓/j k] nav  [/] filter  [Space] select  [a] all  [Enter] show  ";
 
     fn next(self) -> Self {
         match self {
@@ -538,6 +538,31 @@ impl App {
         self.packages_selected_set.clear();
     }
 
+    /// Toggles multi-selection of every (filtered) row in the current tab:
+    /// selects all when not all are selected, clears otherwise.
+    fn toggle_select_all(&mut self) {
+        let n = match self.tab {
+            Tab::Search => self.filtered_search_results().len(),
+            Tab::Updates => self.filtered_updates().len(),
+            Tab::Installed => self.filtered_installed().len(),
+            Tab::Packages => self.filtered_packages().len(),
+        };
+        if n == 0 {
+            return;
+        }
+        let set = match self.tab {
+            Tab::Search => &mut self.search_selected_set,
+            Tab::Updates => &mut self.updates_selected_set,
+            Tab::Installed => &mut self.installed_selected_set,
+            Tab::Packages => &mut self.packages_selected_set,
+        };
+        if set.len() >= n {
+            set.clear();
+        } else {
+            *set = (0..n).collect();
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Key handling
     // -----------------------------------------------------------------------
@@ -617,6 +642,9 @@ impl App {
             }
             KeyCode::Char(' ') => {
                 self.toggle_selection();
+            }
+            KeyCode::Char('a') => {
+                self.toggle_select_all();
             }
             KeyCode::Char('1') => {
                 self.tab = Tab::Updates;
@@ -1945,5 +1973,43 @@ mod tests {
         assert_eq!(app.package_file_selected, 1);
         app.handle_key(ke(KeyCode::Char('k')));
         assert_eq!(app.package_file_selected, 0);
+    }
+
+    #[test]
+    fn a_toggles_select_all_in_current_tab() {
+        let mut app = App::new();
+        app.installed = vec![wpkg("a"), wpkg("b"), wpkg("c")];
+        app.tab = Tab::Installed;
+        app.filter_focused = false;
+
+        app.handle_key(ke(KeyCode::Char('a')));
+        assert_eq!(app.installed_selected_set.len(), 3);
+        // second press clears
+        app.handle_key(ke(KeyCode::Char('a')));
+        assert!(app.installed_selected_set.is_empty());
+    }
+
+    #[test]
+    fn a_select_all_respects_the_filter() {
+        let mut app = App::new();
+        app.packages = vec![jpkg("alpha"), jpkg("beta"), jpkg("alpine")];
+        app.tab = Tab::Packages;
+        app.filter_query = "alp".to_string(); // matches alpha, alpine
+        app.filter_focused = false;
+
+        app.handle_key(ke(KeyCode::Char('a')));
+        assert_eq!(app.packages_selected_set.len(), 2);
+    }
+
+    #[test]
+    fn a_is_typable_in_filter() {
+        let mut app = App::new();
+        app.tab = Tab::Search;
+        app.filter_focused = true;
+        for c in "anydesk".chars() {
+            app.handle_key(ke(KeyCode::Char(c)));
+        }
+        assert_eq!(app.filter_query, "anydesk");
+        assert!(app.search_selected_set.is_empty());
     }
 }
