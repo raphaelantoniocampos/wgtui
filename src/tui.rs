@@ -14,8 +14,8 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tab
 use ratatui::{Frame, Terminal};
 
 use wgtui::{
-    JsonPackage, UpgradablePackage, WingetPackage, find_package_json_files, list_installed,
-    list_upgradable, load_packages_from_file, run_winget_stdout, search_packages,
+    JsonPackage, UpgradablePackage, WingetPackage, find_package_json_files, is_installed,
+    list_installed, list_upgradable, load_packages_from_file, run_winget_stdout, search_packages,
     upgrade_all_packages,
 };
 
@@ -564,7 +564,7 @@ impl App {
 
         if self.filter_focused {
             match key.code {
-                KeyCode::Esc => {
+                KeyCode::Esc | KeyCode::Char('q') => {
                     self.filter_focused = false;
                     self.clamp_selected();
                     return;
@@ -648,7 +648,7 @@ impl App {
                 self.clamp_selected();
                 self.clear_selections();
             }
-            KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Char('q') => {
                 self.should_quit = true;
             }
             KeyCode::PageUp => {
@@ -1587,15 +1587,13 @@ impl App {
                 vec![ListItem::new("No packages match the filter")]
             }
         } else {
-            let installed_ids: std::collections::HashSet<&str> =
-                self.installed.iter().map(|p| p.id.as_str()).collect();
             filtered
                 .iter()
                 .enumerate()
                 .map(|(i, pkg)| {
                     let display = if pkg.is_script {
                         format!("▶ {}", pkg.name)
-                    } else if installed_ids.contains(pkg.id.as_str()) {
+                    } else if is_installed(&pkg.id, &pkg.name, &self.installed) {
                         format!("✓ {}", pkg.name)
                     } else {
                         format!("  {}", pkg.name)
@@ -1691,20 +1689,20 @@ impl App {
         let (left, right) = match self.tab {
             Tab::Updates => (
                 Tab::STATUS_BAR_STR.to_owned() + "[u] upgrade  [U] upgrade all  ",
-                " [Esc] quit ",
+                " [q] quit ",
             ),
             Tab::Search => (
                 Tab::STATUS_BAR_STR.to_owned() + "[i] install  ",
-                " [Esc] quit ",
+                " [q] quit ",
             ),
             Tab::Installed => (
                 Tab::STATUS_BAR_STR.to_owned() + "[u] upgrade  [r] remove  [R] refresh  ",
-                " [Esc] quit ",
+                " [q] quit ",
             ),
             Tab::Packages => (
                 Tab::STATUS_BAR_STR.to_owned()
                     + "[i] install/run  [I] install/run all  [r] remove  [R] remove all  [F] file  ",
-                " [Esc] quit ",
+                " [q] quit ",
             ),
         };
 
