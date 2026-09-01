@@ -19,6 +19,8 @@ use wgtui::{
     upgrade_all_packages,
 };
 
+use crate::elevation::{elevation_warning, is_elevated};
+
 /// Returns the directories to search for manifest JSON files, in priority order.
 ///
 /// For each base (exe dir, project root during dev, cwd) both the base itself
@@ -118,6 +120,8 @@ enum ActionResult {
     InitialInstalled(Vec<WingetPackage>),
     /// First `winget upgrade` at startup (quiet).
     InitialUpdates(Vec<UpgradablePackage>),
+    /// Result of the startup admin-rights check.
+    Elevation(bool),
     SetCommand {
         command: String,
         output: String,
@@ -181,6 +185,9 @@ pub struct App {
     /// Count of startup list loads (`winget list` + `winget upgrade`) not yet
     /// finished. Non-zero drives a "loading" spinner without blocking input.
     initial_load_pending: u8,
+    /// Whether wgtui runs elevated. Assumed true until the startup check says
+    /// otherwise, so no warning flashes on launch.
+    elevated: bool,
     /// Cycles 0..3 for the spinner animation.
     pub spinner_frame: u8,
     /// Sender for background thread results.
@@ -250,6 +257,7 @@ impl App {
             output_scroll: usize::MAX,
             busy: false,
             initial_load_pending: 2,
+            elevated: true,
             spinner_frame: 0,
             action_tx: tx,
             action_rx: rx,
@@ -267,6 +275,10 @@ impl App {
         let tx = self.action_tx.clone();
         thread::spawn(move || {
             let _ = tx.send(ActionResult::InitialUpdates(list_upgradable()));
+        });
+        let tx = self.action_tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(ActionResult::Elevation(is_elevated()));
         });
     }
 
@@ -327,6 +339,9 @@ impl App {
             ActionResult::InitialUpdates(list) => {
                 self.updates = list;
                 self.initial_load_pending = self.initial_load_pending.saturating_sub(1);
+            }
+            ActionResult::Elevation(elevated) => {
+                self.elevated = elevated;
             }
             ActionResult::SetCommand { command, output } => {
                 self.current_command = Some(command);
@@ -1746,14 +1761,20 @@ impl App {
             ),
         };
 
-        let padding = " ".repeat(
-            area.width
-                .saturating_sub(left.len() as u16 + right.len() as u16) as usize,
-        );
+        let base = Style::default().fg(Color::White).bg(Color::Blue);
+        let warn = elevation_warning(self.elevated).unwrap_or("");
+        let warn_style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+
+        let used = left.len() + warn.len() + right.len();
+        let padding = " ".repeat((area.width as usize).saturating_sub(used));
         let line = Line::from(vec![
-            Span::styled(left, Style::default().fg(Color::White).bg(Color::Blue)),
-            Span::styled(&padding, Style::default().bg(Color::Blue)),
-            Span::styled(right, Style::default().fg(Color::White).bg(Color::Blue)),
+            Span::styled(left, base),
+            Span::styled(padding, base),
+            Span::styled(warn, warn_style),
+            Span::styled(right, base),
         ]);
 
         f.render_widget(Paragraph::new(Text::from(line)), area);
@@ -1846,6 +1867,14 @@ mod tests {
         app.handle_action_result(ActionResult::InitialUpdates(vec![]));
         assert_eq!(app.initial_load_pending, 0);
         assert_eq!(app.installed.len(), 1);
+    }
+
+    #[test]
+    fn elevation_defaults_true_and_updates_from_result() {
+        let mut app = App::new();
+        assert!(app.elevated, "assumed elevated until the check reports");
+        app.handle_action_result(ActionResult::Elevation(false));
+        assert!(!app.elevated);
     }
 
     // ----- vim keybindings -----

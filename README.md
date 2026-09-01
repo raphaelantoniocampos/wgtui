@@ -14,7 +14,9 @@ agora exclusivamente winget (Chocolatey/Scoop foram descartados) e em Rust.
   instalar via PowerShell (`Install-Module Microsoft.WinGet.Client` +
   `Repair-WinGetPackageManager`) no primeiro uso.
 - Rust (edition 2024) para compilar da fonte.
-- Execute como **Administrador** para instalar em `--scope machine` (o padrão).
+- Execute como **Administrador** para instalar em `--scope machine` (o padrão). Sem
+  elevação a status bar mostra `⚠ sem admin` e você deve usar `"scope": "user"` nos
+  pacotes do manifesto.
 
 ## Compilar e rodar
 

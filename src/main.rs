@@ -1,4 +1,5 @@
 mod bootstrap;
+mod elevation;
 mod tui;
 
 use crossterm::ExecutableCommand;
