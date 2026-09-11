@@ -1,5 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -18,9 +20,9 @@ use ratatui::widgets::{
 };
 
 use wgtui::{
-    JsonPackage, UpgradablePackage, WingetPackage, find_package_json_files, is_installed,
-    list_installed, list_upgradable, load_packages_from_file, run_winget_stdout, search_packages,
-    update_sources, upgrade_all_packages,
+    JsonPackage, PidSlot, UpgradablePackage, WingetPackage, find_package_json_files, is_installed,
+    kill_process_tree, list_installed, list_upgradable, load_packages_from_file, run_winget_stdout,
+    search_packages, update_sources, upgrade_all_packages,
 };
 
 use crate::elevation::{elevation_warning, is_elevated};
@@ -239,6 +241,64 @@ enum ActionResult {
     CommandDone,
 }
 
+/// An action the user triggered while something else was already running.
+/// Carries only the inputs that vary — never a snapshot of `self.packages` /
+/// `self.installed` — so it resolves against current app state at the moment
+/// it actually starts (see `App::start_action`), not when it was enqueued.
+enum QueuedAction {
+    InstallMulti(Vec<String>),
+    ShowMulti(Vec<String>),
+    UpgradeMulti(Vec<String>),
+    RemoveMulti(Vec<String>),
+    UpgradeAll,
+    InstallJsonMulti(Vec<String>),
+    RemoveJsonMulti(Vec<String>),
+    ShowJsonPackage(Vec<String>),
+    RefreshInstalled,
+    ManualCommand(String),
+    Search(String),
+}
+
+impl QueuedAction {
+    /// Display label for a *pending* row in the queue strip. (The running
+    /// row doesn't need this — it reuses `App::current_command`, which every
+    /// action method below sets for itself once it actually starts.)
+    fn label(&self) -> String {
+        fn ids_label(verb: &str, ids: &[String]) -> String {
+            match ids {
+                [one] => format!("{verb} {one}"),
+                many => format!("{verb} {} packages", many.len()),
+            }
+        }
+        match self {
+            QueuedAction::InstallMulti(ids) | QueuedAction::InstallJsonMulti(ids) => {
+                ids_label("install", ids)
+            }
+            QueuedAction::ShowMulti(ids) | QueuedAction::ShowJsonPackage(ids) => {
+                ids_label("show", ids)
+            }
+            QueuedAction::UpgradeMulti(ids) => ids_label("upgrade", ids),
+            QueuedAction::RemoveMulti(ids) | QueuedAction::RemoveJsonMulti(ids) => {
+                ids_label("remove", ids)
+            }
+            QueuedAction::UpgradeAll => "upgrade all packages".to_string(),
+            QueuedAction::RefreshInstalled => "refresh installed list".to_string(),
+            QueuedAction::ManualCommand(line) => line.clone(),
+            QueuedAction::Search(query) => format!("search \"{query}\""),
+        }
+    }
+}
+
+/// Handle to the job currently executing, so the UI thread can cancel it.
+struct RunningJob {
+    /// PID of whatever OS process is mid-flight right now, if any.
+    pid: PidSlot,
+    /// Set by the UI thread on cancel; the worker thread checks this between
+    /// iterations of a multi-id loop so cancelling stops the whole queued
+    /// item, not just its current sub-step.
+    cancel: Arc<AtomicBool>,
+}
+
 /// Cursor + multi-selection state for one list.
 ///
 /// Indices refer to the tab's **filtered** view, so navigation methods take the
@@ -352,8 +412,19 @@ pub struct App {
     pub command_output: Vec<String>,
     /// Scroll offset for terminal output (usize::MAX = auto-scroll to bottom).
     output_scroll: usize,
-    /// True while a blocking winget command is running.
+    /// True while a background command is running (only one ever runs at a
+    /// time — see `queue`). No longer gates key handling; navigation, typing,
+    /// and triggering further actions all still work while `busy`.
     pub busy: bool,
+    /// Handle to the currently-running job, if any: lets the UI cancel it.
+    running_job: Option<RunningJob>,
+    /// Actions triggered while something else was already running. FIFO;
+    /// `advance_queue` starts the front item once `busy` goes false.
+    queue: VecDeque<QueuedAction>,
+    /// `true` while the queue manager (opened with `Q`) has input focus.
+    queue_focused: bool,
+    /// Cursor over `queue`'s pending items, used only while `queue_focused`.
+    queue_sel: Selection,
     /// Count of startup list loads (`winget list` + `winget upgrade`) not yet
     /// finished. Non-zero drives a "loading" spinner without blocking input.
     initial_load_pending: u8,
@@ -426,6 +497,10 @@ impl App {
             command_output: vec![],
             output_scroll: usize::MAX,
             busy: false,
+            running_job: None,
+            queue: VecDeque::new(),
+            queue_focused: false,
+            queue_sel: Selection::default(),
             initial_load_pending: 2,
             elevated: true,
             spinner_frame: 0,
@@ -484,6 +559,7 @@ impl App {
                     }
                 }
             }
+            self.advance_queue();
 
             // Advance spinner and poll keyboard
             if self.busy || self.initial_load_pending > 0 {
@@ -543,6 +619,7 @@ impl App {
             }
             ActionResult::CommandDone => {
                 self.busy = false;
+                self.running_job = None;
             }
         }
     }
@@ -703,8 +780,110 @@ impl App {
             return;
         }
         match self.tab {
-            Tab::Packages => self.show_json_package(ids),
-            _ => self.show_multi_pkg(ids),
+            Tab::Packages => self.dispatch(QueuedAction::ShowJsonPackage(ids)),
+            _ => self.dispatch(QueuedAction::ShowMulti(ids)),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Command queue
+    // -----------------------------------------------------------------------
+
+    /// Routes an action through the one-job-at-a-time slot: starts it now if
+    /// nothing else is running, otherwise enqueues it silently.
+    fn dispatch(&mut self, action: QueuedAction) {
+        if self.busy {
+            self.queue.push_back(action);
+            self.queue_sel.clamp(self.queue.len());
+        } else {
+            self.start_action(action);
+        }
+    }
+
+    /// Starts an action's worker thread now. Only called from `dispatch`
+    /// (nothing else is running) or `advance_queue` (the previous job just
+    /// finished) — never while `self.busy` is already true.
+    fn start_action(&mut self, action: QueuedAction) {
+        match action {
+            QueuedAction::InstallMulti(ids) => self.install_multi_pkg(ids),
+            QueuedAction::ShowMulti(ids) => self.show_multi_pkg(ids),
+            QueuedAction::UpgradeMulti(ids) => self.upgrade_multi_pkg(ids),
+            QueuedAction::RemoveMulti(ids) => self.remove_multi_pkg(ids),
+            QueuedAction::UpgradeAll => self.upgrade_all(),
+            QueuedAction::InstallJsonMulti(ids) => self.install_json_multi(ids),
+            QueuedAction::RemoveJsonMulti(ids) => self.remove_json_multi(ids),
+            QueuedAction::ShowJsonPackage(ids) => self.show_json_package(ids),
+            QueuedAction::RefreshInstalled => self.refresh_installed(),
+            QueuedAction::ManualCommand(line) => self.run_manual_command(line),
+            QueuedAction::Search(query) => self.run_search(query),
+        }
+    }
+
+    /// Marks a job as running (`busy = true`) and returns the `(pid_slot,
+    /// cancel)` pair the caller's worker thread should thread through its
+    /// `run_*_stdout` calls and check between loop iterations.
+    fn begin_job(&mut self) -> (PidSlot, Arc<AtomicBool>) {
+        self.busy = true;
+        let pid: PidSlot = Arc::new(Mutex::new(None));
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.running_job = Some(RunningJob {
+            pid: pid.clone(),
+            cancel: cancel.clone(),
+        });
+        (pid, cancel)
+    }
+
+    /// Starts the next queued action once idle. Called every frame from
+    /// `run()`; a no-op unless something is both idle and waiting.
+    fn advance_queue(&mut self) {
+        if self.busy {
+            return;
+        }
+        if let Some(next) = self.queue.pop_front() {
+            self.queue_sel.clamp(self.queue.len());
+            self.start_action(next);
+        }
+    }
+
+    /// Cancels the currently-running job, if any: kills its OS process (best
+    /// effort, on its own thread so the UI never blocks on it) and sets the
+    /// cooperative flag its loop checks between package ids.
+    fn cancel_running(&mut self) {
+        if let Some(job) = &self.running_job {
+            job.cancel.store(true, Ordering::Relaxed);
+            if let Some(pid) = *job.pid.lock().unwrap() {
+                thread::spawn(move || {
+                    let _ = kill_process_tree(pid);
+                });
+            }
+        }
+    }
+
+    fn remove_queue_item_at_cursor(&mut self) {
+        if self.queue_sel.cursor < self.queue.len() {
+            self.queue.remove(self.queue_sel.cursor);
+            self.queue_sel.clamp(self.queue.len());
+        }
+    }
+
+    fn clear_pending_queue(&mut self) {
+        self.queue.clear();
+        self.queue_sel.reset();
+    }
+
+    fn move_queue_item_up(&mut self) {
+        let i = self.queue_sel.cursor;
+        if i > 0 && i < self.queue.len() {
+            self.queue.swap(i, i - 1);
+            self.queue_sel.cursor -= 1;
+        }
+    }
+
+    fn move_queue_item_down(&mut self) {
+        let i = self.queue_sel.cursor;
+        if i + 1 < self.queue.len() {
+            self.queue.swap(i, i + 1);
+            self.queue_sel.cursor += 1;
         }
     }
 
@@ -713,10 +892,7 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn handle_key(&mut self, key: KeyEvent) {
-        if self.busy {
-            return;
-        }
-        // Ctrl+C to quit
+        // Ctrl+C to quit — always works, even mid-command.
         if key.code == KeyCode::Char('c')
             && key
                 .modifiers
@@ -726,13 +902,15 @@ impl App {
             return;
         }
 
-        // Manual-command editor ([c]) captures all input while open.
+        // Manual-command editor ([c]) captures all input while open. Enter
+        // dispatches — runs now if idle, enqueues silently if something else
+        // is already running.
         if self.command_input.is_some() {
             match key.code {
                 KeyCode::Esc => self.command_input = None,
                 KeyCode::Enter => {
                     if let Some(line) = self.command_input.take() {
-                        self.run_manual_command(line);
+                        self.dispatch(QueuedAction::ManualCommand(line));
                     }
                 }
                 KeyCode::Char(c) => {
@@ -745,6 +923,27 @@ impl App {
                         buf.pop();
                     }
                 }
+                _ => {}
+            }
+            return;
+        }
+
+        // The queue manager ([Q]) captures all input while focused.
+        if self.queue_focused {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('Q') => self.queue_focused = false,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let n = self.queue.len();
+                    self.queue_sel.down(n);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.queue_sel.up();
+                }
+                KeyCode::Char('d') => self.remove_queue_item_at_cursor(),
+                KeyCode::Char('D') => self.clear_pending_queue(),
+                KeyCode::Char('J') => self.move_queue_item_down(),
+                KeyCode::Char('K') => self.move_queue_item_up(),
+                KeyCode::Char('x') => self.cancel_running(),
                 _ => {}
             }
             return;
@@ -777,7 +976,12 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if self.tab == Tab::Search {
-                        self.trigger_search();
+                        if self.filter_query.is_empty() {
+                            self.search_results.clear();
+                            self.search_sel.cursor = 0;
+                        } else {
+                            self.dispatch(QueuedAction::Search(self.filter_query.clone()));
+                        }
                     } else {
                         self.filter_focused = false;
                         self.clamp_selected();
@@ -821,6 +1025,10 @@ impl App {
                         .clone()
                         .unwrap_or_else(|| "winget ".to_string()),
                 );
+            }
+            KeyCode::Char('Q') if !self.queue.is_empty() || self.running_job.is_some() => {
+                self.queue_focused = true;
+                self.queue_sel.clamp(self.queue.len());
             }
             KeyCode::Char('1') => self.switch_tab(Tab::Updates),
             KeyCode::Char('2') => self.switch_tab(Tab::Search),
@@ -877,7 +1085,7 @@ impl App {
         if let KeyCode::Char('i') = key.code {
             let ids = self.selected_ids();
             if !ids.is_empty() {
-                self.install_multi_pkg(ids);
+                self.dispatch(QueuedAction::InstallMulti(ids));
             }
         }
     }
@@ -887,11 +1095,11 @@ impl App {
             KeyCode::Char('u') => {
                 let ids = self.selected_ids();
                 if !ids.is_empty() {
-                    self.upgrade_multi_pkg(ids);
+                    self.dispatch(QueuedAction::UpgradeMulti(ids));
                 }
             }
             KeyCode::Char('U') => {
-                self.upgrade_all();
+                self.dispatch(QueuedAction::UpgradeAll);
             }
             _ => {}
         }
@@ -916,17 +1124,17 @@ impl App {
             KeyCode::Char('r') => {
                 let ids = self.selected_ids();
                 if !ids.is_empty() {
-                    self.remove_multi_pkg(ids);
+                    self.dispatch(QueuedAction::RemoveMulti(ids));
                 }
             }
             KeyCode::Char('u') | KeyCode::Char('U') => {
                 let ids = self.selected_ids();
                 if !ids.is_empty() {
-                    self.upgrade_multi_pkg(ids);
+                    self.dispatch(QueuedAction::UpgradeMulti(ids));
                 }
             }
             KeyCode::Char('R') => {
-                self.refresh_installed();
+                self.dispatch(QueuedAction::RefreshInstalled);
             }
             _ => {}
         }
@@ -970,25 +1178,25 @@ impl App {
             KeyCode::Char('i') => {
                 let ids = self.selected_ids();
                 if !ids.is_empty() {
-                    self.install_json_multi(ids);
+                    self.dispatch(QueuedAction::InstallJsonMulti(ids));
                 }
             }
             KeyCode::Char('I') => {
                 let all_ids: Vec<String> = self.packages.iter().map(|p| p.id.clone()).collect();
                 if !all_ids.is_empty() {
-                    self.install_json_multi(all_ids);
+                    self.dispatch(QueuedAction::InstallJsonMulti(all_ids));
                 }
             }
             KeyCode::Char('r') => {
                 let ids = self.selected_ids();
                 if !ids.is_empty() {
-                    self.remove_json_multi(ids);
+                    self.dispatch(QueuedAction::RemoveJsonMulti(ids));
                 }
             }
             KeyCode::Char('R') => {
                 let all_ids: Vec<String> = self.packages.iter().map(|p| p.id.clone()).collect();
                 if !all_ids.is_empty() {
-                    self.remove_json_multi(all_ids);
+                    self.dispatch(QueuedAction::RemoveJsonMulti(all_ids));
                 }
             }
             KeyCode::Char('f') | KeyCode::Char('F')
@@ -1008,16 +1216,12 @@ impl App {
     // Actions
     // -----------------------------------------------------------------------
 
-    fn trigger_search(&mut self) {
-        if self.filter_query.is_empty() {
-            self.search_results.clear();
-            self.search_sel.cursor = 0;
-            return;
-        }
-        let query = self.filter_query.clone();
+    /// Runs `winget search <query>`. Not cancellable mid-flight (a quick,
+    /// non-streaming read) — `x` in the queue manager is a no-op on it.
+    fn run_search(&mut self, query: String) {
         let tx = self.action_tx.clone();
         self.current_command = Some(format!("winget search \"{}\"", query));
-        self.busy = true;
+        let _ = self.begin_job();
         thread::spawn(move || {
             let results = search_packages(&query);
             let cmd = format!("winget search \"{}\"", query);
@@ -1052,9 +1256,13 @@ impl App {
                 "machine",
             ]);
         }
-        self.busy = true;
+        let (pid_slot, cancel) = self.begin_job();
         thread::spawn(move || {
             for id in &ids {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(ActionResult::OutputLine("--- cancelled ---".to_string()));
+                    break;
+                }
                 let _ = tx.send(ActionResult::OutputLine(format!("--- install {} ---", id)));
                 let tx2 = tx.clone();
                 let (string_tx, string_rx) = mpsc::channel::<String>();
@@ -1073,7 +1281,7 @@ impl App {
                     "--scope",
                     "machine",
                 ];
-                let _ = run_winget_stdout(&args, string_tx, None);
+                let _ = run_winget_stdout(&args, string_tx, Some(&pid_slot));
                 let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
             let _ = tx.send(ActionResult::RefreshInstalled(list_installed()));
@@ -1088,9 +1296,13 @@ impl App {
         self.command_output.clear();
         self.output_scroll = usize::MAX;
         self.current_command = Some(format!("winget show {} packages", ids.len()));
-        self.busy = true;
+        let (pid_slot, cancel) = self.begin_job();
         thread::spawn(move || {
             for id in &ids {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(ActionResult::OutputLine("--- cancelled ---".to_string()));
+                    break;
+                }
                 let _ = tx.send(ActionResult::OutputLine(format!("--- {} ---", id)));
                 let tx2 = tx.clone();
                 let (string_tx, string_rx) = mpsc::channel::<String>();
@@ -1100,7 +1312,7 @@ impl App {
                     }
                 });
                 let args = ["show", id, "--accept-source-agreements"];
-                let _ = run_winget_stdout(&args, string_tx, None);
+                let _ = run_winget_stdout(&args, string_tx, Some(&pid_slot));
                 let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
             let _ = tx.send(ActionResult::CommandDone);
@@ -1123,9 +1335,13 @@ impl App {
                 "--accept-source-agreements",
             ]);
         }
-        self.busy = true;
+        let (pid_slot, cancel) = self.begin_job();
         thread::spawn(move || {
             for id in &ids {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(ActionResult::OutputLine("--- cancelled ---".to_string()));
+                    break;
+                }
                 let _ = tx.send(ActionResult::OutputLine(format!("--- upgrade {} ---", id)));
                 let tx2 = tx.clone();
                 let (string_tx, string_rx) = mpsc::channel::<String>();
@@ -1142,7 +1358,7 @@ impl App {
                     "--accept-package-agreements",
                     "--accept-source-agreements",
                 ];
-                let _ = run_winget_stdout(&args, string_tx, None);
+                let _ = run_winget_stdout(&args, string_tx, Some(&pid_slot));
                 let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
             let updates = list_upgradable();
@@ -1167,9 +1383,13 @@ impl App {
                 "--accept-source-agreements",
             ]);
         }
-        self.busy = true;
+        let (pid_slot, cancel) = self.begin_job();
         thread::spawn(move || {
             for id in &ids {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(ActionResult::OutputLine("--- cancelled ---".to_string()));
+                    break;
+                }
                 let _ = tx.send(ActionResult::OutputLine(format!(
                     "--- uninstall {} ---",
                     id
@@ -1188,7 +1408,7 @@ impl App {
                     "--silent",
                     "--accept-source-agreements",
                 ];
-                let _ = run_winget_stdout(&args, string_tx, None);
+                let _ = run_winget_stdout(&args, string_tx, Some(&pid_slot));
                 let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
             let list = list_installed();
@@ -1205,10 +1425,10 @@ impl App {
              --accept-package-agreements --accept-source-agreements"
                 .to_string(),
         );
-        self.busy = true;
+        let (pid_slot, _cancel) = self.begin_job();
         thread::spawn(move || {
             let cmd = "winget upgrade --all --include-unknown".to_string();
-            match upgrade_all_packages(None) {
+            match upgrade_all_packages(Some(&pid_slot)) {
                 Ok(msg) => {
                     let _ = tx.send(ActionResult::SetCommand {
                         command: cmd,
@@ -1247,11 +1467,15 @@ impl App {
         {
             self.last_command = Some(seed);
         }
-        self.busy = true;
+        let (pid_slot, cancel) = self.begin_job();
         let tx_clone = tx.clone();
         let packages_clone = self.packages.clone();
         thread::spawn(move || {
             for id in &ids {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(ActionResult::OutputLine("--- cancelled ---".to_string()));
+                    break;
+                }
                 if let Some(pkg) = packages_clone.iter().find(|p| p.id == *id) {
                     if pkg.is_script {
                         let _ = tx.send(ActionResult::OutputLine(format!(
@@ -1271,7 +1495,8 @@ impl App {
                                     let _ = tx2.send(ActionResult::OutputLine(line));
                                 }
                             });
-                            let _ = wgtui::run_command_stdout(cmd, &args, string_tx, None);
+                            let _ =
+                                wgtui::run_command_stdout(cmd, &args, string_tx, Some(&pid_slot));
                         }
                     } else {
                         let args = pkg.install_args();
@@ -1287,7 +1512,7 @@ impl App {
                             }
                         });
                         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                        let _ = run_winget_stdout(&arg_refs, string_tx, None);
+                        let _ = run_winget_stdout(&arg_refs, string_tx, Some(&pid_slot));
                     }
                     let _ = tx.send(ActionResult::OutputLine(String::new()));
                 }
@@ -1305,10 +1530,14 @@ impl App {
         self.command_output.clear();
         self.output_scroll = usize::MAX;
         self.current_command = Some(format!("uninstall/remove {} apps/scripts", ids.len()));
-        self.busy = true;
+        let (pid_slot, cancel) = self.begin_job();
         let packages_clone = self.packages.clone();
         thread::spawn(move || {
             for id in &ids {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(ActionResult::OutputLine("--- cancelled ---".to_string()));
+                    break;
+                }
                 if let Some(pkg) = packages_clone.iter().find(|p| p.id == *id) {
                     if pkg.is_script {
                         let _ = tx.send(ActionResult::OutputLine(format!(
@@ -1334,7 +1563,7 @@ impl App {
                             "--silent",
                             "--accept-source-agreements",
                         ];
-                        let _ = run_winget_stdout(&args, string_tx, None);
+                        let _ = run_winget_stdout(&args, string_tx, Some(&pid_slot));
                     }
                     let _ = tx.send(ActionResult::OutputLine(String::new()));
                 }
@@ -1351,10 +1580,14 @@ impl App {
         self.command_output.clear();
         self.output_scroll = usize::MAX;
         self.current_command = Some(format!("show {} apps/scripts", ids.len()));
-        self.busy = true;
+        let (pid_slot, cancel) = self.begin_job();
         let packages_clone = self.packages.clone();
         thread::spawn(move || {
             for id in &ids {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(ActionResult::OutputLine("--- cancelled ---".to_string()));
+                    break;
+                }
                 if let Some(pkg) = packages_clone.iter().find(|p| p.id == *id) {
                     if pkg.is_script {
                         let _ = tx.send(ActionResult::OutputLine(format!(
@@ -1377,7 +1610,7 @@ impl App {
                             }
                         });
                         let args = ["show", id, "--accept-source-agreements"];
-                        let _ = run_winget_stdout(&args, string_tx, None);
+                        let _ = run_winget_stdout(&args, string_tx, Some(&pid_slot));
                     }
                     let _ = tx.send(ActionResult::OutputLine(String::new()));
                 }
@@ -1386,10 +1619,12 @@ impl App {
         });
     }
 
+    /// Not cancellable mid-flight (a quick, non-streaming read) — `x` in the
+    /// queue manager is a no-op on it.
     fn refresh_installed(&mut self) {
         let tx = self.action_tx.clone();
         self.current_command = Some("winget list --refresh".to_string());
-        self.busy = true;
+        let _ = self.begin_job();
         thread::spawn(move || {
             let list = list_installed();
             let _ = tx.send(ActionResult::RefreshInstalled(list));
@@ -1418,9 +1653,9 @@ impl App {
         self.command_output.clear();
         self.output_scroll = usize::MAX;
         self.current_command = Some(line);
-        self.busy = true;
 
         let tx = self.action_tx.clone();
+        let (pid_slot, _cancel) = self.begin_job();
         thread::spawn(move || {
             let _ = tx.send(ActionResult::OutputLine(format!(
                 "--- {} ---",
@@ -1434,7 +1669,7 @@ impl App {
                 }
             });
             let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
-            let _ = wgtui::run_command_stdout(&argv[0], &args, string_tx, None);
+            let _ = wgtui::run_command_stdout(&argv[0], &args, string_tx, Some(&pid_slot));
             let _ = tx.send(ActionResult::RefreshInstalled(list_installed()));
             let _ = tx.send(ActionResult::UpgradeList(list_upgradable()));
             let _ = tx.send(ActionResult::CommandDone);
@@ -1851,7 +2086,110 @@ impl App {
 
     /// The bottom panel: the running command as the pane title, its live output
     /// as the body. Doubles as the `[c]` command editor.
+    /// The bottom panel: just the command/output pane when the queue is
+    /// empty, idle, and unfocused (pixel-identical to before this feature);
+    /// otherwise a compact queue strip above it.
     fn render_terminal(&self, f: &mut Frame<'_>, area: Rect) {
+        if self.queue.is_empty() && self.running_job.is_none() && !self.queue_focused {
+            self.render_output_panel(f, area);
+            return;
+        }
+        let rows = Layout::vertical([
+            Constraint::Length(self.queue_strip_height()),
+            Constraint::Min(3),
+        ])
+        .split(area);
+        self.render_queue_strip(f, rows[0]);
+        self.render_output_panel(f, rows[1]);
+    }
+
+    /// Rows the queue strip needs: the running item (if any) + up to 4
+    /// visible pending items (more scroll), at least 1 content row, + borders.
+    fn queue_strip_height(&self) -> u16 {
+        let running = u16::from(self.running_job.is_some());
+        let pending = self.queue.len().min(4) as u16;
+        (running + pending).max(1) + 2
+    }
+
+    fn render_queue_strip(&self, f: &mut Frame<'_>, area: Rect) {
+        let focused = self.queue_focused;
+        let title_txt = if self.queue.is_empty() {
+            " queue ".to_string()
+        } else {
+            format!(" queue · {} pending ", self.queue.len())
+        };
+        let hint = if focused {
+            " j/k move · d remove · D clear · J/K reorder · x cancel · esc back "
+        } else {
+            " Q to manage "
+        };
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(theme::border(focused))
+            .title(Span::styled(title_txt, theme::title(focused)))
+            .title(Line::from(Span::styled(hint, theme::dim())).right_aligned())
+            .padding(Padding::horizontal(1));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.height == 0 {
+            return;
+        }
+
+        let mut lines: Vec<Line> = Vec::new();
+        if self.running_job.is_some() {
+            let icon = SPINNER[self.spinner_frame as usize % SPINNER.len()];
+            let cmd = self.current_command.as_deref().unwrap_or("running…");
+            lines.push(Line::from(vec![
+                Span::styled(format!("{icon} "), Style::default().fg(theme::ACCENT)),
+                Span::styled(
+                    cmd.to_string(),
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+        if self.queue.is_empty() && self.running_job.is_none() {
+            lines.push(Line::from(Span::styled(
+                "queue is empty",
+                theme::dim().add_modifier(Modifier::ITALIC),
+            )));
+        } else {
+            for (i, action) in self.queue.iter().enumerate() {
+                let text = format!("{}. {}", i + 1, action.label());
+                let style = if focused && i == self.queue_sel.cursor {
+                    theme::cursor_row()
+                } else {
+                    theme::dim()
+                };
+                lines.push(Line::from(Span::styled(text, style)));
+            }
+        }
+
+        let total = lines.len();
+        let h = inner.height as usize;
+        let running_offset = usize::from(self.running_job.is_some());
+        let scroll = if focused {
+            (self.queue_sel.cursor + running_offset).saturating_sub(h.saturating_sub(1))
+        } else {
+            0
+        };
+        f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), inner);
+
+        if total > h {
+            let mut sb = ScrollbarState::new(total).position(scroll);
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .thumb_style(Style::default().fg(theme::ACCENT)),
+                area.inner(Margin::new(0, 1)),
+                &mut sb,
+            );
+        }
+    }
+
+    fn render_output_panel(&self, f: &mut Frame<'_>, area: Rect) {
         let editing = self.command_input.is_some();
         let busy = self.busy || self.initial_load_pending > 0;
 
@@ -1948,13 +2286,42 @@ impl App {
         };
 
         let mut left: Vec<Span> = Vec::new();
-        for (k, d) in [("j/k", "move"), ("h/l", "tabs"), ("/", "filter")] {
-            push_hint(&mut left, k, d);
+        if self.queue_focused {
+            for (k, d) in [
+                ("j/k", "move"),
+                ("d", "remove"),
+                ("D", "clear"),
+                ("J/K", "reorder"),
+                ("x", "cancel running"),
+                ("esc", "back"),
+            ] {
+                push_hint(&mut left, k, d);
+            }
+        } else {
+            for (k, d) in [("j/k", "move"), ("h/l", "tabs"), ("/", "filter")] {
+                push_hint(&mut left, k, d);
+            }
+            for (k, d) in self.tab.hints() {
+                push_hint(&mut left, k, d);
+            }
+            push_hint(&mut left, "c", "cmd");
+            if self.queue.is_empty() && self.running_job.is_none() {
+                push_hint(&mut left, "Q", "queue");
+            } else {
+                let label = if self.queue.is_empty() {
+                    " queue·running".to_string()
+                } else {
+                    format!(" queue·{}", self.queue.len())
+                };
+                left.push(Span::styled("  Q", key));
+                left.push(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
         }
-        for (k, d) in self.tab.hints() {
-            push_hint(&mut left, k, d);
-        }
-        push_hint(&mut left, "c", "cmd");
 
         let mut right: Vec<Span> = Vec::new();
         if let Some(hint) = elevation_warning(self.elevated) {
@@ -2373,5 +2740,207 @@ mod tests {
         let mut not_admin = populated();
         not_admin.elevated = false;
         draw(&not_admin, 100, 30);
+    }
+
+    #[test]
+    fn renders_queue_strip_running_pending_focused_and_tiny() {
+        let mut app = populated();
+        app.busy = true;
+        app.running_job = Some(RunningJob {
+            pid: Arc::new(Mutex::new(None)),
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        app.queue
+            .push_back(QueuedAction::InstallMulti(vec!["a.a".into()]));
+        app.queue.push_back(QueuedAction::UpgradeAll);
+        app.queue
+            .push_back(QueuedAction::RemoveMulti(vec!["b.b".into(), "c.c".into()]));
+        app.queue
+            .push_back(QueuedAction::ManualCommand("winget list".into()));
+        app.queue.push_back(QueuedAction::Search("7zip".into()));
+        draw(&app, 110, 32);
+        draw(&app, 40, 10);
+        draw(&app, 8, 4);
+
+        app.queue_focused = true;
+        app.queue_sel.cursor = 2;
+        draw(&app, 110, 32);
+
+        let mut just_running = App::new();
+        just_running.busy = true;
+        just_running.running_job = Some(RunningJob {
+            pid: Arc::new(Mutex::new(None)),
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        draw(&just_running, 100, 30);
+    }
+
+    // ----- command queue -----
+
+    #[test]
+    fn queued_action_labels_are_readable() {
+        assert_eq!(
+            QueuedAction::InstallMulti(vec!["Google.Chrome".into()]).label(),
+            "install Google.Chrome"
+        );
+        assert_eq!(
+            QueuedAction::RemoveMulti(vec!["a".into(), "b".into()]).label(),
+            "remove 2 packages"
+        );
+        assert_eq!(QueuedAction::UpgradeAll.label(), "upgrade all packages");
+        assert_eq!(
+            QueuedAction::RefreshInstalled.label(),
+            "refresh installed list"
+        );
+        assert_eq!(
+            QueuedAction::Search("7zip".into()).label(),
+            "search \"7zip\""
+        );
+        assert_eq!(
+            QueuedAction::ManualCommand("winget list".into()).label(),
+            "winget list"
+        );
+    }
+
+    #[test]
+    fn dispatch_enqueues_while_busy_and_runs_immediately_when_idle() {
+        let mut app = App::new();
+        assert!(!app.busy);
+
+        // Idle: dispatch starts the job synchronously (only the sync half is
+        // observable here — never wait on the spawned thread's outcome).
+        app.dispatch(QueuedAction::RefreshInstalled);
+        assert!(app.busy);
+        assert!(app.queue.is_empty());
+
+        // Busy: a second dispatch enqueues instead of starting or dropping.
+        app.dispatch(QueuedAction::UpgradeAll);
+        assert_eq!(app.queue.len(), 1);
+        assert!(app.busy, "still the first job, not replaced");
+    }
+
+    #[test]
+    fn advance_queue_starts_next_only_once_idle() {
+        let mut app = App::new();
+        app.queue.push_back(QueuedAction::RefreshInstalled);
+
+        app.busy = true;
+        app.advance_queue();
+        assert!(
+            !app.queue.is_empty(),
+            "must not start a new job while one is running"
+        );
+
+        app.busy = false;
+        app.advance_queue();
+        assert!(app.busy, "picked up the queued job");
+        assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn busy_no_longer_blocks_navigation_or_dispatch() {
+        // The original bug this feature fixes: the whole UI used to freeze
+        // solid while a command ran.
+        let mut app = App::new();
+        app.tab = Tab::Installed;
+        app.installed = vec![wpkg("a"), wpkg("b")];
+        app.busy = true;
+
+        app.handle_key(ke(KeyCode::Char('j')));
+        assert_eq!(app.installed_sel.cursor, 1, "navigation must still work");
+
+        app.handle_key(ke(KeyCode::Char('r')));
+        assert_eq!(
+            app.queue.len(),
+            1,
+            "an action key while busy enqueues instead of running or being dropped"
+        );
+    }
+
+    #[test]
+    fn queue_remove_clear_and_reorder() {
+        let mut app = App::new();
+        app.queue
+            .push_back(QueuedAction::InstallMulti(vec!["a".into()]));
+        app.queue
+            .push_back(QueuedAction::InstallMulti(vec!["b".into()]));
+        app.queue
+            .push_back(QueuedAction::InstallMulti(vec!["c".into()]));
+
+        app.queue_sel.cursor = 1; // "b"
+        app.move_queue_item_up();
+        assert_eq!(app.queue_sel.cursor, 0);
+        match &app.queue[0] {
+            QueuedAction::InstallMulti(ids) => assert_eq!(ids[0], "b"),
+            _ => panic!("expected InstallMulti"),
+        }
+
+        app.move_queue_item_down();
+        assert_eq!(app.queue_sel.cursor, 1);
+        match &app.queue[0] {
+            QueuedAction::InstallMulti(ids) => assert_eq!(ids[0], "a"),
+            _ => panic!("expected InstallMulti"),
+        }
+
+        app.remove_queue_item_at_cursor();
+        assert_eq!(app.queue.len(), 2);
+
+        app.clear_pending_queue();
+        assert!(app.queue.is_empty());
+        assert_eq!(app.queue_sel.cursor, 0);
+    }
+
+    #[test]
+    fn q_toggles_queue_focus_only_when_there_is_something_to_show() {
+        let mut app = App::new();
+        app.handle_key(ke(KeyCode::Char('Q')));
+        assert!(!app.queue_focused, "nothing queued or running: no-op");
+
+        app.queue.push_back(QueuedAction::RefreshInstalled);
+        app.handle_key(ke(KeyCode::Char('Q')));
+        assert!(app.queue_focused);
+        app.handle_key(ke(KeyCode::Char('Q')));
+        assert!(!app.queue_focused);
+        app.handle_key(ke(KeyCode::Char('Q')));
+
+        // Non-queue keys are swallowed while focused.
+        app.handle_key(ke(KeyCode::Char('i')));
+        assert!(
+            app.queue
+                .iter()
+                .all(|a| matches!(a, QueuedAction::RefreshInstalled))
+        );
+
+        app.handle_key(ke(KeyCode::Esc));
+        assert!(!app.queue_focused);
+    }
+
+    #[test]
+    fn queue_focus_d_removes_and_shift_d_clears() {
+        let mut app = App::new();
+        app.queue
+            .push_back(QueuedAction::InstallMulti(vec!["a".into()]));
+        app.queue
+            .push_back(QueuedAction::InstallMulti(vec!["b".into()]));
+        app.queue_focused = true;
+
+        app.handle_key(ke(KeyCode::Char('d')));
+        assert_eq!(app.queue.len(), 1);
+
+        app.handle_key(ke(KeyCode::Char('D')));
+        assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn cancel_running_sets_the_cooperative_flag() {
+        let mut app = App::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.running_job = Some(RunningJob {
+            pid: Arc::new(Mutex::new(Some(u32::MAX))), // fake, never actually killed here
+            cancel: cancel.clone(),
+        });
+
+        app.cancel_running();
+        assert!(cancel.load(Ordering::Relaxed));
     }
 }

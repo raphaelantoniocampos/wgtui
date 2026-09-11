@@ -49,6 +49,17 @@ Na coluna à esquerda: `●` = marcado · `✓` = já instalado · `▶` = scrip
 para você ajustar e rodar à mão (ex.: acrescentar `--all-versions` ou `--version X` quando
 o winget reclama de múltiplas versões instaladas). `Enter` roda, `Esc` cancela.
 
+**A UI nunca trava.** Você pode navegar, filtrar e disparar outras ações enquanto um
+comando roda — só um comando executa por vez, então uma segunda ação (instalar, atualizar,
+remover, buscar, `[c]`...) entra numa **fila** silenciosa e roda assim que a atual termina.
+
+**`Q` — gerenciar a fila:** aparece na status bar quando há algo rodando ou pendente; abre
+um painel de fila acima do Output com o item em execução e os pendentes numerados.
+Dentro do modo: `j`/`k` navegam os pendentes · `d` remove o pendente selecionado ·
+`D` limpa todos os pendentes · `J`/`K` reordenam o item selecionado (desce/sobe) ·
+`x` cancela o comando **em execução** (mata o processo winget — pode deixar uma
+instalação pela metade) · `Esc`/`Q` volta.
+
 Defina `WGTUI_DEBUG=1` para ver, na aba Apps/Scripts vazia, os diretórios verificados.
 
 ## Manifesto (aba Apps/Scripts)
