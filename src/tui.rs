@@ -2692,6 +2692,16 @@ mod tests {
         term.draw(|f| app.render(f)).unwrap();
     }
 
+    /// Like `draw`, but returns the rendered frame as plain text so a test can
+    /// assert on what's actually on screen, not just "didn't panic".
+    fn draw_text(app: &App, w: u16, h: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        term.backend().to_string()
+    }
+
     fn populated() -> App {
         let mut app = App::new();
         app.installed = vec![wpkg("Chrome"), wpkg("Firefox"), wpkg("7zip")];
@@ -2773,6 +2783,61 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
         });
         draw(&just_running, 100, 30);
+    }
+
+    #[test]
+    fn queue_strip_shows_on_every_tab_not_just_updates() {
+        let mut app = populated();
+        app.busy = true;
+        app.running_job = Some(RunningJob {
+            pid: Arc::new(Mutex::new(None)),
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        app.queue
+            .push_back(QueuedAction::InstallMulti(vec!["a.a".into()]));
+
+        for tab in Tab::ALL {
+            app.tab = tab;
+            let text = draw_text(&app, 110, 32);
+            assert!(
+                text.contains("queue"),
+                "queue strip missing on {tab:?}:\n{text}"
+            );
+            assert!(
+                text.contains("install a.a"),
+                "pending item missing on {tab:?}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_enqueues_from_every_tab_when_busy() {
+        // Regresses the report that the queue only ever filled up from the
+        // Updates tab: each tab's own action key, pressed while something
+        // else is running, must land in app.queue — not run immediately,
+        // not get silently dropped because the selection was empty.
+        let mut app = App::new();
+        app.installed = vec![wpkg("a")];
+        app.search_results = vec![wpkg("b")];
+        app.packages = vec![jpkg("c")];
+        app.busy = true;
+
+        app.tab = Tab::Search;
+        app.handle_key(ke(KeyCode::Char('i')));
+        assert_eq!(app.queue.len(), 1, "Search's `i` must enqueue");
+
+        app.tab = Tab::Installed;
+        app.handle_key(ke(KeyCode::Char('r')));
+        assert_eq!(app.queue.len(), 2, "Installed's `r` must enqueue");
+
+        app.tab = Tab::Packages;
+        app.handle_key(ke(KeyCode::Char('i')));
+        assert_eq!(app.queue.len(), 3, "Packages' `i` must enqueue");
+
+        app.tab = Tab::Updates;
+        app.updates = vec![upkg("d")];
+        app.handle_key(ke(KeyCode::Char('u')));
+        assert_eq!(app.queue.len(), 4, "Updates' `u` must enqueue");
     }
 
     // ----- command queue -----
