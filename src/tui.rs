@@ -991,14 +991,14 @@ impl App {
                     self.remove_json_multi(all_ids);
                 }
             }
-            KeyCode::Char('f') | KeyCode::Char('F') => {
-                if !self.packages_file_picker && self.package_files.len() > 1 {
-                    self.packages_file_picker = true;
-                    self.packages.clear();
-                    self.packages_sel.reset();
-                    self.filter_focused = false;
-                    self.filter_query.clear();
-                }
+            KeyCode::Char('f') | KeyCode::Char('F')
+                if !self.packages_file_picker && self.package_files.len() > 1 =>
+            {
+                self.packages_file_picker = true;
+                self.packages.clear();
+                self.packages_sel.reset();
+                self.filter_focused = false;
+                self.filter_query.clear();
             }
             _ => {}
         }
@@ -1073,7 +1073,7 @@ impl App {
                     "--scope",
                     "machine",
                 ];
-                let _ = run_winget_stdout(&args, string_tx);
+                let _ = run_winget_stdout(&args, string_tx, None);
                 let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
             let _ = tx.send(ActionResult::RefreshInstalled(list_installed()));
@@ -1100,7 +1100,7 @@ impl App {
                     }
                 });
                 let args = ["show", id, "--accept-source-agreements"];
-                let _ = run_winget_stdout(&args, string_tx);
+                let _ = run_winget_stdout(&args, string_tx, None);
                 let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
             let _ = tx.send(ActionResult::CommandDone);
@@ -1142,7 +1142,7 @@ impl App {
                     "--accept-package-agreements",
                     "--accept-source-agreements",
                 ];
-                let _ = run_winget_stdout(&args, string_tx);
+                let _ = run_winget_stdout(&args, string_tx, None);
                 let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
             let updates = list_upgradable();
@@ -1188,7 +1188,7 @@ impl App {
                     "--silent",
                     "--accept-source-agreements",
                 ];
-                let _ = run_winget_stdout(&args, string_tx);
+                let _ = run_winget_stdout(&args, string_tx, None);
                 let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
             let list = list_installed();
@@ -1208,7 +1208,7 @@ impl App {
         self.busy = true;
         thread::spawn(move || {
             let cmd = "winget upgrade --all --include-unknown".to_string();
-            match upgrade_all_packages() {
+            match upgrade_all_packages(None) {
                 Ok(msg) => {
                     let _ = tx.send(ActionResult::SetCommand {
                         command: cmd,
@@ -1271,7 +1271,7 @@ impl App {
                                     let _ = tx2.send(ActionResult::OutputLine(line));
                                 }
                             });
-                            let _ = wgtui::run_command_stdout(cmd, &args, string_tx);
+                            let _ = wgtui::run_command_stdout(cmd, &args, string_tx, None);
                         }
                     } else {
                         let args = pkg.install_args();
@@ -1287,7 +1287,7 @@ impl App {
                             }
                         });
                         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                        let _ = run_winget_stdout(&arg_refs, string_tx);
+                        let _ = run_winget_stdout(&arg_refs, string_tx, None);
                     }
                     let _ = tx.send(ActionResult::OutputLine(String::new()));
                 }
@@ -1334,7 +1334,7 @@ impl App {
                             "--silent",
                             "--accept-source-agreements",
                         ];
-                        let _ = run_winget_stdout(&args, string_tx);
+                        let _ = run_winget_stdout(&args, string_tx, None);
                     }
                     let _ = tx.send(ActionResult::OutputLine(String::new()));
                 }
@@ -1377,7 +1377,7 @@ impl App {
                             }
                         });
                         let args = ["show", id, "--accept-source-agreements"];
-                        let _ = run_winget_stdout(&args, string_tx);
+                        let _ = run_winget_stdout(&args, string_tx, None);
                     }
                     let _ = tx.send(ActionResult::OutputLine(String::new()));
                 }
@@ -1434,7 +1434,7 @@ impl App {
                 }
             });
             let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
-            let _ = wgtui::run_command_stdout(&argv[0], &args, string_tx);
+            let _ = wgtui::run_command_stdout(&argv[0], &args, string_tx, None);
             let _ = tx.send(ActionResult::RefreshInstalled(list_installed()));
             let _ = tx.send(ActionResult::UpgradeList(list_upgradable()));
             let _ = tx.send(ActionResult::CommandDone);

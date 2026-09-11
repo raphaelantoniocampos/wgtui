@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use regex::Regex;
 use serde::Deserialize;
@@ -94,9 +95,10 @@ pub fn list_upgradable() -> Vec<UpgradablePackage> {
     }
 }
 
-/// Runs `winget upgrade --all --include-unknown` to upgrade every package including unknown.
-pub fn upgrade_all_packages() -> Result<String, String> {
-    let output = Command::new("winget")
+/// Runs `winget upgrade --all --include-unknown` to upgrade every package
+/// including unknown. See [`run_command_stdout`] for `pid_slot`.
+pub fn upgrade_all_packages(pid_slot: Option<&PidSlot>) -> Result<String, String> {
+    let child = Command::new("winget")
         .args([
             "upgrade",
             "--all",
@@ -105,8 +107,22 @@ pub fn upgrade_all_packages() -> Result<String, String> {
             "--accept-package-agreements",
             "--accept-source-agreements",
         ])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("Failed to run winget upgrade --all --include-unknown: {e}"))?;
+
+    if let Some(slot) = pid_slot {
+        *slot.lock().unwrap() = Some(child.id());
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to wait on winget upgrade --all --include-unknown: {e}"))?;
+
+    if let Some(slot) = pid_slot {
+        *slot.lock().unwrap() = None;
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -217,15 +233,23 @@ fn parse_winget_table(output: &str) -> Vec<WingetPackage> {
     packages
 }
 
+/// Shared slot the PID of a currently-running child process is published
+/// into, so another thread can look it up and kill it (see
+/// [`kill_process_tree`]). `None` when nothing is running.
+pub type PidSlot = Arc<Mutex<Option<u32>>>;
+
 /// Runs a command and sends its output lines live through the sender.
 ///
 /// Both stdout and stderr are forwarded (stderr is read on its own thread so a
 /// full stderr pipe can't deadlock stdout). The sender is dropped when the
-/// command finishes, signaling completion.
+/// command finishes, signaling completion. If `pid_slot` is given, the
+/// child's PID is published into it right after spawning and cleared again
+/// once the command finishes, so a caller elsewhere can cancel it.
 pub fn run_command_stdout(
     cmd: &str,
     args: &[&str],
     tx: mpsc::Sender<String>,
+    pid_slot: Option<&PidSlot>,
 ) -> Result<(), String> {
     let mut child = Command::new(cmd)
         .args(args)
@@ -233,6 +257,10 @@ pub fn run_command_stdout(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn {cmd}: {e}"))?;
+
+    if let Some(slot) = pid_slot {
+        *slot.lock().unwrap() = Some(child.id());
+    }
 
     let stdout = child.stdout.take().ok_or("No stdout")?;
     let stderr = child.stderr.take().ok_or("No stderr")?;
@@ -265,12 +293,35 @@ pub fn run_command_stdout(
     }
     let _ = stderr_handle.join();
     let _ = child.wait();
+    if let Some(slot) = pid_slot {
+        *slot.lock().unwrap() = None;
+    }
     Ok(())
 }
 
 /// Runs a winget command and sends its stdout lines live through the sender.
-pub fn run_winget_stdout(args: &[&str], tx: mpsc::Sender<String>) -> Result<(), String> {
-    run_command_stdout("winget", args, tx)
+/// See [`run_command_stdout`] for `pid_slot`.
+pub fn run_winget_stdout(
+    args: &[&str],
+    tx: mpsc::Sender<String>,
+    pid_slot: Option<&PidSlot>,
+) -> Result<(), String> {
+    run_command_stdout("winget", args, tx, pid_slot)
+}
+
+/// Kills the process tree rooted at `pid`.
+///
+/// Best-effort: the target may already have exited by the time this runs, in
+/// which case `taskkill` fails and this returns `false` — harmless, not an
+/// error condition worth surfacing. Windows-only, like the rest of this crate.
+pub fn kill_process_tree(pid: u32) -> bool {
+    Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Whether the manifest entry `id` / `name` matches something in `installed`.
@@ -536,7 +587,7 @@ mod tests {
     #[test]
     fn test_run_command_stdout_captures_stdout() {
         let (tx, rx) = mpsc::channel();
-        run_command_stdout("cmd", &["/C", "echo", "hello_out"], tx).unwrap();
+        run_command_stdout("cmd", &["/C", "echo", "hello_out"], tx, None).unwrap();
         let lines: Vec<String> = rx.iter().collect();
         assert!(
             lines.iter().any(|l| l.contains("hello_out")),
@@ -549,12 +600,62 @@ mod tests {
     fn test_run_command_stdout_captures_stderr() {
         let (tx, rx) = mpsc::channel();
         // `echo` piped to stderr via cmd redirection.
-        run_command_stdout("cmd", &["/C", "echo hello_err 1>&2"], tx).unwrap();
+        run_command_stdout("cmd", &["/C", "echo hello_err 1>&2"], tx, None).unwrap();
         let lines: Vec<String> = rx.iter().collect();
         assert!(
             lines.iter().any(|l| l.contains("hello_err")),
             "stderr line missing, got: {lines:?}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_run_command_stdout_publishes_and_clears_pid() {
+        let (tx, rx) = mpsc::channel();
+        let slot: PidSlot = Arc::new(Mutex::new(None));
+        let slot2 = slot.clone();
+        run_command_stdout("cmd", &["/C", "echo", "hi"], tx, Some(&slot2)).unwrap();
+        let _ = rx.iter().collect::<Vec<_>>();
+        // The command already finished, so the slot must be cleared again.
+        assert_eq!(*slot.lock().unwrap(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_kill_process_tree_stops_a_running_child() {
+        use std::time::{Duration, Instant};
+
+        let (tx, rx) = mpsc::channel();
+        let slot: PidSlot = Arc::new(Mutex::new(None));
+        let slot2 = slot.clone();
+        // `ping`, unlike `timeout`, doesn't refuse to run with redirected
+        // stdin, so it reliably blocks for the full duration under `cargo test`.
+        let handle = std::thread::spawn(move || {
+            run_command_stdout("ping", &["-n", "11", "127.0.0.1"], tx, Some(&slot2))
+        });
+
+        let pid = loop {
+            if let Some(p) = *slot.lock().unwrap() {
+                break p;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        let start = Instant::now();
+        assert!(kill_process_tree(pid));
+        let _ = rx.iter().collect::<Vec<_>>();
+        handle.join().unwrap().unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "child should die well before its 10s timeout"
+        );
+    }
+
+    #[test]
+    fn test_kill_process_tree_on_a_dead_pid_is_a_harmless_no_op() {
+        // A PID that (almost certainly) doesn't exist; taskkill should fail
+        // gracefully rather than panic.
+        let _ = kill_process_tree(u32::MAX);
     }
 
     #[test]
