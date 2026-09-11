@@ -42,7 +42,7 @@ Cada push/PR roda `fmt` + `clippy -D warnings` + `cargo test` no CI. Um push de 
 Navegação global: `Tab`/`Shift+Tab`, `←`/`→` ou `h`/`l` trocam de aba · `1`–`4` pulam para
 a aba · `↑`/`↓` ou `j`/`k` navegam a lista · `/` foca o filtro · `Space` marca/desmarca ·
 `a` marca/desmarca todos · `Enter` mostra detalhes · `PageUp`/`PageDown` rolam o painel
-Output · `q`, `Esc` ou `Ctrl+C` saem.
+Output · `Q`, `Esc` ou `Ctrl+C` saem.
 Na coluna à esquerda: `●` = marcado · `✓` = já instalado · `▶` = script.
 
 **`c` — editar comando:** abre o painel Command com o último comando winget executado,
@@ -53,12 +53,12 @@ o winget reclama de múltiplas versões instaladas). `Enter` roda, `Esc` cancela
 comando roda — só um comando executa por vez, então uma segunda ação (instalar, atualizar,
 remover, buscar, `[c]`...) entra numa **fila** silenciosa e roda assim que a atual termina.
 
-**`Q` — gerenciar a fila:** aparece na status bar quando há algo rodando ou pendente; abre
+**`q` — gerenciar a fila:** aparece na status bar quando há algo rodando ou pendente; abre
 um painel de fila acima do Output com o item em execução e os pendentes numerados.
 Dentro do modo: `j`/`k` navegam os pendentes · `d` remove o pendente selecionado ·
 `D` limpa todos os pendentes · `J`/`K` reordenam o item selecionado (desce/sobe) ·
 `x` cancela o comando **em execução** (mata o processo winget — pode deixar uma
-instalação pela metade) · `Esc`/`Q` volta.
+instalação pela metade) · `Esc`/`q` volta.
 
 Defina `WGTUI_DEBUG=1` para ver, na aba Apps/Scripts vazia, os diretórios verificados.
 

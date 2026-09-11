@@ -931,7 +931,7 @@ impl App {
         // The queue manager ([Q]) captures all input while focused.
         if self.queue_focused {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('Q') => self.queue_focused = false,
+                KeyCode::Esc | KeyCode::Char('q') => self.queue_focused = false,
                 KeyCode::Char('j') | KeyCode::Down => {
                     let n = self.queue.len();
                     self.queue_sel.down(n);
@@ -1026,7 +1026,7 @@ impl App {
                         .unwrap_or_else(|| "winget ".to_string()),
                 );
             }
-            KeyCode::Char('Q') if !self.queue.is_empty() || self.running_job.is_some() => {
+            KeyCode::Char('q') if !self.queue.is_empty() || self.running_job.is_some() => {
                 self.queue_focused = true;
                 self.queue_sel.clamp(self.queue.len());
             }
@@ -1040,7 +1040,7 @@ impl App {
             KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => {
                 self.switch_tab(self.tab.next());
             }
-            KeyCode::Esc | KeyCode::Char('q') => {
+            KeyCode::Esc | KeyCode::Char('Q') => {
                 self.should_quit = true;
             }
             KeyCode::Up => {
@@ -2121,7 +2121,7 @@ impl App {
         let hint = if focused {
             " j/k move · d remove · D clear · J/K reorder · x cancel · esc back "
         } else {
-            " Q to manage "
+            " q to manage "
         };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -2306,14 +2306,14 @@ impl App {
             }
             push_hint(&mut left, "c", "cmd");
             if self.queue.is_empty() && self.running_job.is_none() {
-                push_hint(&mut left, "Q", "queue");
+                push_hint(&mut left, "q", "queue");
             } else {
                 let label = if self.queue.is_empty() {
                     " queue·running".to_string()
                 } else {
                     format!(" queue·{}", self.queue.len())
                 };
-                left.push(Span::styled("  Q", key));
+                left.push(Span::styled("  q", key));
                 left.push(Span::styled(
                     label,
                     Style::default()
@@ -2333,7 +2333,7 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        right.push(Span::styled("  q", key));
+        right.push(Span::styled("  Q", key));
         right.push(Span::styled(" quit  ", theme::dim()));
 
         let rw: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
@@ -2552,7 +2552,7 @@ mod tests {
         assert!(!app.should_quit);
 
         app.filter_focused = false;
-        app.handle_key(ke(KeyCode::Char('q')));
+        app.handle_key(ke(KeyCode::Char('Q')));
         assert!(app.should_quit);
     }
 
@@ -2893,15 +2893,15 @@ mod tests {
     #[test]
     fn q_toggles_queue_focus_only_when_there_is_something_to_show() {
         let mut app = App::new();
-        app.handle_key(ke(KeyCode::Char('Q')));
+        app.handle_key(ke(KeyCode::Char('q')));
         assert!(!app.queue_focused, "nothing queued or running: no-op");
 
         app.queue.push_back(QueuedAction::RefreshInstalled);
-        app.handle_key(ke(KeyCode::Char('Q')));
+        app.handle_key(ke(KeyCode::Char('q')));
         assert!(app.queue_focused);
-        app.handle_key(ke(KeyCode::Char('Q')));
+        app.handle_key(ke(KeyCode::Char('q')));
         assert!(!app.queue_focused);
-        app.handle_key(ke(KeyCode::Char('Q')));
+        app.handle_key(ke(KeyCode::Char('q')));
 
         // Non-queue keys are swallowed while focused.
         app.handle_key(ke(KeyCode::Char('i')));
