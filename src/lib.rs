@@ -134,24 +134,36 @@ pub fn upgrade_all_packages(pid_slot: Option<&PidSlot>) -> Result<String, String
     }
 }
 
-/// Finds the byte offset of `needle` in `haystack`, ASCII-case-insensitively
-/// (winget's table headers are ASCII apart from a handful of accented
-/// Portuguese letters — e.g. "Versão", "Disponível" — which are compared
-/// literally, since winget always emits them in the same case).
+/// Finds the *character* index (not byte index) of `needle` in `haystack`,
+/// ASCII-case-insensitively (winget's table headers are ASCII apart from a
+/// handful of accented Portuguese letters — e.g. "Versão", "Disponível" —
+/// compared literally, since winget always emits them in the same case).
+///
+/// Character indices, not byte offsets, are what make column positions
+/// portable between the header and a data line: winget aligns columns by
+/// display width, and a header with e.g. "Versão" (one 2-byte "ã") has a
+/// different byte-length-to-character-count ratio than a data line of plain
+/// ASCII — or than another line whose *package name* happens to contain
+/// accented/non-ASCII characters. Byte offsets computed from one line and
+/// applied to another silently drift; character offsets don't.
 fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
-    let n = needle.len();
-    if n == 0 || n > haystack.len() {
+    let needle: Vec<char> = needle.chars().collect();
+    let hay: Vec<char> = haystack.chars().collect();
+    if needle.is_empty() || needle.len() > hay.len() {
         return None;
     }
-    haystack.char_indices().map(|(i, _)| i).find(|&i| {
-        haystack.is_char_boundary(i + n) && haystack[i..i + n].eq_ignore_ascii_case(needle)
+    (0..=hay.len() - needle.len()).find(|&start| {
+        hay[start..start + needle.len()]
+            .iter()
+            .zip(&needle)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
     })
 }
 
-/// Locates the start column (byte offset) of each header label in `header`,
-/// in order. Each entry in `labels` lists the accepted spellings for that
-/// column (e.g. English/Portuguese); the first one found is used. `None` if
-/// any column's header can't be located.
+/// Locates the start column (character index) of each header label in
+/// `header`, in order. Each entry in `labels` lists the accepted spellings
+/// for that column (e.g. English/Portuguese); the first one found is used.
+/// `None` if any column's header can't be located.
 fn locate_columns(header: &str, labels: &[&[&str]]) -> Option<Vec<usize>> {
     labels
         .iter()
@@ -159,15 +171,7 @@ fn locate_columns(header: &str, labels: &[&[&str]]) -> Option<Vec<usize>> {
         .collect()
 }
 
-/// Rounds `i` down to the nearest UTF-8 char boundary in `s`.
-fn floor_char_boundary(s: &str, mut i: usize) -> usize {
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-/// Splits `line` into columns at the given fixed byte offsets (from
+/// Splits `line` into columns at the given fixed *character* offsets (from
 /// `locate_columns`), trimming each.
 ///
 /// winget's table columns are fixed-width and left-aligned under the header,
@@ -177,16 +181,21 @@ fn floor_char_boundary(s: &str, mut i: usize) -> usize {
 /// left by one. That shift is exactly what used to put a package's Version
 /// string where its Id belonged.
 fn slice_columns<'a>(line: &'a str, offsets: &[usize]) -> Vec<&'a str> {
-    let len = line.len();
+    // This line's own char-index -> byte-offset table (see `find_ci`'s doc
+    // for why offsets can't just be reused as byte indices directly).
+    let mut char_byte: Vec<usize> = line.char_indices().map(|(b, _)| b).collect();
+    char_byte.push(line.len());
+    let to_byte = |ch: usize| char_byte.get(ch).copied().unwrap_or(line.len());
+
     offsets
         .iter()
         .enumerate()
-        .map(|(i, &start)| {
-            let start = floor_char_boundary(line, start.min(len));
+        .map(|(i, &start_ch)| {
+            let start = to_byte(start_ch);
             let end = offsets
                 .get(i + 1)
-                .map(|&e| floor_char_boundary(line, e.min(len)))
-                .unwrap_or(len)
+                .map(|&e| to_byte(e))
+                .unwrap_or(line.len())
                 .max(start);
             line[start..end].trim()
         })
@@ -200,6 +209,23 @@ fn find_header(lines: &[&str]) -> Option<usize> {
         let lower = line.to_lowercase();
         (lower.contains("name") || lower.contains("nome")) && lower.contains("id")
     })
+}
+
+/// Best-effort check that `line` has real column structure — i.e. it's a
+/// genuine data row, not a stray summary/warning line winget sometimes
+/// prints right after the table with no blank-line separator (e.g. "4
+/// atualizações disponíveis.", a pinned-package notice), which this table's
+/// row loop would otherwise slice into a bogus package.
+///
+/// Real rows are fixed-width columns, so there's essentially always at least
+/// one run of 2+ consecutive spaces somewhere on the line — even a row whose
+/// own content happens to fill some column tightly (a single space before
+/// the next column) still has slack in at least one other, typically before
+/// the short, consistent Source column. Ordinary prose never double-spaces
+/// between words, so this holds even when a summary sentence coincidentally
+/// has a single space lined up with a column boundary.
+fn looks_like_row(line: &str) -> bool {
+    line.as_bytes().windows(2).any(|w| w == b"  ")
 }
 
 /// Parses the tabular output of `winget upgrade` (list mode).
@@ -227,7 +253,7 @@ fn parse_upgrade_table(output: &str) -> Vec<UpgradablePackage> {
     let mut packages = Vec::new();
     for line in &lines[header_idx + 1..] {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("---") {
+        if trimmed.is_empty() || trimmed.starts_with("---") || !looks_like_row(line) {
             continue;
         }
         let cols = slice_columns(line, &offsets);
@@ -256,28 +282,39 @@ fn parse_upgrade_table(output: &str) -> Vec<UpgradablePackage> {
 /// Columns are located by the header labels' positions (not by runs of
 /// whitespace), so a row with a blank Id (or Version, or Source) keeps every
 /// other column in its correct place instead of shifting left.
+///
+/// Depending on the winget version and subcommand, an extra column can
+/// appear between Version and Source that this table has no field for — an
+/// available update's version (`list`) or why a search result matched
+/// (`search`, "Moniker: ..."/"Tag: ..."). If present, it's located too,
+/// purely to correctly bound the Version column, and its own text discarded
+/// — otherwise it would run on into `version` (e.g. `"4.90.0  4.91.0"`).
 fn parse_winget_table(output: &str) -> Vec<WingetPackage> {
     let lines: Vec<&str> = output.lines().collect();
     let Some(header_idx) = find_header(&lines) else {
         return vec![];
     };
     let header = lines[header_idx];
-    let Some(offsets) = locate_columns(
-        header,
-        &[
-            &["Name", "Nome"],
-            &["ID", "Id"],
-            &["Version", "Versão"],
-            &["Source", "Origem"],
-        ],
-    ) else {
+    let name_off = find_ci(header, "Name").or_else(|| find_ci(header, "Nome"));
+    let id_off = find_ci(header, "ID").or_else(|| find_ci(header, "Id"));
+    let version_off = find_ci(header, "Version").or_else(|| find_ci(header, "Versão"));
+    let source_off = find_ci(header, "Source").or_else(|| find_ci(header, "Origem"));
+    let (Some(name_off), Some(id_off), Some(version_off), Some(source_off)) =
+        (name_off, id_off, version_off, source_off)
+    else {
         return vec![];
     };
+    let version_end = ["Available", "Disponível", "Match", "Correspondência"]
+        .iter()
+        .find_map(|l| find_ci(header, l))
+        .filter(|&o| o > version_off && o < source_off)
+        .unwrap_or(source_off);
+    let offsets = [name_off, id_off, version_off, version_end, source_off];
 
     let mut packages = Vec::new();
     for line in &lines[header_idx + 1..] {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("---") {
+        if trimmed.is_empty() || trimmed.starts_with("---") || !looks_like_row(line) {
             continue;
         }
         let cols = slice_columns(line, &offsets);
@@ -288,7 +325,7 @@ fn parse_winget_table(output: &str) -> Vec<WingetPackage> {
             name: cols[0].to_string(),
             id: cols[1].to_string(),
             version: Some(cols[2].to_string()).filter(|s| !s.is_empty()),
-            source: Some(cols[3].to_string()).filter(|s| !s.is_empty()),
+            source: Some(cols[4].to_string()).filter(|s| !s.is_empty()),
         });
     }
     packages
@@ -762,18 +799,98 @@ Some Weird App                              9.9.9
     }
 
     #[test]
+    fn test_parse_winget_table_real_list_output_with_available_column() {
+        // Captured live from `winget list --accept-source-agreements`
+        // (v1.29.290, pt-BR): `list` adds a 5th "Disponível" (Available)
+        // column whenever *any* row has a pending update — WingetPackage has
+        // no field for it, but it must not run on into `version` for rows
+        // that populate it.
+        let sample = "Nome                                                                                                  ID                                                                                              Versão                        Disponível Origem\n\
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n\
+Docker Desktop                                                                                        Docker.DockerDesktop                                                                            4.90.0                        4.91.0     winget\n\
+bat                                                                                                   sharkdp.bat                                                                                     0.26.1                                   winget\n";
+
+        let packages = parse_winget_table(sample);
+        assert_eq!(packages.len(), 2);
+        assert_eq!(packages[0].name, "Docker Desktop");
+        assert_eq!(packages[0].id, "Docker.DockerDesktop");
+        assert_eq!(
+            packages[0].version.as_deref(),
+            Some("4.90.0"),
+            "the 4.91.0 available-version text must not leak in"
+        );
+        assert_eq!(packages[1].name, "bat");
+        assert_eq!(packages[1].id, "sharkdp.bat");
+        assert_eq!(packages[1].version.as_deref(), Some("0.26.1"));
+        assert_eq!(packages[1].source.as_deref(), Some("winget"));
+    }
+
+    #[test]
+    fn test_parse_winget_table_real_search_output_with_match_column() {
+        // Captured live from `winget search 7zip --accept-source-agreements`
+        // (pt-BR): `search` adds a "Correspondência" (Match reason) column
+        // that must likewise not leak into `version`.
+        let sample = "\
+Nome                               ID                        Versão          Correspondência Origem
+---------------------------------------------------------------------------------------------------
+7-Zip                              7zip.7zip                 26.03           Moniker: 7zip   winget
+7zr                                7zip.7zr                  26.03                           winget
+";
+        let packages = parse_winget_table(sample);
+        assert_eq!(packages.len(), 2);
+        assert_eq!(packages[0].name, "7-Zip");
+        assert_eq!(packages[0].id, "7zip.7zip");
+        assert_eq!(packages[0].version.as_deref(), Some("26.03"));
+        assert_eq!(packages[0].source.as_deref(), Some("winget"));
+        assert_eq!(packages[1].id, "7zip.7zr");
+        assert_eq!(packages[1].version.as_deref(), Some("26.03"));
+    }
+
+    #[test]
+    fn test_parse_upgrade_table_real_output_skips_summary_footer_lines() {
+        // Captured live from `winget upgrade --accept-source-agreements`:
+        // trailing prose after the table (update count, pinned-package
+        // notice) must not become a bogus "package".
+        let sample = "\
+Nome           ID                   Versão  Disponível Origem
+-------------------------------------------------------------
+Docker Desktop Docker.DockerDesktop 4.90.0  4.91.0     winget
+flyctl         Fly-io.flyctl        0.4.102 0.4.103    winget
+4 atualizações disponíveis.
+1 pacote(s) têm pinos que impedem a atualização. Use o comando 'winget pin' para exibir e editar marcações. Usar o argumento '--include-pinned' pode mostrar mais resultados.
+";
+        let packages = parse_upgrade_table(sample);
+        assert_eq!(
+            packages.len(),
+            2,
+            "footer lines must not appear as packages"
+        );
+        assert_eq!(packages[0].name, "Docker Desktop");
+        assert_eq!(packages[0].installed_version, "4.90.0");
+        assert_eq!(packages[0].available_version, "4.91.0");
+        assert_eq!(packages[1].name, "flyctl");
+    }
+
+    #[test]
     fn test_parse_winget_table_row_shorter_than_header_does_not_panic() {
         // Trailing columns are routinely stripped of trailing whitespace by
         // the terminal/pipe, so a data line can be physically shorter than
-        // the header it's aligned under.
-        let sample = "\
-Name                  ID                    Version           Source
--------------------------------------------------------------------
-Short
-";
-        let packages = parse_winget_table(sample);
-        assert_eq!(packages.len(), 1);
-        assert_eq!(packages[0].name, "Short");
+        // the header it's aligned under — but real winget output still pads
+        // up to wherever the next column would start (see the real captured
+        // fixtures above), so there's a genuine multi-space run. (Built with
+        // `format!`, not a literal with trailing spaces on a line, since
+        // those tend to get silently stripped by editors/tools.)
+        let header = "Name                  ID                    Version           Source";
+        let sep = "-".repeat(header.len());
+        let sample = format!("{header}\n{sep}\nShort\nPadded{}\n", " ".repeat(16));
+
+        let packages = parse_winget_table(&sample);
+        assert_eq!(
+            packages.len(),
+            1,
+            "'Short' has no column padding at all — not a row"
+        );
+        assert_eq!(packages[0].name, "Padded");
         assert_eq!(packages[0].id, "");
         assert_eq!(packages[0].version, None);
     }
