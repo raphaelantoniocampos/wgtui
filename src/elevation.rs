@@ -1,7 +1,9 @@
 //! Best-effort detection of whether wgtui runs elevated (as Administrator).
 //!
-//! `winget install --scope machine` (wgtui's default) needs admin rights, so a
-//! non-elevated session gets a status-bar warning.
+//! `winget install --scope machine` needs admin rights (opt in per package via
+//! the manifest's `"scope": "machine"`), and winget itself sometimes prompts
+//! for elevation depending on the installer, so a non-elevated session gets a
+//! status-bar warning.
 
 use std::process::{Command, Stdio};
 
@@ -24,7 +26,7 @@ pub fn is_elevated() -> bool {
 /// The short status-bar marker to show, or `None` when elevated.
 ///
 /// (Kept short so it fits next to `q quit`; the README explains the impact —
-/// `--scope machine` installs need admin, use `"scope": "user"` otherwise.)
+/// a manifest package with `"scope": "machine"` needs admin.)
 #[must_use]
 pub fn elevation_warning(elevated: bool) -> Option<&'static str> {
     if elevated { None } else { Some(" not admin ") }

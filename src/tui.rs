@@ -1252,8 +1252,6 @@ impl App {
                 "--silent",
                 "--accept-package-agreements",
                 "--accept-source-agreements",
-                "--scope",
-                "machine",
             ]);
         }
         let (pid_slot, cancel) = self.begin_job();
@@ -1271,6 +1269,9 @@ impl App {
                         let _ = tx2.send(ActionResult::OutputLine(line));
                     }
                 });
+                // No --scope: let winget pick whatever's applicable. Forcing
+                // `machine` here used to make installs fail outright for
+                // packages with no machine-scope installer.
                 let args = [
                     "install",
                     "--exact",
@@ -1278,8 +1279,6 @@ impl App {
                     "--silent",
                     "--accept-package-agreements",
                     "--accept-source-agreements",
-                    "--scope",
-                    "machine",
                 ];
                 let _ = run_winget_stdout(&args, string_tx, Some(&pid_slot));
                 let _ = tx.send(ActionResult::OutputLine(String::new()));

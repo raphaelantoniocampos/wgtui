@@ -16,9 +16,10 @@ agora exclusivamente winget (Chocolatey/Scoop foram descartados) e em Rust.
   instalar via PowerShell (`Install-Module Microsoft.WinGet.Client` +
   `Repair-WinGetPackageManager`) no primeiro uso.
 - Rust (edition 2024) para compilar da fonte.
-- Execute como **Administrador** para instalar em `--scope machine` (o padrão). Sem
-  elevação a status bar mostra `not admin` e você deve usar `"scope": "user"` nos
-  pacotes do manifesto.
+- Por padrão o wgtui **não força `--scope`** — deixa o winget escolher o instalador
+  aplicável (forçar `machine` fazia instalações falharem de cara em pacotes sem
+  instalador de máquina). Se você quiser `--scope machine` explicitamente num pacote,
+  isso pede Administrador; sem elevação a status bar mostra `not admin`.
 
 ## Compilar e rodar
 
@@ -94,12 +95,12 @@ seletor (`F` reabre).
 |---|---|---|
 | `id` | sim | `PackageIdentifier` do winget (usado em `winget install --exact`) |
 | `name` | não | Nome exibido na lista; se ausente, usa o `id` |
-| `args` | não | Argumentos extras acrescentados ao `winget install` (ex.: `["-a", "x86"]`) |
-| `scope` | não | Vira `--scope <valor>` (`machine` \| `user`); padrão `machine` |
-| `locale` | não | Vira `--locale <valor>` (ex.: `pt-BR`) |
+| `args` | não | Argumentos extras acrescentados ao `winget install` (ex.: `["-a", "x86"]`, ou `["--force"]` quando o winget recusa por hash divergente) |
+| `scope` | não | Vira `--scope <valor>` (`machine` \| `user`); **omitido se ausente** (deixa o winget escolher) |
+| `locale` | não | Vira `--locale <valor>` (ex.: `pt-BR`); só use se o pacote realmente tiver instalador nesse idioma — senão o winget falha com "no applicable installer found" |
 
 Comando montado: `winget install --exact <id> --silent --accept-package-agreements
---accept-source-agreements --scope <scope> [--locale <locale>] [args...]`
+--accept-source-agreements [--scope <scope>] [--locale <locale>] [args...]`
 
 **`scripts[]`**
 

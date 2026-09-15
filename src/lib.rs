@@ -357,7 +357,9 @@ pub struct JsonPackage {
     pub is_script: bool,
     /// Extra args appended to `winget install` (e.g. `["-a", "x86"]`).
     pub args: Vec<String>,
-    /// `--scope` value; defaults to `machine` when `None`.
+    /// `--scope` value; omitted (let winget pick) when `None`. Many packages
+    /// only ship a user-scope installer, so forcing `machine` by default made
+    /// otherwise-fine installs fail outright.
     pub scope: Option<String>,
     /// `--locale` value; omitted when `None`.
     pub locale: Option<String>,
@@ -381,8 +383,10 @@ impl JsonPackage {
         .map(|s| (*s).to_string())
         .collect();
 
-        a.push("--scope".to_string());
-        a.push(self.scope.clone().unwrap_or_else(|| "machine".to_string()));
+        if let Some(scope) = &self.scope {
+            a.push("--scope".to_string());
+            a.push(scope.clone());
+        }
 
         if let Some(locale) = &self.locale {
             a.push("--locale".to_string());
@@ -778,7 +782,12 @@ Google Chrome         Google.Chrome         134.0.6998.165    winget
     }
 
     #[test]
-    fn test_install_args_default_scope_is_machine() {
+    fn test_install_args_omit_scope_and_locale_by_default() {
+        // No `scope`/`locale` in the manifest -> let winget pick whatever
+        // installer is actually applicable, instead of forcing --scope
+        // machine (which fails outright for packages with no machine-scope
+        // installer — reported as "winget install --exact ... --scope
+        // machine ... not working, plain `winget install id --force` does").
         let pkg = JsonPackage {
             id: "Google.Chrome".to_string(),
             name: "Google Chrome".to_string(),
@@ -789,11 +798,26 @@ Google Chrome         Google.Chrome         134.0.6998.165    winget
             locale: None,
         };
         let args = pkg.install_args();
+        assert!(!args.iter().any(|a| a == "--scope"));
+        assert!(!args.iter().any(|a| a == "--locale"));
+    }
+
+    #[test]
+    fn test_install_args_uses_explicit_scope_when_given() {
+        let pkg = JsonPackage {
+            id: "Google.Chrome".to_string(),
+            name: "Google Chrome".to_string(),
+            command: None,
+            is_script: false,
+            args: Vec::new(),
+            scope: Some("machine".to_string()),
+            locale: None,
+        };
+        let args = pkg.install_args();
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "--scope" && w[1] == "machine")
         );
-        assert!(!args.iter().any(|a| a == "--locale"));
     }
 
     #[test]
