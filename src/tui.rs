@@ -711,8 +711,14 @@ impl App {
 
     fn selected_ids(&self) -> Vec<String> {
         let idx = self.sel().active();
+        // winget sometimes reports no Id at all for a package (e.g. a
+        // manually-installed app it can't match to a source) — skip those
+        // rather than act on an empty `--exact ""`.
         let pick = |ids: Vec<String>| -> Vec<String> {
-            idx.iter().filter_map(|&i| ids.get(i).cloned()).collect()
+            idx.iter()
+                .filter_map(|&i| ids.get(i).cloned())
+                .filter(|id| !id.is_empty())
+                .collect()
         };
         match self.tab {
             Tab::Search => pick(
@@ -2837,6 +2843,25 @@ mod tests {
         app.updates = vec![upkg("d")];
         app.handle_key(ke(KeyCode::Char('u')));
         assert_eq!(app.queue.len(), 4, "Updates' `u` must enqueue");
+    }
+
+    #[test]
+    fn selected_ids_skips_rows_with_no_winget_id() {
+        // winget sometimes has no Id for a row (manually-installed app it
+        // can't match to a source) — acting on it would send `--exact ""`.
+        let mut app = App::new();
+        app.tab = Tab::Installed;
+        app.installed = vec![WingetPackage {
+            name: "Weird Local App".into(),
+            id: String::new(),
+            version: None,
+            source: None,
+        }];
+        app.installed_sel.cursor = 0;
+        assert!(app.selected_ids().is_empty());
+
+        app.handle_key(ke(KeyCode::Char('r')));
+        assert!(app.queue.is_empty(), "no id -> nothing to remove, no-op");
     }
 
     // ----- command queue -----

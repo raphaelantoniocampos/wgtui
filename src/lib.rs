@@ -7,7 +7,6 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use regex::Regex;
 use serde::Deserialize;
 
 /// A package returned by `winget search` or `winget list`.
@@ -135,101 +134,163 @@ pub fn upgrade_all_packages(pid_slot: Option<&PidSlot>) -> Result<String, String
     }
 }
 
+/// Finds the byte offset of `needle` in `haystack`, ASCII-case-insensitively
+/// (winget's table headers are ASCII apart from a handful of accented
+/// Portuguese letters — e.g. "Versão", "Disponível" — which are compared
+/// literally, since winget always emits them in the same case).
+fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let n = needle.len();
+    if n == 0 || n > haystack.len() {
+        return None;
+    }
+    haystack.char_indices().map(|(i, _)| i).find(|&i| {
+        haystack.is_char_boundary(i + n) && haystack[i..i + n].eq_ignore_ascii_case(needle)
+    })
+}
+
+/// Locates the start column (byte offset) of each header label in `header`,
+/// in order. Each entry in `labels` lists the accepted spellings for that
+/// column (e.g. English/Portuguese); the first one found is used. `None` if
+/// any column's header can't be located.
+fn locate_columns(header: &str, labels: &[&[&str]]) -> Option<Vec<usize>> {
+    labels
+        .iter()
+        .map(|candidates| candidates.iter().find_map(|c| find_ci(header, c)))
+        .collect()
+}
+
+/// Rounds `i` down to the nearest UTF-8 char boundary in `s`.
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Splits `line` into columns at the given fixed byte offsets (from
+/// `locate_columns`), trimming each.
+///
+/// winget's table columns are fixed-width and left-aligned under the header,
+/// so slicing by position — not by runs of whitespace — is required: a
+/// genuinely empty cell (common in the Id column for manually-installed
+/// apps winget can't match to a source) must not shift every later column
+/// left by one. That shift is exactly what used to put a package's Version
+/// string where its Id belonged.
+fn slice_columns<'a>(line: &'a str, offsets: &[usize]) -> Vec<&'a str> {
+    let len = line.len();
+    offsets
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| {
+            let start = floor_char_boundary(line, start.min(len));
+            let end = offsets
+                .get(i + 1)
+                .map(|&e| floor_char_boundary(line, e.min(len)))
+                .unwrap_or(len)
+                .max(start);
+            line[start..end].trim()
+        })
+        .collect()
+}
+
+/// Finds the header row: the first line containing both a name-ish and an
+/// id-ish column label.
+fn find_header(lines: &[&str]) -> Option<usize> {
+    lines.iter().position(|line| {
+        let lower = line.to_lowercase();
+        (lower.contains("name") || lower.contains("nome")) && lower.contains("id")
+    })
+}
+
 /// Parses the tabular output of `winget upgrade` (list mode).
 ///
 /// Table format: Name, Id, Version, Available, Source
 fn parse_upgrade_table(output: &str) -> Vec<UpgradablePackage> {
-    let re_spaces = Regex::new(r"\s{2,}").expect("regex: two or more whitespace");
     let lines: Vec<&str> = output.lines().collect();
-
-    let header_idx = lines.iter().position(|line| {
-        let lower = line.to_lowercase();
-        (lower.contains("name") || lower.contains("nome")) && lower.contains("id")
-    });
-
-    let Some(header_idx) = header_idx else {
+    let Some(header_idx) = find_header(&lines) else {
+        return vec![];
+    };
+    let header = lines[header_idx];
+    let Some(offsets) = locate_columns(
+        header,
+        &[
+            &["Name", "Nome"],
+            &["Id"],
+            &["Version", "Versão"],
+            &["Available", "Disponível"],
+            &["Source", "Origem"],
+        ],
+    ) else {
         return vec![];
     };
 
-    let data_lines = &lines[header_idx + 1..];
     let mut packages = Vec::new();
-
-    for line in data_lines {
+    for line in &lines[header_idx + 1..] {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.contains("---") {
+        if trimmed.is_empty() || trimmed.starts_with("---") {
             continue;
         }
-
-        let parts: Vec<&str> = re_spaces.splitn(trimmed, 5).collect();
-        if parts.len() >= 4 {
-            packages.push(UpgradablePackage {
-                name: parts[0].trim().to_string(),
-                id: parts[1].trim().to_string(),
-                installed_version: parts[2].trim().to_string(),
-                available_version: parts[3].trim().to_string(),
-                source: parts
-                    .get(4)
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty()),
-            });
+        let cols = slice_columns(line, &offsets);
+        if cols[0].is_empty() {
+            continue; // no name at all — not a usable row
         }
+        packages.push(UpgradablePackage {
+            name: cols[0].to_string(),
+            id: cols[1].to_string(),
+            installed_version: cols[2].to_string(),
+            available_version: cols[3].to_string(),
+            source: Some(cols[4].to_string()).filter(|s| !s.is_empty()),
+        });
     }
-
     packages
 }
 
 /// Parses the tabular output of `winget search` / `winget list` into structured records.
 ///
-/// The table format is:
+/// The table format is fixed-width columns under a header, e.g.:
 /// ```text
 /// Name                  ID                    Version           Source
 /// ---------------------------------------------------------------
 /// Google Chrome         Google.Chrome         134.0.6998.165    winget
 /// ```
-///
-/// Columns are separated by 2+ spaces. The header row is detected by containing "Name" and "Id".
+/// Columns are located by the header labels' positions (not by runs of
+/// whitespace), so a row with a blank Id (or Version, or Source) keeps every
+/// other column in its correct place instead of shifting left.
 fn parse_winget_table(output: &str) -> Vec<WingetPackage> {
-    let re_spaces = Regex::new(r"\s{2,}").expect("regex: two or more whitespace");
     let lines: Vec<&str> = output.lines().collect();
-
-    // Find the header row (contains "Name" or "Nome" and "ID" or "Id")
-    let header_idx = lines.iter().position(|line| {
-        let lower = line.to_lowercase();
-        (lower.contains("name") || lower.contains("nome")) && lower.contains("id")
-    });
-
-    let Some(header_idx) = header_idx else {
+    let Some(header_idx) = find_header(&lines) else {
+        return vec![];
+    };
+    let header = lines[header_idx];
+    let Some(offsets) = locate_columns(
+        header,
+        &[
+            &["Name", "Nome"],
+            &["ID", "Id"],
+            &["Version", "Versão"],
+            &["Source", "Origem"],
+        ],
+    ) else {
         return vec![];
     };
 
-    // Parse data rows after header
-    let data_lines = &lines[header_idx + 1..];
     let mut packages = Vec::new();
-
-    for line in data_lines {
+    for line in &lines[header_idx + 1..] {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.contains("---") {
+        if trimmed.is_empty() || trimmed.starts_with("---") {
             continue;
         }
-
-        // Split by 2+ spaces, max 4 parts (Name, ID, Version, Source)
-        let parts: Vec<&str> = re_spaces.splitn(trimmed, 4).collect();
-        if parts.len() >= 2 {
-            packages.push(WingetPackage {
-                name: parts[0].trim().to_string(),
-                id: parts[1].trim().to_string(),
-                version: parts
-                    .get(2)
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty()),
-                source: parts
-                    .get(3)
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty()),
-            });
+        let cols = slice_columns(line, &offsets);
+        if cols[0].is_empty() {
+            continue; // no name at all — not a usable row
         }
+        packages.push(WingetPackage {
+            name: cols[0].to_string(),
+            id: cols[1].to_string(),
+            version: Some(cols[2].to_string()).filter(|s| !s.is_empty()),
+            source: Some(cols[3].to_string()).filter(|s| !s.is_empty()),
+        });
     }
-
     packages
 }
 
@@ -682,6 +743,42 @@ Google Chrome         Google.Chrome         134.0.6998.165    winget
     }
 
     #[test]
+    fn test_parse_winget_table_blank_id_does_not_leak_into_version() {
+        // Manually-installed apps winget can't match to a source often show
+        // a blank Id column. Reported bug: the old whitespace-splitting
+        // parser then shifted the Version string into the Id field, so
+        // upgrade/remove/show sent that version string as `--exact <id>`.
+        let sample = "\
+Name                  ID                    Version           Source
+-------------------------------------------------------------------
+Google Chrome         Google.Chrome         134.0.6998.165    winget
+Some Weird App                              9.9.9
+";
+        let packages = parse_winget_table(sample);
+        assert_eq!(packages.len(), 2);
+        assert_eq!(packages[1].name, "Some Weird App");
+        assert_eq!(packages[1].id, "", "no Id column, not the version string");
+        assert_eq!(packages[1].version.as_deref(), Some("9.9.9"));
+    }
+
+    #[test]
+    fn test_parse_winget_table_row_shorter_than_header_does_not_panic() {
+        // Trailing columns are routinely stripped of trailing whitespace by
+        // the terminal/pipe, so a data line can be physically shorter than
+        // the header it's aligned under.
+        let sample = "\
+Name                  ID                    Version           Source
+-------------------------------------------------------------------
+Short
+";
+        let packages = parse_winget_table(sample);
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "Short");
+        assert_eq!(packages[0].id, "");
+        assert_eq!(packages[0].version, None);
+    }
+
+    #[test]
     fn test_parse_empty_table() {
         let packages = parse_winget_table("No installed package found");
         assert!(packages.is_empty());
@@ -691,6 +788,38 @@ Google Chrome         Google.Chrome         134.0.6998.165    winget
     fn test_parse_no_header() {
         let packages = parse_winget_table("");
         assert!(packages.is_empty());
+    }
+
+    #[test]
+    fn test_parse_upgrade_table() {
+        let sample = "\
+Name                  Id                    Version    Available  Source
+--------------------------------------------------------------------------
+Google Chrome         Google.Chrome         133.0      134.0      winget
+";
+        let packages = parse_upgrade_table(sample);
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "Google Chrome");
+        assert_eq!(packages[0].id, "Google.Chrome");
+        assert_eq!(packages[0].installed_version, "133.0");
+        assert_eq!(packages[0].available_version, "134.0");
+        assert_eq!(packages[0].source.as_deref(), Some("winget"));
+    }
+
+    #[test]
+    fn test_parse_upgrade_table_blank_id_does_not_leak_into_version() {
+        let sample = "\
+Name                  Id                    Version    Available  Source
+--------------------------------------------------------------------------
+Google Chrome         Google.Chrome         133.0      134.0      winget
+Weird Local App                             1.0        2.0
+";
+        let packages = parse_upgrade_table(sample);
+        assert_eq!(packages.len(), 2);
+        assert_eq!(packages[1].name, "Weird Local App");
+        assert_eq!(packages[1].id, "", "no Id column, not the version string");
+        assert_eq!(packages[1].installed_version, "1.0");
+        assert_eq!(packages[1].available_version, "2.0");
     }
 
     fn write_tmp(name: &str, content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
