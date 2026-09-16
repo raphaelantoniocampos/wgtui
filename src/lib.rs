@@ -426,21 +426,60 @@ pub fn kill_process_tree(pid: u32) -> bool {
 /// (PSWindowsUpdate module).
 ///
 /// Every field is optional, `title` included: confirmed live on a real
-/// machine with real pending updates, `Select-Object KB, Title, Size`
-/// against the raw update object doesn't reliably line up with the
-/// human-readable columns `Get-WindowsUpdate` displays interactively — a
-/// `Title` came back JSON `null` even though the same update showed a
-/// perfectly normal title in the console table, which broke parsing for the
-/// *entire* batch (not just that one item) when this field was a bare
-/// `String`. Nothing here can be trusted to always be present and non-null.
+/// machine with real pending updates, a bare `Select-Object KB, Title, Size`
+/// against the raw update object returned all three as JSON `null` even
+/// though those properties are genuinely populated on the object (confirmed
+/// by dumping the full object with `ConvertTo-Json` directly — see
+/// `windows_update_check_script`'s doc for the fix). Keeping every field
+/// optional here is a second, independent layer of defense on top of that
+/// fix: nothing about PSWindowsUpdate's raw object should be trusted to
+/// always be present and non-null.
+///
+/// Every field also goes through [`flexible_string`] rather than deriving
+/// `Option<String>` directly: confirmed live (a third distinct failure on
+/// the same machine), `KB` can come back as a JSON *array* rather than a
+/// string — plausibly because the raw object's real `KBArticleIDs` property
+/// is a genuine array (an update can reference more than one KB article),
+/// and the convenience `KB` property doesn't reliably collapse that to a
+/// single string in every case.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct WindowsUpdateItem {
-    #[serde(rename = "KB", default)]
+    #[serde(rename = "KB", default, deserialize_with = "flexible_string")]
     pub kb: Option<String>,
-    #[serde(rename = "Title", default)]
+    #[serde(rename = "Title", default, deserialize_with = "flexible_string")]
     pub title: Option<String>,
-    #[serde(rename = "Size", default)]
+    #[serde(rename = "Size", default, deserialize_with = "flexible_string")]
     pub size: Option<String>,
+}
+
+/// Accepts a JSON string, `null`, or an array of strings (joined with
+/// `", "`) where a plain string was expected.
+///
+/// Found necessary live: the raw `Get-WindowsUpdate` object has a genuine
+/// `KBArticleIDs` *array* property (an update can reference more than one KB
+/// article) alongside a convenience `KB` property — the two real updates
+/// tested so far both had 0 or 1 KB article, which happens to come out as a
+/// plain (or empty) string, but nothing rules out `KB` itself coming back as
+/// a genuine JSON array for an update referencing several. Applied to all
+/// three fields, not just `KB`, since nothing about this module's raw object
+/// shape has proven reliable enough to special-case just one.
+fn flexible_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Array(items) => {
+            let joined: Vec<String> = items
+                .into_iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            (!joined.is_empty()).then(|| joined.join(", "))
+        }
+        _ => None,
+    })
 }
 
 /// Parses the JSON a Windows Update check writes out (see
@@ -499,7 +538,22 @@ pub fn windows_update_json_path() -> std::path::PathBuf {
 /// entirely rather than trusting it. `-ErrorAction Stop` is still left on
 /// `Get-WindowsUpdate` as cheap defense-in-depth for other failure modes.
 ///
-/// Two more pitfalls guarded against, both found by testing against a real
+/// Reading `KB`/`Title`/`Size` via `ForEach-Object { [PSCustomObject]@{ KB =
+/// $_.KB; ... } }` rather than a bare `Select-Object KB, Title, Size` matters
+/// more than it looks: confirmed live on a real machine with real pending
+/// updates, the bare `Select-Object` form returned an object with all three
+/// properties `null`, despite those exact properties being genuinely
+/// populated strings on the underlying object — verified by dumping the full
+/// object with `Get-WindowsUpdate | Select-Object -First 1 | ConvertTo-Json`
+/// directly, no `Select-Object <names>` involved. Explicit `$_.KB` dot-access
+/// inside `ForEach-Object` reads the property directly off each object
+/// rather than asking `Select-Object` to resolve it by name, which sidesteps
+/// whatever about these particular properties (likely how PSWindowsUpdate
+/// attaches them — extended/calculated members rather than plain
+/// NoteProperty) `Select-Object`'s name-based matching doesn't handle
+/// reliably.
+///
+/// Three more pitfalls guarded against, all found by testing against a real
 /// machine: `@(...)` around the `Get-WindowsUpdate` pipeline forces array
 /// context so a single pending update still serializes as a one-element JSON
 /// array instead of collapsing to a bare object; `-InputObject $updates` (not
@@ -523,7 +577,7 @@ pub fn windows_update_check_script(json_path: &Path) -> String {
          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser; \
          Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser }}; \
          Import-Module PSWindowsUpdate; \
-         $updates = @(Get-WindowsUpdate -ErrorAction Stop | Select-Object KB, Title, Size); \
+         $updates = @(Get-WindowsUpdate -ErrorAction Stop | ForEach-Object {{ [PSCustomObject]@{{ KB = $_.KB; Title = $_.Title; Size = $_.Size }} }}); \
          $json = ConvertTo-Json -InputObject $updates -Depth 3; \
          [System.IO.File]::WriteAllText('{path}', $json, [System.Text.UTF8Encoding]::new($false))"
     )
@@ -1351,6 +1405,46 @@ Weird Local App                             1.0        2.0
     }
 
     #[test]
+    fn parse_windows_update_json_array_kb_is_joined_into_a_string() {
+        // Regression (found in real testing, a third distinct failure on
+        // the same machine): "invalid type: sequence, expected a string" (or
+        // similar). The raw Get-WindowsUpdate object has a genuine
+        // KBArticleIDs *array* property (an update can reference multiple KB
+        // articles) alongside the convenience KB property — the two real
+        // updates tested so far both had 0 or 1 KB article, which happens to
+        // serialize KB as a plain string ("KB2267602") or empty string
+        // (""), but there's no reason to assume every update stays in that
+        // shape. A plain Option<String> field rejects a JSON array outright;
+        // this must accept either shape.
+        let items =
+            parse_windows_update_json(r#"[{"KB":["KB1111","KB2222"],"Title":"T","Size":"1 MB"}]"#)
+                .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kb.as_deref(), Some("KB1111, KB2222"));
+    }
+
+    #[test]
+    fn parse_windows_update_json_array_title_and_size_are_also_tolerated() {
+        // Same flexible-string handling applies uniformly to all three
+        // fields, not just KB, since nothing about this module's raw object
+        // shape has proven reliable enough to special-case just one field.
+        let items = parse_windows_update_json(
+            r#"[{"KB":"KB1","Title":["Part 1","Part 2"],"Size":["1","MB"]}]"#,
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title.as_deref(), Some("Part 1, Part 2"));
+        assert_eq!(items[0].size.as_deref(), Some("1, MB"));
+    }
+
+    #[test]
+    fn parse_windows_update_json_empty_array_field_becomes_none() {
+        let items = parse_windows_update_json(r#"[{"KB":[],"Title":"T","Size":"1 MB"}]"#).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kb, None);
+    }
+
+    #[test]
     fn parse_windows_update_json_malformed_input_errs() {
         assert!(parse_windows_update_json("not json").is_err());
         assert!(
@@ -1455,6 +1549,34 @@ Weird Local App                             1.0        2.0
         assert!(
             script.contains("@(Get-WindowsUpdate"),
             "must wrap in @(...) so a single result still serializes as a JSON array: {script}"
+        );
+    }
+
+    #[test]
+    fn windows_update_check_script_reads_properties_via_explicit_dot_access() {
+        // Regression (found in real testing, on a machine with real pending
+        // updates): `Select-Object KB, Title, Size` (bare property-name
+        // selection) against Get-WindowsUpdate's real output produced an
+        // object with all three fields null, even though a full object dump
+        // (Get-WindowsUpdate | Select-Object -First 1 | ConvertTo-Json)
+        // proved KB/Title/Size genuinely exist as populated string
+        // properties on the same object. Whatever the exact reason
+        // (PSWindowsUpdate likely adds these as calculated/extended
+        // properties that bare Select-Object doesn't reliably resolve),
+        // explicit `$_.KB`/`$_.Title`/`$_.Size` dot-access inside
+        // ForEach-Object sidesteps Select-Object's name-matching entirely
+        // and is a much more universally reliable way to read a property
+        // regardless of how it was attached to the object.
+        let path = std::path::Path::new("C:/tmp/wgtui-wu.json");
+        let script = windows_update_check_script(path);
+        assert!(
+            !script.contains("Select-Object KB, Title, Size"),
+            "bare Select-Object property-name selection was proven unreliable \
+             for these specific properties on a real machine: {script}"
+        );
+        assert!(
+            script.contains("$_.KB") && script.contains("$_.Title") && script.contains("$_.Size"),
+            "must read KB/Title/Size via explicit dot-access: {script}"
         );
     }
 
