@@ -2014,8 +2014,8 @@ impl App {
     }
 
     fn render_updates(&self, f: &mut Frame<'_>, area: Rect) {
-        let panels =
-            Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).split(area);
+        let panels = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area);
         self.render_app_updates(f, panels[0]);
         self.render_system_updates(f, panels[1]);
     }
@@ -3370,7 +3370,7 @@ mod tests {
             size: Some("450 MB".into()),
         }]);
 
-        let text = draw_text(&app, 110, 32);
+        let text = draw_text(&app, 200, 32);
         assert!(text.contains("System Updates"), "missing title:\n{text}");
         assert!(text.contains("KB5000001"), "missing KB:\n{text}");
         assert!(

@@ -469,10 +469,18 @@ pub fn windows_update_json_path() -> std::path::PathBuf {
 /// `Remove-Item` on `json_path` runs first, before anything that could fail,
 /// so "the file is missing after the process exits" always means "the check
 /// didn't complete" — never a stale result from a previous run being reread
-/// by mistake. `@(...)` around the `Get-WindowsUpdate` pipeline forces array
-/// context so a single pending update still serializes as a one-element JSON
-/// array instead of collapsing to a bare object (a classic `ConvertTo-Json`
-/// gotcha that would otherwise break deserializing into `Vec<WindowsUpdateItem>`).
+/// by mistake.
+///
+/// Two `ConvertTo-Json` pitfalls, both guarded against: `@(...)` around the
+/// `Get-WindowsUpdate` pipeline forces array context so a single pending
+/// update still serializes as a one-element JSON array instead of collapsing
+/// to a bare object; and `-InputObject $updates` (not `$updates |
+/// ConvertTo-Json`) passes the array as one value instead of piping it
+/// element-by-element — piped, an *empty* array sends zero objects through
+/// the pipeline, so `ConvertTo-Json` receives no input at all and emits
+/// nothing, leaving a file that fails to parse as JSON (found by testing
+/// against a real machine with zero pending updates). Both together mean 0,
+/// 1, and N pending updates all serialize as a proper JSON array.
 #[must_use]
 pub fn windows_update_check_script(json_path: &Path) -> String {
     let path = json_path.display();
@@ -483,7 +491,7 @@ pub fn windows_update_check_script(json_path: &Path) -> String {
          Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser }}; \
          Import-Module PSWindowsUpdate; \
          $updates = @(Get-WindowsUpdate | Select-Object KB, Title, Size); \
-         $updates | ConvertTo-Json -Depth 3 | Out-File -FilePath '{path}' -Encoding utf8"
+         ConvertTo-Json -InputObject $updates -Depth 3 | Out-File -FilePath '{path}' -Encoding utf8"
     )
 }
 
@@ -1283,6 +1291,31 @@ Weird Local App                             1.0        2.0
         assert!(
             script.contains("@(Get-WindowsUpdate"),
             "must wrap in @(...) so a single result still serializes as a JSON array: {script}"
+        );
+    }
+
+    #[test]
+    fn windows_update_check_script_passes_updates_via_input_object_not_pipeline() {
+        // Regression (found in real testing on a machine with zero pending
+        // updates): `$updates | ConvertTo-Json` pipes the array *element by
+        // element* — when $updates is empty, zero objects flow through the
+        // pipeline, so ConvertTo-Json receives no input at all and emits
+        // nothing, leaving an empty file. read_windows_update_result then
+        // fails to parse the empty string ("expected value at line 1 column
+        // 1"). Passing the array via -InputObject binds it as a single
+        // value, so ConvertTo-Json correctly emits "[]" for zero elements
+        // too (this is on top of, not instead of, the @(...) wrap above,
+        // which is still needed so $updates itself is always array-typed).
+        let path = std::path::Path::new("C:/tmp/wgtui-wu.json");
+        let script = windows_update_check_script(path);
+        assert!(
+            script.contains("ConvertTo-Json -InputObject $updates"),
+            "must pass $updates via -InputObject, not pipe it in, or an empty \
+             result set (system up to date) produces no output at all: {script}"
+        );
+        assert!(
+            !script.contains("$updates | ConvertTo-Json"),
+            "must not pipe $updates into ConvertTo-Json: {script}"
         );
     }
 
