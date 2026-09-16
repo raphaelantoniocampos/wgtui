@@ -422,6 +422,105 @@ pub fn kill_process_tree(pid: u32) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// A pending Windows Update item, as reported by `Get-WindowsUpdate`
+/// (PSWindowsUpdate module).
+///
+/// Every field but `title` is optional: the exact JSON shape PSWindowsUpdate
+/// produces hasn't been observed against a real machine with pending updates
+/// (unlike winget's table output, which was validated against real captures
+/// from this machine) — parsing must tolerate an unexpected/missing field
+/// rather than fail outright.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WindowsUpdateItem {
+    #[serde(rename = "KB", default)]
+    pub kb: Option<String>,
+    #[serde(rename = "Title", default)]
+    pub title: String,
+    #[serde(rename = "Size", default)]
+    pub size: Option<String>,
+}
+
+/// Parses the JSON a Windows Update check writes out (see
+/// [`windows_update_check_script`]). Never panics: malformed input is an
+/// `Err`, not a crash.
+pub fn parse_windows_update_json(raw: &str) -> Result<Vec<WindowsUpdateItem>, String> {
+    serde_json::from_str(raw).map_err(|e| format!("Failed to parse Windows Update JSON: {e}"))
+}
+
+/// Where a Windows Update check writes its JSON result, for
+/// [`read_windows_update_result`] to read back after the process exits.
+#[must_use]
+pub fn windows_update_json_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("wgtui-windows-update.json")
+}
+
+/// Builds the PowerShell one-liner that lists pending Windows updates as
+/// JSON at `json_path`.
+///
+/// Ensures the PSWindowsUpdate module is present (installing it and its
+/// NuGet provider at `-Scope CurrentUser`, so this never requires
+/// Administrator — mirrors `bootstrap.rs`'s `BOOTSTRAP_PS`), then writes
+/// `Get-WindowsUpdate`'s result to `json_path` rather than relying on
+/// captured stdout: PSWindowsUpdate is a chatty module (progress/verbose
+/// output), so decoupling the structured result from whatever incidental
+/// text it prints along the way avoids an entire class of "stdout wasn't
+/// purely the data I expected" bug.
+///
+/// `Remove-Item` on `json_path` runs first, before anything that could fail,
+/// so "the file is missing after the process exits" always means "the check
+/// didn't complete" — never a stale result from a previous run being reread
+/// by mistake. `@(...)` around the `Get-WindowsUpdate` pipeline forces array
+/// context so a single pending update still serializes as a one-element JSON
+/// array instead of collapsing to a bare object (a classic `ConvertTo-Json`
+/// gotcha that would otherwise break deserializing into `Vec<WindowsUpdateItem>`).
+#[must_use]
+pub fn windows_update_check_script(json_path: &Path) -> String {
+    let path = json_path.display();
+    format!(
+        "Remove-Item -Path '{path}' -ErrorAction SilentlyContinue; \
+         if (-not (Get-Module -ListAvailable | Where-Object {{ $_.Name -eq 'PSWindowsUpdate' }})) {{ \
+         Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser; \
+         Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser }}; \
+         Import-Module PSWindowsUpdate; \
+         $updates = @(Get-WindowsUpdate | Select-Object KB, Title, Size); \
+         $updates | ConvertTo-Json -Depth 3 | Out-File -FilePath '{path}' -Encoding utf8"
+    )
+}
+
+/// PowerShell one-liner that installs every pending Windows update.
+///
+/// Ensures PSWindowsUpdate is present (same `-Scope CurrentUser` guard as
+/// [`windows_update_check_script`] — this line alone never needs
+/// Administrator; the actual install, like Windows Update itself, does), then
+/// runs `-AcceptAll -Install -IgnoreReboot`: accepts every pending update and
+/// installs it, but never reboots the machine on its own.
+///
+/// Deliberately does *not* mirror the caller's original
+/// `Set-ExecutionPolicy -Scope LocalMachine` bookending: that needs
+/// Administrator just to run, and has a real bug — if `Get-WindowsUpdate`
+/// throws partway through, the final line restoring the policy never runs,
+/// permanently altering the machine's execution policy. The process-scoped
+/// `-ExecutionPolicy Bypass` flag passed to `powershell.exe` (see
+/// `run_command_stdout` call sites) achieves the same thing without needing
+/// admin or mutating any persistent state — already the established pattern
+/// in this codebase (`bootstrap.rs`'s `BOOTSTRAP_PS`).
+pub const WINDOWS_UPDATE_INSTALL_PS: &str = "\
+    if (-not (Get-Module -ListAvailable | Where-Object { $_.Name -eq 'PSWindowsUpdate' })) { \
+    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser; \
+    Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser }; \
+    Import-Module PSWindowsUpdate; \
+    Get-WindowsUpdate -AcceptAll -Install -IgnoreReboot";
+
+/// Reads and parses the JSON a Windows Update check wrote to `json_path`.
+///
+/// A missing file (the check never completed, or hasn't run yet) is reported
+/// as its own distinct error rather than silently treated as "zero updates".
+pub fn read_windows_update_result(json_path: &Path) -> Result<Vec<WindowsUpdateItem>, String> {
+    let raw = fs::read_to_string(json_path)
+        .map_err(|e| format!("Windows Update check produced no result: {e}"))?;
+    parse_windows_update_json(&raw)
+}
+
 /// Whether the manifest entry `id` / `name` matches something in `installed`.
 ///
 /// `winget list` output routinely differs in case from `winget search`, and
@@ -1130,5 +1229,91 @@ Weird Local App                             1.0        2.0
         let ids: std::collections::HashSet<&str> = packages.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(packages.len(), 2); // A.One deduped across files
         assert!(ids.contains("A.One") && ids.contains("B.Two"));
+    }
+
+    #[test]
+    fn parse_windows_update_json_empty_array_is_ok() {
+        assert_eq!(parse_windows_update_json("[]").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn parse_windows_update_json_one_item() {
+        let items = parse_windows_update_json(
+            r#"[{"KB":"KB5000001","Title":"Cumulative Update","Size":"450 MB"}]"#,
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kb.as_deref(), Some("KB5000001"));
+        assert_eq!(items[0].title, "Cumulative Update");
+        assert_eq!(items[0].size.as_deref(), Some("450 MB"));
+    }
+
+    #[test]
+    fn parse_windows_update_json_several_items() {
+        let items = parse_windows_update_json(
+            r#"[{"KB":"KB1","Title":"One","Size":"1 MB"},{"KB":"KB2","Title":"Two","Size":"2 MB"}]"#,
+        )
+        .unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].kb.as_deref(), Some("KB2"));
+    }
+
+    #[test]
+    fn parse_windows_update_json_missing_fields_uses_defaults() {
+        let items = parse_windows_update_json(r#"[{"Title":"No KB or size"}]"#).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kb, None);
+        assert_eq!(items[0].title, "No KB or size");
+        assert_eq!(items[0].size, None);
+    }
+
+    #[test]
+    fn parse_windows_update_json_malformed_input_errs() {
+        assert!(parse_windows_update_json("not json").is_err());
+        assert!(
+            parse_windows_update_json("{}").is_err(),
+            "a bare object (not an array) must not silently become an empty list"
+        );
+    }
+
+    #[test]
+    fn windows_update_check_script_wraps_selectobject_in_array_context() {
+        let path = std::path::Path::new("C:/tmp/wgtui-wu.json");
+        let script = windows_update_check_script(path);
+        assert!(
+            script.contains("@(Get-WindowsUpdate"),
+            "must wrap in @(...) so a single result still serializes as a JSON array: {script}"
+        );
+    }
+
+    #[test]
+    fn windows_update_check_script_removes_stale_file_before_anything_else() {
+        let path = std::path::Path::new("C:/tmp/wgtui-wu.json");
+        let script = windows_update_check_script(path);
+        let remove_idx = script.find("Remove-Item").expect("Remove-Item present");
+        let import_idx = script.find("Import-Module").expect("Import-Module present");
+        let get_idx = script
+            .find("Get-WindowsUpdate")
+            .expect("Get-WindowsUpdate present");
+        assert!(
+            remove_idx < import_idx && remove_idx < get_idx,
+            "stale output must be deleted before anything that could fail, so a missing file always means \"check didn't complete\""
+        );
+    }
+
+    #[test]
+    fn read_windows_update_result_parses_file_written_by_check_script() {
+        let (_dir, path) = write_tmp("wu.json", r#"[{"KB":"KB1","Title":"T","Size":"1 MB"}]"#);
+        let items = read_windows_update_result(&path).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kb.as_deref(), Some("KB1"));
+    }
+
+    #[test]
+    fn read_windows_update_result_missing_file_is_a_distinct_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let never_written = dir.path().join("never-written.json");
+        let err = read_windows_update_result(&never_written).unwrap_err();
+        assert!(!err.is_empty());
     }
 }
