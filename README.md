@@ -15,13 +15,28 @@ agora exclusivamente winget (Chocolatey/Scoop foram descartados) e em Rust.
 - Windows 10/11 com **winget** (App Installer). Se faltar, o wgtui pergunta se pode
   instalar via PowerShell (`Install-Module Microsoft.WinGet.Client` +
   `Repair-WinGetPackageManager`) no primeiro uso.
-- Rust (edition 2024) para compilar da fonte.
 - Por padrão o wgtui **não força `--scope`** — deixa o winget escolher o instalador
   aplicável (forçar `machine` fazia instalações falharem de cara em pacotes sem
   instalador de máquina). Se você quiser `--scope machine` explicitamente num pacote,
   isso pede Administrador; sem elevação a status bar mostra `not admin`.
 
+## Instalação
+
+Abra um PowerShell e rode:
+
+```powershell
+irm https://raw.githubusercontent.com/raphaelantoniocampos/wgtui/main/install.ps1 | iex
+```
+
+Baixa o `wgtui.exe` do [último release](https://github.com/raphaelantoniocampos/wgtui/releases/latest)
+para `%LOCALAPPDATA%\Programs\wgtui` e adiciona a pasta ao PATH do usuário (não precisa de
+Administrador). Rodar de novo a qualquer momento atualiza para a versão mais recente. Prefere
+conferir o script antes de rodar, ou baixar o `.exe` na mão? Veja [`install.ps1`](install.ps1)
+ou a [página de releases](https://github.com/raphaelantoniocampos/wgtui/releases).
+
 ## Compilar e rodar
+
+Alternativa para quem quer compilar da fonte (Rust, edition 2024):
 
 ```bash
 cargo run            # desenvolvimento
