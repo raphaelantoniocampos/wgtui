@@ -1,6 +1,6 @@
 [package]
 name = "wgtui"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Keyboard-driven terminal UI for the winget package manager"
 repository = "https://github.com/raphaelantoniocampos/wgtui"
