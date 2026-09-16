@@ -444,6 +444,12 @@ pub struct WindowsUpdateItem {
 /// [`windows_update_check_script`]). Never panics: malformed input is an
 /// `Err`, not a crash.
 pub fn parse_windows_update_json(raw: &str) -> Result<Vec<WindowsUpdateItem>, String> {
+    // Windows PowerShell 5.1 (`powershell.exe`, as opposed to pwsh.exe) has
+    // no way to write UTF-8 without a BOM via Out-File, so a leading
+    // U+FEFF is expected here even though `windows_update_check_script`
+    // avoids it at the source — stripping it defensively costs nothing and
+    // protects against any other path that writes this file.
+    let raw = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
     serde_json::from_str(raw).map_err(|e| format!("Failed to parse Windows Update JSON: {e}"))
 }
 
@@ -458,50 +464,78 @@ pub fn windows_update_json_path() -> std::path::PathBuf {
 /// JSON at `json_path`.
 ///
 /// Ensures the PSWindowsUpdate module is present (installing it and its
-/// NuGet provider at `-Scope CurrentUser`, so this never requires
-/// Administrator — mirrors `bootstrap.rs`'s `BOOTSTRAP_PS`), then writes
-/// `Get-WindowsUpdate`'s result to `json_path` rather than relying on
-/// captured stdout: PSWindowsUpdate is a chatty module (progress/verbose
-/// output), so decoupling the structured result from whatever incidental
-/// text it prints along the way avoids an entire class of "stdout wasn't
-/// purely the data I expected" bug.
+/// NuGet provider at `-Scope CurrentUser`, mirroring `bootstrap.rs`'s
+/// `BOOTSTRAP_PS`), then writes `Get-WindowsUpdate`'s result to `json_path`
+/// rather than relying on captured stdout: PSWindowsUpdate is a chatty
+/// module (progress/verbose output), so decoupling the structured result
+/// from whatever incidental text it prints along the way avoids an entire
+/// class of "stdout wasn't purely the data I expected" bug.
+///
+/// **Both checking and installing need Administrator.** `-Scope CurrentUser`
+/// only controls where the PSWindowsUpdate *module files* install — it does
+/// not change what `Get-WindowsUpdate` itself requires at runtime, and
+/// confirmed live on a real machine, `Get-WindowsUpdate` throws
+/// `AccessDenied` ("must run an elevated Windows PowerShell console") when
+/// not elevated, even with no `-Install`. (This module wraps the Windows
+/// Update Agent API, which requires an elevated caller to query at all — not
+/// specific to this module or to installing.)
 ///
 /// `Remove-Item` on `json_path` runs first, before anything that could fail,
 /// so "the file is missing after the process exits" always means "the check
 /// didn't complete" — never a stale result from a previous run being reread
-/// by mistake.
+/// by mistake. That guarantee depends on nothing past it silently succeeding
+/// when it shouldn't, which is why elevation is checked *explicitly*, with a
+/// real `throw`, before anything else runs: `-ErrorAction Stop` on
+/// `Get-WindowsUpdate` looks like it should be enough (its `AccessDenied`
+/// failure is non-terminating by default, so naively it'd continue with an
+/// empty `$updates` and write a misleadingly-valid `"[]"`), but testing
+/// against a real unelevated machine showed PSWindowsUpdate's own
+/// `AccessDenied` error doesn't reliably respect `-ErrorAction Stop` either
+/// — the file got written anyway. A plain `throw` (confirmed live to reliably
+/// abort a `-Command` chain) sidesteps PSWindowsUpdate's error handling
+/// entirely rather than trusting it. `-ErrorAction Stop` is still left on
+/// `Get-WindowsUpdate` as cheap defense-in-depth for other failure modes.
 ///
-/// Two `ConvertTo-Json` pitfalls, both guarded against: `@(...)` around the
-/// `Get-WindowsUpdate` pipeline forces array context so a single pending
-/// update still serializes as a one-element JSON array instead of collapsing
-/// to a bare object; and `-InputObject $updates` (not `$updates |
-/// ConvertTo-Json`) passes the array as one value instead of piping it
-/// element-by-element — piped, an *empty* array sends zero objects through
-/// the pipeline, so `ConvertTo-Json` receives no input at all and emits
-/// nothing, leaving a file that fails to parse as JSON (found by testing
-/// against a real machine with zero pending updates). Both together mean 0,
-/// 1, and N pending updates all serialize as a proper JSON array.
+/// Two more pitfalls guarded against, both found by testing against a real
+/// machine: `@(...)` around the `Get-WindowsUpdate` pipeline forces array
+/// context so a single pending update still serializes as a one-element JSON
+/// array instead of collapsing to a bare object; `-InputObject $updates` (not
+/// `$updates | ConvertTo-Json`) passes the array as one value instead of
+/// piping it element-by-element — piped, an *empty* array sends zero objects
+/// through the pipeline, so `ConvertTo-Json` receives no input and emits
+/// nothing; and writing via `[System.IO.File]::WriteAllText` with an
+/// explicit BOM-less `UTF8Encoding`, not `Out-File -Encoding utf8` — Windows
+/// PowerShell 5.1 (`powershell.exe`, unlike `pwsh.exe`) always prepends a
+/// UTF-8 BOM for that encoding with no flag to suppress it, and
+/// `std::fs::read_to_string` doesn't strip a BOM, so it lands as a literal
+/// U+FEFF before the JSON and `serde_json` rejects it.
 #[must_use]
 pub fn windows_update_check_script(json_path: &Path) -> String {
     let path = json_path.display();
     format!(
         "Remove-Item -Path '{path}' -ErrorAction SilentlyContinue; \
+         if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{ \
+         throw 'Windows Update check requires an elevated (Administrator) process.' }}; \
          if (-not (Get-Module -ListAvailable | Where-Object {{ $_.Name -eq 'PSWindowsUpdate' }})) {{ \
          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser; \
          Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser }}; \
          Import-Module PSWindowsUpdate; \
-         $updates = @(Get-WindowsUpdate | Select-Object KB, Title, Size); \
-         ConvertTo-Json -InputObject $updates -Depth 3 | Out-File -FilePath '{path}' -Encoding utf8"
+         $updates = @(Get-WindowsUpdate -ErrorAction Stop | Select-Object KB, Title, Size); \
+         $json = ConvertTo-Json -InputObject $updates -Depth 3; \
+         [System.IO.File]::WriteAllText('{path}', $json, [System.Text.UTF8Encoding]::new($false))"
     )
 }
 
 /// PowerShell one-liner that installs every pending Windows update.
 ///
-/// Ensures PSWindowsUpdate is present (same `-Scope CurrentUser` guard as
-/// [`windows_update_check_script`] — this line alone never needs
-/// Administrator; the actual install, like Windows Update itself, does), then
-/// runs `-AcceptAll -Install -IgnoreReboot`: accepts every pending update and
-/// installs it, but never reboots the machine on its own.
+/// Checks elevation explicitly first, same as and for the same reason as
+/// [`windows_update_check_script`] (see its doc) — PSWindowsUpdate's own
+/// error handling for the unelevated case isn't reliable enough to depend
+/// on. Then ensures PSWindowsUpdate is present (`-Scope CurrentUser`;
+/// installing the *module* itself doesn't need Administrator, only
+/// `Get-WindowsUpdate` does), then runs `-AcceptAll -Install -IgnoreReboot`:
+/// accepts every pending update and installs it, but never reboots the
+/// machine on its own.
 ///
 /// Deliberately does *not* mirror the caller's original
 /// `Set-ExecutionPolicy -Scope LocalMachine` bookending: that needs
@@ -513,6 +547,8 @@ pub fn windows_update_check_script(json_path: &Path) -> String {
 /// admin or mutating any persistent state — already the established pattern
 /// in this codebase (`bootstrap.rs`'s `BOOTSTRAP_PS`).
 pub const WINDOWS_UPDATE_INSTALL_PS: &str = "\
+    if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { \
+    throw 'Windows Update install requires an elevated (Administrator) process.' }; \
     if (-not (Get-Module -ListAvailable | Where-Object { $_.Name -eq 'PSWindowsUpdate' })) { \
     Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser; \
     Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser }; \
@@ -1245,6 +1281,26 @@ Weird Local App                             1.0        2.0
     }
 
     #[test]
+    fn windows_update_install_ps_checks_elevation_explicitly_first() {
+        // Same reasoning as windows_update_check_script: PSWindowsUpdate's
+        // own error handling for the unelevated case isn't reliable enough
+        // to depend on, so check explicitly and fail fast with a clear
+        // message before even touching the module.
+        assert!(
+            WINDOWS_UPDATE_INSTALL_PS
+                .contains("IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"),
+            "must check elevation explicitly: {WINDOWS_UPDATE_INSTALL_PS}"
+        );
+        let admin_idx = WINDOWS_UPDATE_INSTALL_PS
+            .find("IsInRole")
+            .expect("elevation check present");
+        let install_idx = WINDOWS_UPDATE_INSTALL_PS
+            .find("Get-WindowsUpdate")
+            .expect("Get-WindowsUpdate present");
+        assert!(admin_idx < install_idx);
+    }
+
+    #[test]
     fn parse_windows_update_json_one_item() {
         let items = parse_windows_update_json(
             r#"[{"KB":"KB5000001","Title":"Cumulative Update","Size":"450 MB"}]"#,
@@ -1281,6 +1337,95 @@ Weird Local App                             1.0        2.0
         assert!(
             parse_windows_update_json("{}").is_err(),
             "a bare object (not an array) must not silently become an empty list"
+        );
+    }
+
+    #[test]
+    fn parse_windows_update_json_strips_leading_bom() {
+        // Regression (found in real testing, still failing after the
+        // -InputObject fix): powershell.exe (Windows PowerShell 5.1) always
+        // writes a UTF-8 BOM for `-Encoding utf8`, with no way to suppress
+        // it via Out-File. std::fs::read_to_string doesn't strip a BOM, so
+        // it lands as a literal U+FEFF before the JSON — which
+        // serde_json rejects with "expected value at line 1 column 1",
+        // regardless of whether the array is empty or not.
+        assert_eq!(
+            parse_windows_update_json("\u{FEFF}[]").unwrap(),
+            vec![],
+            "a leading BOM must not break parsing an empty result"
+        );
+        let items = parse_windows_update_json(
+            "\u{FEFF}[{\"KB\":\"KB1\",\"Title\":\"T\",\"Size\":\"1 MB\"}]",
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn windows_update_check_script_writes_without_bom() {
+        // The script itself should avoid the BOM at the source (Out-File
+        // -Encoding utf8's BOM is a Windows PowerShell 5.1 default with no
+        // suppressible flag), rather than relying solely on the Rust-side
+        // strip above.
+        let path = std::path::Path::new("C:/tmp/wgtui-wu.json");
+        let script = windows_update_check_script(path);
+        assert!(
+            !script.contains("Out-File"),
+            "Out-File -Encoding utf8 always writes a BOM on Windows PowerShell 5.1: {script}"
+        );
+        assert!(
+            script.contains("UTF8Encoding]::new($false)"),
+            "must write via an explicitly BOM-less UTF8Encoding: {script}"
+        );
+    }
+
+    #[test]
+    fn windows_update_check_script_stops_on_get_windowsupdate_failure() {
+        // Regression (found in real testing): Get-WindowsUpdate itself
+        // requires an elevated process (not just -Install) — confirmed live
+        // via "AccessDenied ... Get-WindowsUpdate" when run unelevated. By
+        // default that's a *non-terminating* PowerShell error, so without
+        // -ErrorAction Stop the script would silently continue with an
+        // empty $updates, write a valid "[]", and the panel would falsely
+        // report "System is up to date" instead of surfacing the failure.
+        // -ErrorAction Stop makes it abort before the file ever gets
+        // written, so read_windows_update_result correctly reports "check
+        // didn't complete" (missing file) instead of a wrong success.
+        let path = std::path::Path::new("C:/tmp/wgtui-wu.json");
+        let script = windows_update_check_script(path);
+        assert!(
+            script.contains("Get-WindowsUpdate -ErrorAction Stop"),
+            "a failed (e.g. unelevated) Get-WindowsUpdate must abort the script, \
+             not silently produce an empty-but-valid result: {script}"
+        );
+    }
+
+    #[test]
+    fn windows_update_check_script_throws_explicitly_when_not_elevated() {
+        // Regression (found in real testing, still hit *after* the
+        // -ErrorAction Stop fix above): PSWindowsUpdate's own AccessDenied
+        // error does NOT reliably respect the caller's -ErrorAction Stop —
+        // confirmed live by re-running the fixed script unelevated and
+        // finding the JSON file got written anyway (a valid empty array,
+        // still the wrong "silently up to date" answer). Checking elevation
+        // explicitly up front, with a real `throw` (verified live to reliably
+        // abort a -Command chain, unlike relying on a nested cmdlet's own
+        // error handling), doesn't depend on PSWindowsUpdate's internals at
+        // all.
+        let path = std::path::Path::new("C:/tmp/wgtui-wu.json");
+        let script = windows_update_check_script(path);
+        assert!(
+            script.contains("IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"),
+            "must check elevation explicitly, not rely on Get-WindowsUpdate's own \
+             error handling for it: {script}"
+        );
+        let admin_check_idx = script.find("IsInRole").expect("elevation check present");
+        let get_wu_idx = script
+            .find("Get-WindowsUpdate -ErrorAction Stop")
+            .expect("Get-WindowsUpdate present");
+        assert!(
+            admin_check_idx < get_wu_idx,
+            "elevation must be checked before attempting Get-WindowsUpdate: {script}"
         );
     }
 

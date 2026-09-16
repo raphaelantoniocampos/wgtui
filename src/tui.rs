@@ -2069,7 +2069,14 @@ impl App {
     /// navigate to, so no cursor highlight.
     fn render_system_updates(&self, f: &mut Frame<'_>, area: Rect) {
         let (rows, empty): (Vec<Row>, &str) = match &self.windows_update_state {
-            WindowsUpdateState::NeverChecked => (vec![], "Press w to check for Windows updates"),
+            WindowsUpdateState::NeverChecked => (
+                vec![],
+                if self.elevated {
+                    "Press w to check for Windows updates"
+                } else {
+                    "Press w to check (needs Administrator)"
+                },
+            ),
             WindowsUpdateState::Checking => (vec![], "Checking…"),
             WindowsUpdateState::Checked(items) if items.is_empty() => {
                 (vec![], "System is up to date")
@@ -3376,6 +3383,30 @@ mod tests {
         assert!(
             text.contains("Cumulative Update"),
             "missing title text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn system_updates_never_checked_hint_mentions_admin_when_not_elevated() {
+        // Found in real testing: Get-WindowsUpdate needs Administrator even
+        // just to check (not only to install), confirmed live against a
+        // real machine. The app already knows self.elevated before the user
+        // ever presses w, so the hint should say so up front rather than
+        // let them find out only after a failed attempt.
+        let mut app = populated();
+        app.tab = Tab::Updates;
+        app.windows_update_state = WindowsUpdateState::NeverChecked;
+
+        app.elevated = true;
+        let elevated_text = draw_text(&app, 200, 32);
+        assert!(elevated_text.contains("Press w to check"));
+        assert!(!elevated_text.contains("Administrator"));
+
+        app.elevated = false;
+        let not_elevated_text = draw_text(&app, 200, 32);
+        assert!(
+            not_elevated_text.contains("Administrator"),
+            "must hint that checking needs Administrator when not elevated:\n{not_elevated_text}"
         );
     }
 }

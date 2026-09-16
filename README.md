@@ -21,8 +21,10 @@ agora exclusivamente winget (Chocolatey/Scoop foram descartados) e em Rust.
   isso pede Administrador; sem elevação a status bar mostra `not admin`.
 - O painel **System Updates** (aba Updates) usa o módulo PowerShell **PSWindowsUpdate**,
   instalado automaticamente (por usuário, sem precisar de Administrador) na primeira vez
-  que você aperta `w`. Checar não precisa de Administrador; **instalar** (`W`) precisa —
-  sem elevação, a instalação falha e o erro aparece no painel de output, igual a qualquer
+  que você aperta `w`. **Tanto checar (`w`) quanto instalar (`W`) precisam de Administrador**
+  — não é uma escolha do wgtui, é o próprio `Get-WindowsUpdate` que exige processo elevado
+  mesmo só pra listar. Sem elevação, o wgtui já mostra isso no próprio painel antes de você
+  apertar `w`; se tentar mesmo assim, o erro aparece no painel de output, igual a qualquer
   outro comando.
 
 ## Instalação
