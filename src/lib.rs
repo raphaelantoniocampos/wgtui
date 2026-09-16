@@ -553,6 +553,21 @@ pub fn windows_update_json_path() -> std::path::PathBuf {
 /// NoteProperty) `Select-Object`'s name-based matching doesn't handle
 /// reliably.
 ///
+/// `| Write-Output |` between `Get-WindowsUpdate` and `ForEach-Object` fixes
+/// a second, more surprising problem with the same real two-update machine:
+/// without it, the resulting JSON was one object whose `KB`/`Title`/`Size`
+/// were each an *array* of both updates' values zipped together, instead of
+/// two separate objects. Reproduced exactly (confirmed live) with a fake
+/// source cmdlet that emits its whole result collection via `Write-Output
+/// -NoEnumerate` rather than one record per update: when a single pipeline
+/// record is itself a collection, `$_` inside `ForEach-Object` binds to that
+/// whole collection, and `$_.KB` triggers PowerShell's member-enumeration
+/// feature (a collection's `.Property` returns an array of that property
+/// from every element) instead of reading one update's `KB`. Piping through
+/// `Write-Output` first forces normal per-object pipeline enumeration
+/// regardless of how the upstream cmdlet chose to emit its results —
+/// confirmed live to fix the exact repro.
+///
 /// Three more pitfalls guarded against, all found by testing against a real
 /// machine: `@(...)` around the `Get-WindowsUpdate` pipeline forces array
 /// context so a single pending update still serializes as a one-element JSON
@@ -577,7 +592,7 @@ pub fn windows_update_check_script(json_path: &Path) -> String {
          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser; \
          Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser }}; \
          Import-Module PSWindowsUpdate; \
-         $updates = @(Get-WindowsUpdate -ErrorAction Stop | ForEach-Object {{ [PSCustomObject]@{{ KB = $_.KB; Title = $_.Title; Size = $_.Size }} }}); \
+         $updates = @(Get-WindowsUpdate -ErrorAction Stop | Write-Output | ForEach-Object {{ [PSCustomObject]@{{ KB = $_.KB; Title = $_.Title; Size = $_.Size }} }}); \
          $json = ConvertTo-Json -InputObject $updates -Depth 3; \
          [System.IO.File]::WriteAllText('{path}', $json, [System.Text.UTF8Encoding]::new($false))"
     )
@@ -1577,6 +1592,40 @@ Weird Local App                             1.0        2.0
         assert!(
             script.contains("$_.KB") && script.contains("$_.Title") && script.contains("$_.Size"),
             "must read KB/Title/Size via explicit dot-access: {script}"
+        );
+    }
+
+    #[test]
+    fn windows_update_check_script_forces_pipeline_enumeration() {
+        // Regression (found in real testing, on a machine with 2 real
+        // pending updates): the resulting JSON was one object with
+        // *array-valued* KB/Title/Size fields — each array holding both
+        // updates' values zipped together — instead of two separate
+        // objects. Reproduced exactly by having a fake source cmdlet emit
+        // its whole result collection via `Write-Output -NoEnumerate`
+        // instead of one record per update (confirmed live against real
+        // powershell.exe): when a single pipeline record is itself a
+        // collection, `$_` inside ForEach-Object binds to that whole
+        // collection, and `$_.KB` triggers PowerShell's member-enumeration
+        // feature (a collection's `.Property` returns an array of that
+        // property from every element) rather than reading one update's KB.
+        // Piping through `Write-Output` first forces normal per-object
+        // pipeline enumeration regardless of how the upstream cmdlet chose
+        // to emit its results — confirmed live to fix the exact repro.
+        let path = std::path::Path::new("C:/tmp/wgtui-wu.json");
+        let script = windows_update_check_script(path);
+        let write_output_idx = script
+            .find("| Write-Output |")
+            .expect("must force-flatten via | Write-Output | before ForEach-Object");
+        let foreach_idx = script
+            .find("ForEach-Object")
+            .expect("ForEach-Object present");
+        let get_wu_idx = script
+            .find("Get-WindowsUpdate -ErrorAction Stop")
+            .expect("Get-WindowsUpdate present");
+        assert!(
+            get_wu_idx < write_output_idx && write_output_idx < foreach_idx,
+            "Write-Output must sit between Get-WindowsUpdate and ForEach-Object: {script}"
         );
     }
 
