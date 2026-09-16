@@ -425,17 +425,20 @@ pub fn kill_process_tree(pid: u32) -> bool {
 /// A pending Windows Update item, as reported by `Get-WindowsUpdate`
 /// (PSWindowsUpdate module).
 ///
-/// Every field but `title` is optional: the exact JSON shape PSWindowsUpdate
-/// produces hasn't been observed against a real machine with pending updates
-/// (unlike winget's table output, which was validated against real captures
-/// from this machine) — parsing must tolerate an unexpected/missing field
-/// rather than fail outright.
+/// Every field is optional, `title` included: confirmed live on a real
+/// machine with real pending updates, `Select-Object KB, Title, Size`
+/// against the raw update object doesn't reliably line up with the
+/// human-readable columns `Get-WindowsUpdate` displays interactively — a
+/// `Title` came back JSON `null` even though the same update showed a
+/// perfectly normal title in the console table, which broke parsing for the
+/// *entire* batch (not just that one item) when this field was a bare
+/// `String`. Nothing here can be trusted to always be present and non-null.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct WindowsUpdateItem {
     #[serde(rename = "KB", default)]
     pub kb: Option<String>,
     #[serde(rename = "Title", default)]
-    pub title: String,
+    pub title: Option<String>,
     #[serde(rename = "Size", default)]
     pub size: Option<String>,
 }
@@ -1308,7 +1311,7 @@ Weird Local App                             1.0        2.0
         .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kb.as_deref(), Some("KB5000001"));
-        assert_eq!(items[0].title, "Cumulative Update");
+        assert_eq!(items[0].title.as_deref(), Some("Cumulative Update"));
         assert_eq!(items[0].size.as_deref(), Some("450 MB"));
     }
 
@@ -1327,8 +1330,24 @@ Weird Local App                             1.0        2.0
         let items = parse_windows_update_json(r#"[{"Title":"No KB or size"}]"#).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kb, None);
-        assert_eq!(items[0].title, "No KB or size");
+        assert_eq!(items[0].title.as_deref(), Some("No KB or size"));
         assert_eq!(items[0].size, None);
+    }
+
+    #[test]
+    fn parse_windows_update_json_null_title_does_not_error() {
+        // Regression (found in real testing, on a machine with real pending
+        // updates this time — a security-intelligence update and a driver
+        // update): "invalid type: null, expected a str". Title was the only
+        // non-Option field in WindowsUpdateItem, so any update whose Title
+        // comes back JSON null (PSWindowsUpdate's raw object properties
+        // don't necessarily match its display columns 1:1 — the same class
+        // of surprise KB/Size were already guarded against) broke parsing
+        // entirely, for every item in the batch, not just the odd one.
+        let items =
+            parse_windows_update_json(r#"[{"KB":"KB1","Title":null,"Size":"1 MB"}]"#).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, None);
     }
 
     #[test]

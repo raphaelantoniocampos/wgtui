@@ -1428,8 +1428,11 @@ impl App {
     /// Lists pending Windows updates via PSWindowsUpdate. Deliberately does
     /// not set `last_command`: the `[c]` editor's `parse_command_line` only
     /// understands double-quote grouping and would mangle this PowerShell
-    /// one-liner's semicolons/single quotes — leaving `[c]` showing the last
-    /// *winget* command is correct, not an oversight.
+    /// one-liner's semicolons/single quotes if re-run through it — leaving
+    /// `[c]` showing the last *winget* command is correct, not an oversight.
+    /// The literal command still streams into the output panel below (same
+    /// as `bootstrap.rs`'s `run_powershell_bootstrap`), so it's visible —
+    /// just not blindly re-runnable through a parser that can't handle it.
     fn check_windows_updates(&mut self) {
         let tx = self.action_tx.clone();
         self.command_output.clear();
@@ -1438,11 +1441,11 @@ impl App {
         self.windows_update_state = WindowsUpdateState::Checking;
         let (pid_slot, _cancel) = self.begin_job();
         thread::spawn(move || {
-            let _ = tx.send(ActionResult::OutputLine(
-                "--- checking Windows Update ---".to_string(),
-            ));
             let json_path = wgtui::windows_update_json_path();
             let script = wgtui::windows_update_check_script(&json_path);
+            let _ = tx.send(ActionResult::OutputLine(format!(
+                "> powershell -NoProfile -ExecutionPolicy Bypass -Command \"{script}\""
+            )));
             let tx2 = tx.clone();
             let (string_tx, string_rx) = mpsc::channel::<String>();
             thread::spawn(move || {
@@ -1473,9 +1476,10 @@ impl App {
         self.current_command = Some("Windows Update install".to_string());
         let (pid_slot, _cancel) = self.begin_job();
         thread::spawn(move || {
-            let _ = tx.send(ActionResult::OutputLine(
-                "--- installing Windows Updates ---".to_string(),
-            ));
+            let _ = tx.send(ActionResult::OutputLine(format!(
+                "> powershell -NoProfile -ExecutionPolicy Bypass -Command \"{}\"",
+                wgtui::WINDOWS_UPDATE_INSTALL_PS
+            )));
             let tx2 = tx.clone();
             let (string_tx, string_rx) = mpsc::channel::<String>();
             thread::spawn(move || {
@@ -2090,7 +2094,7 @@ impl App {
                                 u.kb.clone().unwrap_or_default(),
                                 theme::dim(),
                             )),
-                            Cell::from(u.title.clone()),
+                            Cell::from(u.title.clone().unwrap_or_default()),
                             Cell::from(Span::styled(
                                 u.size.clone().unwrap_or_default(),
                                 theme::dim(),
@@ -3352,7 +3356,7 @@ mod tests {
             WindowsUpdateState::Checked(vec![]),
             WindowsUpdateState::Checked(vec![WindowsUpdateItem {
                 kb: Some("KB5000001".into()),
-                title: "2026-09 Cumulative Update".into(),
+                title: Some("2026-09 Cumulative Update".into()),
                 size: Some("450 MB".into()),
             }]),
             WindowsUpdateState::Error("boom".into()),
@@ -3373,7 +3377,7 @@ mod tests {
         app.tab = Tab::Updates;
         app.windows_update_state = WindowsUpdateState::Checked(vec![WindowsUpdateItem {
             kb: Some("KB5000001".into()),
-            title: "2026-09 Cumulative Update".into(),
+            title: Some("2026-09 Cumulative Update".into()),
             size: Some("450 MB".into()),
         }]);
 
