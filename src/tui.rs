@@ -1797,8 +1797,8 @@ impl App {
         table_rows: Vec<Row<'static>>,
         sel: &Selection,
         empty: &str,
+        focused: bool,
     ) {
-        let focused = !self.filter_focused;
         let shown = table_rows.len();
         let count = if total == shown {
             format!(" {total} ")
@@ -1902,6 +1902,7 @@ impl App {
             rows,
             &self.search_sel,
             "Type a query above and press Enter to search winget",
+            !self.filter_focused,
         );
     }
 
@@ -1944,6 +1945,7 @@ impl App {
             rows,
             &self.updates_sel,
             empty,
+            !self.filter_focused,
         );
     }
 
@@ -1984,6 +1986,7 @@ impl App {
             rows,
             &self.installed_sel,
             empty,
+            !self.filter_focused,
         );
     }
 
@@ -2005,6 +2008,7 @@ impl App {
                 Vec::new(),
                 &self.packages_sel,
                 &lines.join("  •  "),
+                !self.filter_focused,
             );
             return;
         }
@@ -2055,6 +2059,7 @@ impl App {
             rows,
             &self.packages_sel,
             "No entries match the filter",
+            !self.filter_focused,
         );
     }
 
@@ -2773,6 +2778,53 @@ mod tests {
         app.command_output = vec!["--- install X ---".into(), "Found X".into()];
         app.updates_sel.marked.insert(0);
         app
+    }
+
+    #[test]
+    fn draw_table_focused_false_never_highlights_cursor_row() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let app = App::new();
+        let sel = Selection {
+            cursor: 0,
+            ..Default::default()
+        };
+        let rows = || vec![Row::new(vec!["a"]), Row::new(vec!["b"])];
+
+        let any_cell_highlighted = |focused: bool| {
+            let mut term = Terminal::new(TestBackend::new(20, 8)).unwrap();
+            term.draw(|f| {
+                let area = f.area();
+                app.draw_table(
+                    f,
+                    area,
+                    "T",
+                    2,
+                    Row::new(vec!["H"]),
+                    vec![Constraint::Percentage(100)],
+                    rows(),
+                    &sel,
+                    "empty",
+                    focused,
+                );
+            })
+            .unwrap();
+            let buf = term.backend().buffer();
+            (0..buf.area.width).any(|x| {
+                (0..buf.area.height)
+                    .any(|y| buf.cell((x, y)).is_some_and(|c| c.bg == theme::ACCENT))
+            })
+        };
+
+        assert!(
+            !any_cell_highlighted(false),
+            "focused=false must never show a cursor highlight"
+        );
+        assert!(
+            any_cell_highlighted(true),
+            "sanity check: focused=true does highlight the cursor row"
+        );
     }
 
     #[test]
