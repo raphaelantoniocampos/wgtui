@@ -19,6 +19,11 @@ agora exclusivamente winget (Chocolatey/Scoop foram descartados) e em Rust.
   aplicável (forçar `machine` fazia instalações falharem de cara em pacotes sem
   instalador de máquina). Se você quiser `--scope machine` explicitamente num pacote,
   isso pede Administrador; sem elevação a status bar mostra `not admin`.
+- O painel **System Updates** (aba Updates) usa o módulo PowerShell **PSWindowsUpdate**,
+  instalado automaticamente (por usuário, sem precisar de Administrador) na primeira vez
+  que você aperta `w`. Checar não precisa de Administrador; **instalar** (`W`) precisa —
+  sem elevação, a instalação falha e o erro aparece no painel de output, igual a qualquer
+  outro comando.
 
 ## Instalação
 
@@ -52,7 +57,8 @@ Cada push/PR roda `fmt` + `clippy -D warnings` + `cargo test` no CI. Um push de 
 
 | Aba | Conteúdo | Ações |
 |---|---|---|
-| **[1] Updates** | `winget upgrade` (lista) | `u` atualizar selecionado(s) · `U` atualizar todos · `Enter` detalhes |
+| **[1] Updates** — App Updates | `winget upgrade` (lista) | `u` atualizar selecionado(s) · `U` atualizar todos · `Enter` detalhes |
+| **[1] Updates** — System Updates | Windows Update (`Get-WindowsUpdate`) | `w` checar pendências · `W` instalar todas |
 | **[2] Search** | `winget search` | digite + `Enter` para buscar · `i` instalar · `Enter` detalhes |
 | **[3] Installed** | `winget list` | `u` atualizar · `r` remover · `R` recarregar · `Enter` detalhes |
 | **[4] Apps/Scripts** | manifesto JSON | `i` instalar/rodar selecionado(s) · `I` todos · `r`/`R` remover · `F` trocar de arquivo |
