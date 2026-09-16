@@ -7,9 +7,10 @@
 
         irm https://raw.githubusercontent.com/raphaelantoniocampos/wgtui/main/install.ps1 | iex
 
-    Coloca o wgtui.exe em %LOCALAPPDATA%\Programs\wgtui e adiciona essa pasta
-    ao PATH do usuário (sem precisar de Administrador). Rodar de novo atualiza
-    para a versão mais recente.
+    Coloca o wgtui.exe em %LOCALAPPDATA%\Programs\wgtui (com o manifesto de
+    exemplo em .\examples, para a aba Apps/Scripts já abrir com algo) e
+    adiciona essa pasta ao PATH do usuário (sem precisar de Administrador).
+    Rodar de novo atualiza para a versão mais recente.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -28,6 +29,18 @@ Invoke-WebRequest -Uri $downloadUrl -OutFile $exePath
 # Remove a marca "baixado da internet" (Zona 3) para não disparar o aviso do
 # SmartScreen ao rodar um binário sem assinatura digital.
 Unblock-File -Path $exePath
+
+# Manifesto de exemplo, opcional: wgtui procura por *.json em .\examples ao
+# lado do próprio exe, então isso já deixa a aba Apps/Scripts com conteúdo.
+# Falha aqui não é fatal — o wgtui funciona normalmente sem manifesto.
+try {
+    $examplesDir = Join-Path $installDir 'examples'
+    New-Item -ItemType Directory -Force -Path $examplesDir | Out-Null
+    $examplesUrl = "https://raw.githubusercontent.com/$repo/main/examples/packages.json"
+    Invoke-WebRequest -Uri $examplesUrl -OutFile (Join-Path $examplesDir 'packages.json')
+} catch {
+    Write-Warning "Não foi possível baixar o manifesto de exemplo (examples/packages.json): $_"
+}
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 $pathEntries = @()

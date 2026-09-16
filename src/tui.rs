@@ -58,6 +58,17 @@ fn detect_package_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Whether the Packages tab should open in file-picker mode for this many
+/// discovered manifest files.
+///
+/// Zero files means there is nothing to pick: the picker used to open
+/// anyway with an empty list, and since Up/Down/Enter are all no-ops on an
+/// empty list, no key could ever leave it — the whole tab hung. Zero (like
+/// one) instead goes straight to the tab's normal state (empty, or loaded).
+fn should_show_file_picker(file_count: usize) -> bool {
+    file_count > 1
+}
+
 /// Env var that surfaces the raw package-discovery diagnostic in the UI.
 const DEBUG_ENV: &str = "WGTUI_DEBUG";
 
@@ -458,21 +469,22 @@ impl App {
             package_files.extend(files);
         }
 
-        let (packages, packages_file_picker) = if package_files.len() == 1 {
+        let packages_file_picker = should_show_file_picker(package_files.len());
+        let packages = if package_files.len() == 1 {
             let pkgs = load_packages_from_file(&package_files[0]);
             diag.push_str(&format!(
                 "loaded {} pkgs from {}\n",
                 pkgs.len(),
                 package_files[0].display()
             ));
-            (pkgs, false)
+            pkgs
         } else {
             if package_files.is_empty() {
                 diag.push_str("no json files found\n");
             } else {
                 diag.push_str(&format!("{} files found, pick one\n", package_files.len()));
             }
-            (vec![], true)
+            vec![]
         };
 
         Self {
@@ -1150,6 +1162,9 @@ impl App {
         // File picker mode: pick a JSON file first
         if self.packages_file_picker {
             match key.code {
+                KeyCode::Esc => {
+                    self.packages_file_picker = false;
+                }
                 KeyCode::Up => {
                     if self.package_file_selected > 0 {
                         self.package_file_selected -= 1;
@@ -2385,6 +2400,21 @@ mod tests {
     }
 
     #[test]
+    fn should_show_file_picker_is_false_with_zero_or_one_files() {
+        // Zero manifest files means there's nothing to pick — the picker
+        // used to open anyway with an empty list, which no key (Up/Down/
+        // Enter) could ever escape: the Packages tab hung completely.
+        assert!(!should_show_file_picker(0));
+        assert!(!should_show_file_picker(1));
+    }
+
+    #[test]
+    fn should_show_file_picker_is_true_with_multiple_files() {
+        assert!(should_show_file_picker(2));
+        assert!(should_show_file_picker(5));
+    }
+
+    #[test]
     fn app_new_does_not_block_on_winget() {
         // `new()` must not shell out to winget: it returns immediately with
         // empty lists and the initial load still pending.
@@ -2648,6 +2678,28 @@ mod tests {
         assert_eq!(app.package_file_selected, 1);
         app.handle_key(ke(KeyCode::Char('k')));
         assert_eq!(app.package_file_selected, 0);
+    }
+
+    #[test]
+    fn esc_cancels_file_picker_even_with_no_files_to_pick() {
+        // Regression: with an empty `package_files`, Up/Down/Enter are all
+        // no-ops (nothing to move to, nothing to confirm), and every other
+        // key used to be swallowed too — the tab, and the whole app, hung
+        // with no way out. Esc must always close the picker.
+        let mut app = App::new();
+        app.tab = Tab::Packages;
+        app.packages_file_picker = true;
+        app.package_files = vec![];
+        app.filter_focused = false;
+
+        app.handle_key(ke(KeyCode::Enter));
+        assert!(
+            app.packages_file_picker,
+            "Enter with no files must not silently succeed"
+        );
+
+        app.handle_key(ke(KeyCode::Esc));
+        assert!(!app.packages_file_picker);
     }
 
     #[test]

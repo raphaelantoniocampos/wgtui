@@ -29,10 +29,12 @@ irm https://raw.githubusercontent.com/raphaelantoniocampos/wgtui/main/install.ps
 ```
 
 Baixa o `wgtui.exe` do [último release](https://github.com/raphaelantoniocampos/wgtui/releases/latest)
-para `%LOCALAPPDATA%\Programs\wgtui` e adiciona a pasta ao PATH do usuário (não precisa de
-Administrador). Rodar de novo a qualquer momento atualiza para a versão mais recente. Prefere
-conferir o script antes de rodar, ou baixar o `.exe` na mão? Veja [`install.ps1`](install.ps1)
-ou a [página de releases](https://github.com/raphaelantoniocampos/wgtui/releases).
+e o manifesto de exemplo ([`examples/packages.json`](examples/packages.json)) para
+`%LOCALAPPDATA%\Programs\wgtui`, e adiciona a pasta ao PATH do usuário (não precisa de
+Administrador) — a aba Apps/Scripts já abre com algo para explorar. Rodar de novo a qualquer
+momento atualiza para a versão mais recente. Prefere conferir o script antes de rodar, ou
+baixar o `.exe` na mão? Veja [`install.ps1`](install.ps1) ou a
+[página de releases](https://github.com/raphaelantoniocampos/wgtui/releases).
 
 ## Compilar e rodar
 
