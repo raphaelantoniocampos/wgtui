@@ -20,10 +20,9 @@ use ratatui::widgets::{
 };
 
 use wgtui::{
-    JsonPackage, PidSlot, UpgradablePackage, WindowsUpdateItem, WingetPackage,
-    find_package_json_files, is_installed, kill_process_tree, list_installed, list_upgradable,
-    load_packages_from_file, run_winget_stdout, search_packages, update_sources,
-    upgrade_all_packages,
+    JsonPackage, PidSlot, UpgradablePackage, WingetPackage, find_package_json_files, is_installed,
+    kill_process_tree, list_installed, list_upgradable, load_packages_from_file, run_winget_stdout,
+    search_packages, update_sources, upgrade_all_packages,
 };
 
 use crate::elevation::{elevation_warning, is_elevated};
@@ -209,8 +208,7 @@ impl Tab {
                 ("a", "all"),
                 ("u", "upgrade"),
                 ("U", "upgrade all"),
-                ("w", "check win update"),
-                ("W", "install win update"),
+                ("W", "install win updates"),
                 ("enter", "details"),
             ],
             Tab::Search => &[("enter", "search"), ("space", "mark"), ("i", "install")],
@@ -253,19 +251,6 @@ enum ActionResult {
     RefreshInstalled(Vec<WingetPackage>),
     OutputLine(String),
     CommandDone,
-    WindowsUpdateChecked(Result<Vec<WindowsUpdateItem>, String>),
-}
-
-/// State of the System Updates panel. A single enum instead of loose flags:
-/// it's the only source of truth for that panel's empty-state text, and
-/// (deliberately) has no coupling to `initial_load_pending` — checking is
-/// on-demand (`w`), never automatic at startup like the app-updates list.
-#[derive(Debug, Clone, PartialEq)]
-enum WindowsUpdateState {
-    NeverChecked,
-    Checking,
-    Checked(Vec<WindowsUpdateItem>),
-    Error(String),
 }
 
 /// An action the user triggered while something else was already running.
@@ -284,7 +269,6 @@ enum QueuedAction {
     RefreshInstalled,
     ManualCommand(String),
     Search(String),
-    CheckWindowsUpdates,
     InstallWindowsUpdates,
 }
 
@@ -314,7 +298,6 @@ impl QueuedAction {
             QueuedAction::RefreshInstalled => "refresh installed list".to_string(),
             QueuedAction::ManualCommand(line) => line.clone(),
             QueuedAction::Search(query) => format!("search \"{query}\""),
-            QueuedAction::CheckWindowsUpdates => "check Windows Update".to_string(),
             QueuedAction::InstallWindowsUpdates => "install Windows Update".to_string(),
         }
     }
@@ -462,8 +445,6 @@ pub struct App {
     /// Whether wgtui runs elevated. Assumed true until the startup check says
     /// otherwise, so no warning flashes on launch.
     elevated: bool,
-    /// State of the System Updates (Windows Update) panel.
-    windows_update_state: WindowsUpdateState,
     /// Cycles 0..3 for the spinner animation.
     pub spinner_frame: u8,
     /// Sender for background thread results.
@@ -537,7 +518,6 @@ impl App {
             queue_sel: Selection::default(),
             initial_load_pending: 2,
             elevated: true,
-            windows_update_state: WindowsUpdateState::NeverChecked,
             spinner_frame: 0,
             action_tx: tx,
             action_rx: rx,
@@ -655,12 +635,6 @@ impl App {
             ActionResult::CommandDone => {
                 self.busy = false;
                 self.running_job = None;
-            }
-            ActionResult::WindowsUpdateChecked(result) => {
-                self.windows_update_state = match result {
-                    Ok(items) => WindowsUpdateState::Checked(items),
-                    Err(e) => WindowsUpdateState::Error(e),
-                };
             }
         }
     }
@@ -863,7 +837,6 @@ impl App {
             QueuedAction::RefreshInstalled => self.refresh_installed(),
             QueuedAction::ManualCommand(line) => self.run_manual_command(line),
             QueuedAction::Search(query) => self.run_search(query),
-            QueuedAction::CheckWindowsUpdates => self.check_windows_updates(),
             QueuedAction::InstallWindowsUpdates => self.install_windows_updates(),
         }
     }
@@ -1150,9 +1123,6 @@ impl App {
             KeyCode::Char('U') => {
                 self.dispatch(QueuedAction::UpgradeAll);
             }
-            KeyCode::Char('w') => {
-                self.dispatch(QueuedAction::CheckWindowsUpdates);
-            }
             KeyCode::Char('W') => {
                 self.dispatch(QueuedAction::InstallWindowsUpdates);
             }
@@ -1425,50 +1395,14 @@ impl App {
         });
     }
 
-    /// Lists pending Windows updates via PSWindowsUpdate. Deliberately does
-    /// not set `last_command`: the `[c]` editor's `parse_command_line` only
+    /// Installs every pending Windows update. Deliberately does not set
+    /// `last_command`: the `[c]` editor's `parse_command_line` only
     /// understands double-quote grouping and would mangle this PowerShell
     /// one-liner's semicolons/single quotes if re-run through it — leaving
     /// `[c]` showing the last *winget* command is correct, not an oversight.
     /// The literal command still streams into the output panel below (same
     /// as `bootstrap.rs`'s `run_powershell_bootstrap`), so it's visible —
     /// just not blindly re-runnable through a parser that can't handle it.
-    fn check_windows_updates(&mut self) {
-        let tx = self.action_tx.clone();
-        self.command_output.clear();
-        self.output_scroll = usize::MAX;
-        self.current_command = Some("Windows Update check".to_string());
-        self.windows_update_state = WindowsUpdateState::Checking;
-        let (pid_slot, _cancel) = self.begin_job();
-        thread::spawn(move || {
-            let json_path = wgtui::windows_update_json_path();
-            let script = wgtui::windows_update_check_script(&json_path);
-            let _ = tx.send(ActionResult::OutputLine(format!(
-                "> powershell -NoProfile -ExecutionPolicy Bypass -Command \"{script}\""
-            )));
-            let tx2 = tx.clone();
-            let (string_tx, string_rx) = mpsc::channel::<String>();
-            thread::spawn(move || {
-                while let Ok(line) = string_rx.recv() {
-                    let _ = tx2.send(ActionResult::OutputLine(line));
-                }
-            });
-            let args = [
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                &script,
-            ];
-            let _ = wgtui::run_command_stdout("powershell", &args, string_tx, Some(&pid_slot));
-            let checked = wgtui::read_windows_update_result(&json_path);
-            let _ = tx.send(ActionResult::WindowsUpdateChecked(checked));
-            let _ = tx.send(ActionResult::CommandDone);
-        });
-    }
-
-    /// Installs every pending Windows update. See `check_windows_updates` for
-    /// why `last_command` is deliberately left untouched.
     fn install_windows_updates(&mut self) {
         let tx = self.action_tx.clone();
         self.command_output.clear();
@@ -1908,8 +1842,8 @@ impl App {
         table_rows: Vec<Row<'static>>,
         sel: &Selection,
         empty: &str,
-        focused: bool,
     ) {
+        let focused = !self.filter_focused;
         let shown = table_rows.len();
         let count = if total == shown {
             format!(" {total} ")
@@ -2013,18 +1947,10 @@ impl App {
             rows,
             &self.search_sel,
             "Type a query above and press Enter to search winget",
-            !self.filter_focused,
         );
     }
 
     fn render_updates(&self, f: &mut Frame<'_>, area: Rect) {
-        let panels = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(area);
-        self.render_app_updates(f, panels[0]);
-        self.render_system_updates(f, panels[1]);
-    }
-
-    fn render_app_updates(&self, f: &mut Frame<'_>, area: Rect) {
         let filtered = self.filtered_updates();
         let rows: Vec<Row> = filtered
             .iter()
@@ -2050,7 +1976,7 @@ impl App {
         self.draw_table(
             f,
             area,
-            "App Updates",
+            "Updates",
             self.updates.len(),
             Row::new(vec!["", "NAME", "CURRENT", "", "AVAILABLE"]),
             vec![
@@ -2063,65 +1989,6 @@ impl App {
             rows,
             &self.updates_sel,
             empty,
-            !self.filter_focused,
-        );
-    }
-
-    /// Read-only: the only action is always "install everything pending"
-    /// (mirrors the `-AcceptAll` install script), so there's no per-row
-    /// selection here and `focused` is always `false` — nothing to
-    /// navigate to, so no cursor highlight.
-    fn render_system_updates(&self, f: &mut Frame<'_>, area: Rect) {
-        let (rows, empty): (Vec<Row>, &str) = match &self.windows_update_state {
-            WindowsUpdateState::NeverChecked => (
-                vec![],
-                if self.elevated {
-                    "Press w to check for Windows updates"
-                } else {
-                    "Press w to check (needs Administrator)"
-                },
-            ),
-            WindowsUpdateState::Checking => (vec![], "Checking…"),
-            WindowsUpdateState::Checked(items) if items.is_empty() => {
-                (vec![], "System is up to date")
-            }
-            WindowsUpdateState::Checked(items) => (
-                items
-                    .iter()
-                    .map(|u| {
-                        Row::new(vec![
-                            Cell::from(Span::styled(
-                                u.kb.clone().unwrap_or_default(),
-                                theme::dim(),
-                            )),
-                            Cell::from(u.title.clone().unwrap_or_default()),
-                            Cell::from(Span::styled(
-                                u.size.clone().unwrap_or_default(),
-                                theme::dim(),
-                            )),
-                        ])
-                    })
-                    .collect(),
-                "",
-            ),
-            WindowsUpdateState::Error(e) => (vec![], e.as_str()),
-        };
-        let total = rows.len();
-        self.draw_table(
-            f,
-            area,
-            "System Updates",
-            total,
-            Row::new(vec!["KB", "TITLE", "SIZE"]),
-            vec![
-                Constraint::Length(12),
-                Constraint::Percentage(70),
-                Constraint::Length(10),
-            ],
-            rows,
-            &Selection::default(),
-            empty,
-            false,
         );
     }
 
@@ -2162,7 +2029,6 @@ impl App {
             rows,
             &self.installed_sel,
             empty,
-            !self.filter_focused,
         );
     }
 
@@ -2184,7 +2050,6 @@ impl App {
                 Vec::new(),
                 &self.packages_sel,
                 &lines.join("  •  "),
-                !self.filter_focused,
             );
             return;
         }
@@ -2235,7 +2100,6 @@ impl App {
             rows,
             &self.packages_sel,
             "No entries match the filter",
-            !self.filter_focused,
         );
     }
 
@@ -2957,53 +2821,6 @@ mod tests {
     }
 
     #[test]
-    fn draw_table_focused_false_never_highlights_cursor_row() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let app = App::new();
-        let sel = Selection {
-            cursor: 0,
-            ..Default::default()
-        };
-        let rows = || vec![Row::new(vec!["a"]), Row::new(vec!["b"])];
-
-        let any_cell_highlighted = |focused: bool| {
-            let mut term = Terminal::new(TestBackend::new(20, 8)).unwrap();
-            term.draw(|f| {
-                let area = f.area();
-                app.draw_table(
-                    f,
-                    area,
-                    "T",
-                    2,
-                    Row::new(vec!["H"]),
-                    vec![Constraint::Percentage(100)],
-                    rows(),
-                    &sel,
-                    "empty",
-                    focused,
-                );
-            })
-            .unwrap();
-            let buf = term.backend().buffer();
-            (0..buf.area.width).any(|x| {
-                (0..buf.area.height)
-                    .any(|y| buf.cell((x, y)).is_some_and(|c| c.bg == theme::ACCENT))
-            })
-        };
-
-        assert!(
-            !any_cell_highlighted(false),
-            "focused=false must never show a cursor highlight"
-        );
-        assert!(
-            any_cell_highlighted(true),
-            "sanity check: focused=true does highlight the cursor row"
-        );
-    }
-
-    #[test]
     fn renders_every_tab_without_panicking() {
         for tab in Tab::ALL {
             let mut app = populated();
@@ -3314,20 +3131,14 @@ mod tests {
     }
 
     #[test]
-    fn w_dispatches_check_windows_updates_and_capital_w_dispatches_install() {
+    fn capital_w_dispatches_install_windows_updates() {
         // Must go through dispatch()'s queueing path, never start_action()'s
         // real one: this action spawns powershell.exe and, on first use,
         // would try to install PSWindowsUpdate over the network. busy=true
-        // forces every dispatch in this test to enqueue instead of run.
+        // forces the dispatch in this test to enqueue instead of run.
         let mut app = App::new();
         app.tab = Tab::Updates;
         app.busy = true;
-
-        app.handle_key(ke(KeyCode::Char('w')));
-        assert!(matches!(
-            app.queue.back(),
-            Some(QueuedAction::CheckWindowsUpdates)
-        ));
 
         app.handle_key(ke(KeyCode::Char('W')));
         assert!(matches!(
@@ -3337,80 +3148,10 @@ mod tests {
     }
 
     #[test]
-    fn windows_update_action_labels() {
-        assert_eq!(
-            QueuedAction::CheckWindowsUpdates.label(),
-            "check Windows Update"
-        );
+    fn install_windows_updates_action_label() {
         assert_eq!(
             QueuedAction::InstallWindowsUpdates.label(),
             "install Windows Update"
-        );
-    }
-
-    #[test]
-    fn renders_system_updates_panel_in_every_state_without_panicking() {
-        let states = [
-            WindowsUpdateState::NeverChecked,
-            WindowsUpdateState::Checking,
-            WindowsUpdateState::Checked(vec![]),
-            WindowsUpdateState::Checked(vec![WindowsUpdateItem {
-                kb: Some("KB5000001".into()),
-                title: Some("2026-09 Cumulative Update".into()),
-                size: Some("450 MB".into()),
-            }]),
-            WindowsUpdateState::Error("boom".into()),
-        ];
-        for state in states {
-            let mut app = populated();
-            app.tab = Tab::Updates;
-            app.windows_update_state = state;
-            draw(&app, 110, 32);
-            draw(&app, 40, 10);
-            draw(&app, 8, 4);
-        }
-    }
-
-    #[test]
-    fn system_updates_panel_shows_title_and_rows_when_checked() {
-        let mut app = populated();
-        app.tab = Tab::Updates;
-        app.windows_update_state = WindowsUpdateState::Checked(vec![WindowsUpdateItem {
-            kb: Some("KB5000001".into()),
-            title: Some("2026-09 Cumulative Update".into()),
-            size: Some("450 MB".into()),
-        }]);
-
-        let text = draw_text(&app, 200, 32);
-        assert!(text.contains("System Updates"), "missing title:\n{text}");
-        assert!(text.contains("KB5000001"), "missing KB:\n{text}");
-        assert!(
-            text.contains("Cumulative Update"),
-            "missing title text:\n{text}"
-        );
-    }
-
-    #[test]
-    fn system_updates_never_checked_hint_mentions_admin_when_not_elevated() {
-        // Found in real testing: Get-WindowsUpdate needs Administrator even
-        // just to check (not only to install), confirmed live against a
-        // real machine. The app already knows self.elevated before the user
-        // ever presses w, so the hint should say so up front rather than
-        // let them find out only after a failed attempt.
-        let mut app = populated();
-        app.tab = Tab::Updates;
-        app.windows_update_state = WindowsUpdateState::NeverChecked;
-
-        app.elevated = true;
-        let elevated_text = draw_text(&app, 200, 32);
-        assert!(elevated_text.contains("Press w to check"));
-        assert!(!elevated_text.contains("Administrator"));
-
-        app.elevated = false;
-        let not_elevated_text = draw_text(&app, 200, 32);
-        assert!(
-            not_elevated_text.contains("Administrator"),
-            "must hint that checking needs Administrator when not elevated:\n{not_elevated_text}"
         );
     }
 }

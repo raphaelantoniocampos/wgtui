@@ -19,13 +19,12 @@ agora exclusivamente winget (Chocolatey/Scoop foram descartados) e em Rust.
   aplicável (forçar `machine` fazia instalações falharem de cara em pacotes sem
   instalador de máquina). Se você quiser `--scope machine` explicitamente num pacote,
   isso pede Administrador; sem elevação a status bar mostra `not admin`.
-- O painel **System Updates** (aba Updates) usa o módulo PowerShell **PSWindowsUpdate**,
-  instalado automaticamente (por usuário, sem precisar de Administrador) na primeira vez
-  que você aperta `w`. **Tanto checar (`w`) quanto instalar (`W`) precisam de Administrador**
-  — não é uma escolha do wgtui, é o próprio `Get-WindowsUpdate` que exige processo elevado
-  mesmo só pra listar. Sem elevação, o wgtui já mostra isso no próprio painel antes de você
-  apertar `w`; se tentar mesmo assim, o erro aparece no painel de output, igual a qualquer
-  outro comando.
+- **`W`, na aba Updates, instala as atualizações do Windows** (`winget upgrade` continua
+  cuidando só dos apps) via o módulo PowerShell **PSWindowsUpdate**, instalado
+  automaticamente (por usuário, sem precisar de Administrador) na primeira vez que você
+  aperta `W`. A instalação em si **precisa de Administrador** — não é uma escolha do
+  wgtui, é o próprio `Get-WindowsUpdate` que exige processo elevado; sem elevação o erro
+  aparece no painel de output, igual a qualquer outro comando.
 
 ## Instalação
 
@@ -59,8 +58,7 @@ Cada push/PR roda `fmt` + `clippy -D warnings` + `cargo test` no CI. Um push de 
 
 | Aba | Conteúdo | Ações |
 |---|---|---|
-| **[1] Updates** — App Updates | `winget upgrade` (lista) | `u` atualizar selecionado(s) · `U` atualizar todos · `Enter` detalhes |
-| **[1] Updates** — System Updates | Windows Update (`Get-WindowsUpdate`) | `w` checar pendências · `W` instalar todas |
+| **[1] Updates** | `winget upgrade` (lista) | `u` atualizar selecionado(s) · `U` atualizar todos · `W` instalar atualizações do Windows · `Enter` detalhes |
 | **[2] Search** | `winget search` | digite + `Enter` para buscar · `i` instalar · `Enter` detalhes |
 | **[3] Installed** | `winget list` | `u` atualizar · `r` remover · `R` recarregar · `Enter` detalhes |
 | **[4] Apps/Scripts** | manifesto JSON | `i` instalar/rodar selecionado(s) · `I` todos · `r`/`R` remover · `F` trocar de arquivo |
