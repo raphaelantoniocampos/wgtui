@@ -1948,7 +1948,7 @@ impl App {
                     .border_type(BorderType::Rounded)
                     .border_style(theme::border(false))
                     .title(Span::styled(
-                        " wgtui ",
+                        concat!(" wgtui v", env!("CARGO_PKG_VERSION"), " "),
                         Style::default()
                             .fg(theme::ACCENT)
                             .add_modifier(Modifier::BOLD),
@@ -3533,6 +3533,20 @@ mod tests {
         assert!(text.contains("v9.9.9"), "{text}");
         assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
         assert!(text.contains("[y]") && text.contains("[n]"), "{text}");
+    }
+
+    #[test]
+    fn title_bar_shows_the_running_version_on_every_tab() {
+        let expected = format!("wgtui v{}", env!("CARGO_PKG_VERSION"));
+        for tab in Tab::ALL {
+            let mut app = populated();
+            app.tab = tab;
+            let text = draw_text(&app, 100, 30);
+            assert!(
+                text.contains(&expected),
+                "missing {expected:?} on {tab:?}:\n{text}"
+            );
+        }
     }
 
     #[test]
