@@ -83,7 +83,7 @@ Na coluna à esquerda: `●` = marcado · `✓` = já instalado · `▶` = scrip
 
 **`c` — editar comando:** abre o painel Command com o último comando winget executado,
 para você ajustar e rodar à mão (ex.: acrescentar `--all-versions` ou `--version X` quando
-o winget reclama de múltiplas versões instaladas). `Enter` roda, `Esc` cancela.
+o winget reclama de múltiplas versões instaladas). Edite onde quiser: `←`/`→` movem o cursor, `Home`/`End` vão para as pontas, `Backspace`/`Delete` apagam antes/sob o cursor. `Enter` roda, `Esc` cancela.
 
 **A UI nunca trava.** Você pode navegar, filtrar e disparar outras ações enquanto um
 comando roda — só um comando executa por vez, então uma segunda ação (instalar, atualizar,

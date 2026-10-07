@@ -438,6 +438,10 @@ pub struct App {
     last_command: Option<String>,
     /// `Some` while the manual-command editor (`[c]`) is open.
     command_input: Option<String>,
+    /// Cursor position inside `command_input`, as a *character* index (not a
+    /// byte offset). Always clamped to the buffer's length where it's used,
+    /// so a stale value can never slice mid-character.
+    command_cursor: usize,
     /// Output lines from the last command (shown in the output panel).
     pub command_output: Vec<String>,
     /// Scroll offset for terminal output (usize::MAX = auto-scroll to bottom).
@@ -535,6 +539,7 @@ impl App {
             current_command: None,
             last_command: None,
             command_input: None,
+            command_cursor: 0,
             command_output: vec![],
             output_scroll: usize::MAX,
             busy: false,
@@ -696,6 +701,53 @@ impl App {
         if self.update_prompt_pending && self.command_input.is_none() && !self.filter_focused {
             self.update_prompt_pending = false;
             self.update_prompt_open = true;
+        }
+    }
+
+    /// Keys while the `[c]` command editor is open: typing and Backspace/Delete
+    /// act at the cursor; Left/Right/Home/End move it. Enter runs the line
+    /// (dispatch: now if idle, queued otherwise), Esc cancels.
+    fn handle_command_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.command_input = None;
+                return;
+            }
+            KeyCode::Enter => {
+                if let Some(line) = self.command_input.take() {
+                    self.dispatch(QueuedAction::ManualCommand(line));
+                }
+                return;
+            }
+            _ => {}
+        }
+        let Some(buf) = self.command_input.as_mut() else {
+            return;
+        };
+        let len = buf.chars().count();
+        let cur = self.command_cursor.min(len);
+        let byte = |ci: usize| buf.char_indices().nth(ci).map_or(buf.len(), |(b, _)| b);
+        match key.code {
+            KeyCode::Char(c) => {
+                let at = byte(cur);
+                buf.insert(at, c);
+                self.command_cursor = cur + 1;
+            }
+            KeyCode::Backspace if cur > 0 => {
+                let at = byte(cur - 1);
+                buf.remove(at);
+                self.command_cursor = cur - 1;
+            }
+            KeyCode::Delete if cur < len => {
+                let at = byte(cur);
+                buf.remove(at);
+                self.command_cursor = cur;
+            }
+            KeyCode::Left => self.command_cursor = cur.saturating_sub(1),
+            KeyCode::Right => self.command_cursor = (cur + 1).min(len),
+            KeyCode::Home => self.command_cursor = 0,
+            KeyCode::End => self.command_cursor = len,
+            _ => self.command_cursor = cur,
         }
     }
 
@@ -1040,25 +1092,7 @@ impl App {
         // dispatches — runs now if idle, enqueues silently if something else
         // is already running.
         if self.command_input.is_some() {
-            match key.code {
-                KeyCode::Esc => self.command_input = None,
-                KeyCode::Enter => {
-                    if let Some(line) = self.command_input.take() {
-                        self.dispatch(QueuedAction::ManualCommand(line));
-                    }
-                }
-                KeyCode::Char(c) => {
-                    if let Some(buf) = self.command_input.as_mut() {
-                        buf.push(c);
-                    }
-                }
-                KeyCode::Backspace => {
-                    if let Some(buf) = self.command_input.as_mut() {
-                        buf.pop();
-                    }
-                }
-                _ => {}
-            }
+            self.handle_command_key(key);
             return;
         }
 
@@ -1154,11 +1188,12 @@ impl App {
                 self.toggle_select_all();
             }
             KeyCode::Char('c') => {
-                self.command_input = Some(
-                    self.last_command
-                        .clone()
-                        .unwrap_or_else(|| "winget ".to_string()),
-                );
+                let seed = self
+                    .last_command
+                    .clone()
+                    .unwrap_or_else(|| "winget ".to_string());
+                self.command_cursor = seed.chars().count();
+                self.command_input = Some(seed);
             }
             KeyCode::Char('q') if !self.queue.is_empty() || self.running_job.is_some() => {
                 self.queue_focused = true;
@@ -2436,6 +2471,12 @@ impl App {
         let busy = self.busy || self.initial_load_pending > 0;
 
         let title = if let Some(input) = &self.command_input {
+            // Split at the cursor; the char under it (or a trailing space at
+            // the end) is drawn reversed so it reads as a block cursor.
+            let text = Style::default().add_modifier(Modifier::BOLD);
+            let cur = self.command_cursor.min(input.chars().count());
+            let mut rest = input.chars().skip(cur);
+            let at_cursor = rest.next().map_or(" ".to_string(), String::from);
             Line::from(vec![
                 Span::styled(
                     " edit ",
@@ -2445,8 +2486,10 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::styled(input.clone(), Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled("▏ ", Style::default().fg(theme::WARN)),
+                Span::styled(input.chars().take(cur).collect::<String>(), text),
+                Span::styled(at_cursor, text.add_modifier(Modifier::REVERSED)),
+                Span::styled(rest.collect::<String>(), text),
+                Span::raw(" "),
             ])
         } else {
             let icon = if busy {
@@ -2469,7 +2512,7 @@ impl App {
 
         let border_col = if editing { theme::WARN } else { theme::MUTED };
         let hint = if editing {
-            " enter run · esc cancel "
+            " ←→ move · del · enter run · esc cancel "
         } else {
             " output "
         };
@@ -2882,7 +2925,7 @@ mod tests {
     #[test]
     fn command_editor_typing_backspace_and_cancel() {
         let mut app = App::new();
-        app.command_input = Some("winget ".into());
+        app.handle_key(ke(KeyCode::Char('c'))); // seeds "winget ", cursor at the end
         for c in "list".chars() {
             app.handle_key(ke(KeyCode::Char(c)));
         }
@@ -2891,6 +2934,155 @@ mod tests {
         assert_eq!(app.command_input.as_deref(), Some("winget lis"));
         app.handle_key(ke(KeyCode::Esc));
         assert!(app.command_input.is_none());
+    }
+
+    /// Opens the `[c]` editor seeded with `line`, cursor at the end (exactly
+    /// what pressing `c` after running `line` does).
+    fn editor_with(line: &str) -> App {
+        let mut app = App::new();
+        app.last_command = Some(line.to_string());
+        app.handle_key(ke(KeyCode::Char('c')));
+        assert_eq!(app.command_input.as_deref(), Some(line));
+        app
+    }
+
+    fn press(app: &mut App, keys: &[KeyCode]) {
+        for k in keys {
+            app.handle_key(ke(*k));
+        }
+    }
+
+    #[test]
+    fn command_editor_left_arrow_inserts_in_the_middle() {
+        // The reported problem: fixing an id in the middle of a command meant
+        // backspacing everything after it and retyping.
+        let mut app = editor_with("winget upgrade Foo.Bar --silent");
+        press(&mut app, &[KeyCode::Left; 9]); // back over " --silent"
+        press(&mut app, &[KeyCode::Char('X')]);
+        assert_eq!(
+            app.command_input.as_deref(),
+            Some("winget upgrade Foo.BarX --silent")
+        );
+    }
+
+    #[test]
+    fn command_editor_backspace_deletes_before_the_cursor() {
+        let mut app = editor_with("winget list");
+        press(&mut app, &[KeyCode::Left; 5]);
+        press(&mut app, &[KeyCode::Backspace]);
+        assert_eq!(app.command_input.as_deref(), Some("winge list"));
+        press(&mut app, &[KeyCode::Char('t')]);
+        assert_eq!(app.command_input.as_deref(), Some("winget list"));
+    }
+
+    #[test]
+    fn command_editor_delete_removes_the_char_under_the_cursor() {
+        let mut app = editor_with("winget list");
+        press(&mut app, &[KeyCode::Home, KeyCode::Delete, KeyCode::Delete]);
+        assert_eq!(app.command_input.as_deref(), Some("nget list"));
+        press(&mut app, &[KeyCode::End, KeyCode::Delete]);
+        assert_eq!(
+            app.command_input.as_deref(),
+            Some("nget list"),
+            "Delete at the end is a no-op"
+        );
+    }
+
+    #[test]
+    fn command_editor_home_and_end_jump_to_the_edges() {
+        let mut app = editor_with("list");
+        press(&mut app, &[KeyCode::Home, KeyCode::Char('>')]);
+        assert_eq!(app.command_input.as_deref(), Some(">list"));
+        press(&mut app, &[KeyCode::End, KeyCode::Char('<')]);
+        assert_eq!(app.command_input.as_deref(), Some(">list<"));
+    }
+
+    #[test]
+    fn command_editor_cursor_stops_at_both_ends() {
+        let mut app = editor_with("ab");
+        press(&mut app, &[KeyCode::Right; 5]);
+        press(&mut app, &[KeyCode::Char('c')]);
+        assert_eq!(app.command_input.as_deref(), Some("abc"));
+
+        press(&mut app, &[KeyCode::Left; 9]);
+        press(&mut app, &[KeyCode::Backspace]); // nothing before the cursor
+        press(&mut app, &[KeyCode::Char('_')]);
+        assert_eq!(app.command_input.as_deref(), Some("_abc"));
+    }
+
+    #[test]
+    fn command_editor_handles_multibyte_characters() {
+        // The cursor counts characters, not bytes: slicing a String mid-char
+        // would panic.
+        let mut app = editor_with("list é");
+        press(&mut app, &[KeyCode::Left, KeyCode::Delete]);
+        assert_eq!(app.command_input.as_deref(), Some("list "));
+        press(&mut app, &[KeyCode::Char('ã'), KeyCode::Char('ç')]);
+        assert_eq!(app.command_input.as_deref(), Some("list ãç"));
+        press(&mut app, &[KeyCode::Left, KeyCode::Backspace]);
+        assert_eq!(app.command_input.as_deref(), Some("list ç"));
+        press(&mut app, &[KeyCode::Home, KeyCode::Delete]);
+        assert_eq!(app.command_input.as_deref(), Some("ist ç"));
+        press(
+            &mut app,
+            &[KeyCode::End, KeyCode::Backspace, KeyCode::Backspace],
+        );
+        assert_eq!(app.command_input.as_deref(), Some("ist"));
+    }
+
+    #[test]
+    fn command_editor_enter_runs_the_edited_line() {
+        let mut app = editor_with("winget upgrade Foo.Bar");
+        app.busy = true; // enqueue instead of spawning a real winget
+        press(&mut app, &[KeyCode::Home, KeyCode::Delete]);
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(app.command_input.is_none());
+        match app.queue.back() {
+            Some(QueuedAction::ManualCommand(line)) => {
+                assert_eq!(line, "inget upgrade Foo.Bar");
+            }
+            _ => panic!("edited line should be queued"),
+        }
+    }
+
+    #[test]
+    fn command_editor_reopens_with_the_cursor_at_the_end() {
+        let mut app = editor_with("winget list");
+        press(&mut app, &[KeyCode::Home, KeyCode::Esc]);
+        press(&mut app, &[KeyCode::Char('c')]);
+        press(&mut app, &[KeyCode::Char('!')]);
+        assert_eq!(app.command_input.as_deref(), Some("winget list!"));
+    }
+
+    /// Column of the highlighted cursor cell in the rendered frame.
+    fn cursor_column(app: &App) -> u16 {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer();
+        let hits: Vec<u16> = (0..buf.area.width)
+            .flat_map(|x| (0..buf.area.height).map(move |y| (x, y)))
+            .filter(|&(x, y)| {
+                buf.cell((x, y))
+                    .is_some_and(|c| c.modifier.contains(Modifier::REVERSED))
+            })
+            .map(|(x, _)| x)
+            .collect();
+        assert_eq!(hits.len(), 1, "exactly one cursor cell, got {hits:?}");
+        hits[0]
+    }
+
+    #[test]
+    fn command_editor_draws_the_cursor_where_it_is() {
+        let mut app = editor_with("winget list");
+        let at_end = cursor_column(&app);
+        press(&mut app, &[KeyCode::Left]);
+        assert_eq!(cursor_column(&app), at_end - 1);
+        press(&mut app, &[KeyCode::Home]);
+        assert_eq!(cursor_column(&app), at_end - "winget list".len() as u16);
+        assert!(draw_text(&app, 100, 30).contains("winget list"));
     }
 
     #[test]
