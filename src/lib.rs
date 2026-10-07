@@ -506,7 +506,6 @@ impl JsonPackage {
     pub fn install_args(&self) -> Vec<String> {
         let mut a: Vec<String> = [
             "install",
-            "--exact",
             &self.id,
             "--silent",
             "--accept-package-agreements",
@@ -819,7 +818,7 @@ Google Chrome         Google.Chrome         134.0.6998.165    winget
         // Manually-installed apps winget can't match to a source often show
         // a blank Id column. Reported bug: the old whitespace-splitting
         // parser then shifted the Version string into the Id field, so
-        // upgrade/remove/show sent that version string as `--exact <id>`.
+        // upgrade/remove/show sent that version string as the package id.
         let sample = "\
 Name                  ID                    Version           Source
 -------------------------------------------------------------------
@@ -1055,7 +1054,11 @@ Weird Local App                             1.0        2.0
         let pkg = &load_packages_from_file(&path)[0];
         let args = pkg.install_args();
         let pair = |a: &str, b: &str| args.windows(2).any(|w| w[0] == a && w[1] == b);
-        assert!(args.starts_with(&["install".to_string(), "--exact".to_string()]));
+        assert!(args.starts_with(&[
+            "install".to_string(),
+            "Oracle.JavaRuntimeEnvironment".to_string()
+        ]));
+        assert!(!args.contains(&"--exact".to_string()));
         assert!(pair("--scope", "user"));
         assert!(pair("--locale", "pt-BR"));
         assert!(pair("-a", "x86"));
@@ -1067,8 +1070,8 @@ Weird Local App                             1.0        2.0
         // No `scope`/`locale` in the manifest -> let winget pick whatever
         // installer is actually applicable, instead of forcing --scope
         // machine (which fails outright for packages with no machine-scope
-        // installer — reported as "winget install --exact ... --scope
-        // machine ... not working, plain `winget install id --force` does").
+        // installer — reported as "winget install ... --scope machine ...
+        // not working, plain `winget install id --force` does").
         let pkg = JsonPackage {
             id: "Google.Chrome".to_string(),
             name: "Google Chrome".to_string(),

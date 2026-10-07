@@ -15,7 +15,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Cell, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    Block, BorderType, Cell, Clear, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation,
     ScrollbarState, Table, TableState, Tabs,
 };
 
@@ -26,6 +26,7 @@ use wgtui::{
 };
 
 use crate::elevation::{elevation_warning, is_elevated};
+use crate::update;
 
 /// Returns the directories to search for manifest JSON files, in priority order.
 ///
@@ -251,6 +252,21 @@ enum ActionResult {
     RefreshInstalled(Vec<WingetPackage>),
     OutputLine(String),
     CommandDone,
+    /// The startup check found a release newer than this build (its tag).
+    UpdateAvailable(String),
+    /// A self-update finished: `Ok(tag)` once the new exe is in place.
+    UpdateFinished(Result<String, String>),
+}
+
+/// Where the self-update flow is. Independent of the job queue: checking and
+/// downloading happen on their own threads and never occupy `busy`.
+#[derive(Debug, Clone, PartialEq)]
+enum UpdateState {
+    Idle,
+    Available(String),
+    Downloading(String),
+    Ready(String),
+    Failed(String),
 }
 
 /// An action the user triggered while something else was already running.
@@ -445,6 +461,16 @@ pub struct App {
     /// Whether wgtui runs elevated. Assumed true until the startup check says
     /// otherwise, so no warning flashes on launch.
     elevated: bool,
+    /// Self-update flow state (see [`UpdateState`]).
+    update: UpdateState,
+    /// The update prompt is on screen and capturing keys.
+    update_prompt_open: bool,
+    /// The prompt has something new to say but hasn't opened yet — it waits
+    /// for the user to stop typing so a stray `y`/`n` is never an answer.
+    update_prompt_pending: bool,
+    /// Downloads and installs a release by tag. A field so tests can stub it
+    /// instead of hitting the network and replacing the real exe.
+    update_installer: fn(&str) -> Result<(), String>,
     /// Cycles 0..3 for the spinner animation.
     pub spinner_frame: u8,
     /// Sender for background thread results.
@@ -518,6 +544,10 @@ impl App {
             queue_sel: Selection::default(),
             initial_load_pending: 2,
             elevated: true,
+            update: UpdateState::Idle,
+            update_prompt_open: false,
+            update_prompt_pending: false,
+            update_installer: update::download_and_install,
             spinner_frame: 0,
             action_tx: tx,
             action_rx: rx,
@@ -548,6 +578,13 @@ impl App {
                 let _ = tx.send(ActionResult::UpgradeList(list_upgradable()));
             }
         });
+        let tx = self.action_tx.clone();
+        thread::spawn(move || {
+            update::cleanup_old_executable();
+            if let Some(tag) = update::available_update() {
+                let _ = tx.send(ActionResult::UpdateAvailable(tag));
+            }
+        });
     }
 
     /// Run the main event loop.
@@ -575,6 +612,7 @@ impl App {
                 }
             }
             self.advance_queue();
+            self.maybe_open_update_prompt();
 
             // Advance spinner and poll keyboard
             if self.busy || self.initial_load_pending > 0 {
@@ -636,7 +674,75 @@ impl App {
                 self.busy = false;
                 self.running_job = None;
             }
+            ActionResult::UpdateAvailable(tag) => {
+                if self.update == UpdateState::Idle {
+                    self.update = UpdateState::Available(tag);
+                    self.update_prompt_pending = true;
+                }
+            }
+            ActionResult::UpdateFinished(result) => {
+                self.update = match result {
+                    Ok(tag) => UpdateState::Ready(tag),
+                    Err(e) => UpdateState::Failed(e),
+                };
+                self.update_prompt_pending = true;
+            }
         }
+    }
+
+    /// Opens the update prompt once it has something to say and the user
+    /// isn't mid-keystroke in the filter or the `[c]` editor.
+    fn maybe_open_update_prompt(&mut self) {
+        if self.update_prompt_pending && self.command_input.is_none() && !self.filter_focused {
+            self.update_prompt_pending = false;
+            self.update_prompt_open = true;
+        }
+    }
+
+    /// Keys while the update prompt is open. Everything unrecognised is
+    /// swallowed (it's a modal); Ctrl+C is handled before this is reached.
+    /// Quitting after an update needs an explicit `y` — Enter is pressed far
+    /// too often to be allowed to close the app.
+    fn handle_update_key(&mut self, key: KeyEvent) {
+        let yes = matches!(key.code, KeyCode::Char('y' | 'Y'));
+        let no = matches!(key.code, KeyCode::Char('n' | 'N') | KeyCode::Esc);
+        match self.update.clone() {
+            UpdateState::Available(tag) => {
+                if yes {
+                    self.start_update(tag);
+                } else if no {
+                    self.update_prompt_open = false;
+                }
+            }
+            UpdateState::Ready(_) => {
+                if yes {
+                    self.should_quit = true;
+                } else if no {
+                    self.update_prompt_open = false;
+                }
+            }
+            UpdateState::Downloading(_) => {
+                if no {
+                    self.update_prompt_open = false;
+                }
+            }
+            UpdateState::Failed(_) => {
+                if no || key.code == KeyCode::Enter {
+                    self.update_prompt_open = false;
+                }
+            }
+            UpdateState::Idle => self.update_prompt_open = false,
+        }
+    }
+
+    fn start_update(&mut self, tag: String) {
+        self.update = UpdateState::Downloading(tag.clone());
+        let tx = self.action_tx.clone();
+        let install = self.update_installer;
+        thread::spawn(move || {
+            let result = install(&tag).map(|()| tag);
+            let _ = tx.send(ActionResult::UpdateFinished(result));
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -728,7 +834,7 @@ impl App {
         let idx = self.sel().active();
         // winget sometimes reports no Id at all for a package (e.g. a
         // manually-installed app it can't match to a source) — skip those
-        // rather than act on an empty `--exact ""`.
+        // rather than act on an empty id.
         let pick = |ids: Vec<String>| -> Vec<String> {
             idx.iter()
                 .filter_map(|&i| ids.get(i).cloned())
@@ -921,6 +1027,12 @@ impl App {
                 .contains(crossterm::event::KeyModifiers::CONTROL)
         {
             self.should_quit = true;
+            return;
+        }
+
+        // The update prompt is a modal: it owns the keyboard while open.
+        if self.update_prompt_open {
+            self.handle_update_key(key);
             return;
         }
 
@@ -1275,7 +1387,6 @@ impl App {
             self.set_last_command([
                 "winget",
                 "install",
-                "--exact",
                 id.as_str(),
                 "--silent",
                 "--accept-package-agreements",
@@ -1302,7 +1413,6 @@ impl App {
                 // packages with no machine-scope installer.
                 let args = [
                     "install",
-                    "--exact",
                     id,
                     "--silent",
                     "--accept-package-agreements",
@@ -1355,7 +1465,6 @@ impl App {
             self.set_last_command([
                 "winget",
                 "upgrade",
-                "--exact",
                 id.as_str(),
                 "--silent",
                 "--accept-package-agreements",
@@ -1379,7 +1488,6 @@ impl App {
                 });
                 let args = [
                     "upgrade",
-                    "--exact",
                     id,
                     "--silent",
                     "--accept-package-agreements",
@@ -1442,7 +1550,6 @@ impl App {
             self.set_last_command([
                 "winget",
                 "uninstall",
-                "--exact",
                 id.as_str(),
                 "--silent",
                 "--accept-source-agreements",
@@ -1466,13 +1573,7 @@ impl App {
                         let _ = tx2.send(ActionResult::OutputLine(line));
                     }
                 });
-                let args = [
-                    "uninstall",
-                    "--exact",
-                    id,
-                    "--silent",
-                    "--accept-source-agreements",
-                ];
+                let args = ["uninstall", id, "--silent", "--accept-source-agreements"];
                 let _ = run_winget_stdout(&args, string_tx, Some(&pid_slot));
                 let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
@@ -1621,13 +1722,7 @@ impl App {
                                 let _ = tx2.send(ActionResult::OutputLine(line));
                             }
                         });
-                        let args = [
-                            "uninstall",
-                            "--exact",
-                            id,
-                            "--silent",
-                            "--accept-source-agreements",
-                        ];
+                        let args = ["uninstall", id, "--silent", "--accept-source-agreements"];
                         let _ = run_winget_stdout(&args, string_tx, Some(&pid_slot));
                     }
                     let _ = tx.send(ActionResult::OutputLine(String::new()));
@@ -1762,6 +1857,88 @@ impl App {
         self.render_content(f, body[0]);
         self.render_terminal(f, body[1]);
         self.render_status_bar(f, rows[3]);
+        if self.update_prompt_open {
+            self.render_update_prompt(f, f.area());
+        }
+    }
+
+    /// Centered modal for the self-update flow.
+    fn render_update_prompt(&self, f: &mut Frame<'_>, area: Rect) {
+        let key = Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD);
+        let current = env!("CARGO_PKG_VERSION");
+        let (title, mut lines): (&str, Vec<Line>) = match &self.update {
+            UpdateState::Available(tag) => (
+                " Update available ",
+                vec![
+                    Line::from(format!("wgtui {tag} is available (you have v{current}).")),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("[y]", key),
+                        Span::raw(" update now    "),
+                        Span::styled("[n]", key),
+                        Span::raw(" later"),
+                    ]),
+                ],
+            ),
+            UpdateState::Downloading(tag) => (
+                " Updating ",
+                vec![
+                    Line::from(format!(
+                        "{} Downloading {tag}…",
+                        SPINNER[self.spinner_frame as usize % SPINNER.len()]
+                    )),
+                    Line::from(""),
+                    Line::from(vec![Span::styled("[esc]", key), Span::raw(" hide")]),
+                ],
+            ),
+            UpdateState::Ready(tag) => (
+                " Updated ",
+                vec![
+                    Line::from(format!("{tag} installed. Restart wgtui to use it.")),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("[y]", key),
+                        Span::raw(" quit now    "),
+                        Span::styled("[n]", key),
+                        Span::raw(" later"),
+                    ]),
+                ],
+            ),
+            UpdateState::Failed(err) => (
+                " Update failed ",
+                vec![
+                    Line::from(err.clone()),
+                    Line::from(""),
+                    Line::from(vec![Span::styled("[esc]", key), Span::raw(" close")]),
+                ],
+            ),
+            UpdateState::Idle => return,
+        };
+        lines.insert(0, Line::from(""));
+
+        let width = 64.min(area.width);
+        let height = (lines.len() as u16 + 2).min(area.height);
+        let popup = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + (area.height - height) / 2,
+            width,
+            height,
+        };
+        f.render_widget(Clear, popup);
+        f.render_widget(
+            Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .border_style(theme::border(true))
+                        .title(Span::styled(title, theme::title(true))),
+                ),
+            popup,
+        );
     }
 
     fn render_tabs(&self, f: &mut Frame<'_>, area: Rect) {
@@ -2389,6 +2566,22 @@ impl App {
         }
 
         let mut right: Vec<Span> = Vec::new();
+        // Visible only while the prompt is closed — it's the way back to the
+        // state of an update the user hid mid-download or postponed.
+        let update_chip = match (&self.update, self.update_prompt_open) {
+            (UpdateState::Downloading(_), false) => Some(" updating… "),
+            (UpdateState::Ready(_), false) => Some(" restart to finish update "),
+            _ => None,
+        };
+        if let Some(chip) = update_chip {
+            right.push(Span::styled(
+                chip,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if let Some(hint) = elevation_warning(self.elevated) {
             right.push(Span::styled(
                 hint,
@@ -2663,10 +2856,10 @@ mod tests {
     #[test]
     fn set_last_command_joins_argv() {
         let mut app = App::new();
-        app.set_last_command(["winget", "uninstall", "--exact", "sharkdp.bat"]);
+        app.set_last_command(["winget", "uninstall", "sharkdp.bat"]);
         assert_eq!(
             app.last_command.as_deref(),
-            Some("winget uninstall --exact sharkdp.bat")
+            Some("winget uninstall sharkdp.bat")
         );
     }
 
@@ -2678,11 +2871,11 @@ mod tests {
         assert_eq!(app.command_input.as_deref(), Some("winget ")); // no prior command
 
         app.command_input = None;
-        app.last_command = Some("winget uninstall --exact sharkdp.bat --silent".into());
+        app.last_command = Some("winget uninstall sharkdp.bat --silent".into());
         app.handle_key(ke(KeyCode::Char('c')));
         assert_eq!(
             app.command_input.as_deref(),
-            Some("winget uninstall --exact sharkdp.bat --silent")
+            Some("winget uninstall sharkdp.bat --silent")
         );
     }
 
@@ -2839,7 +3032,7 @@ mod tests {
         draw(&empty, 8, 4);
 
         let mut editing = populated();
-        editing.command_input = Some("winget uninstall --exact X --all-versions".into());
+        editing.command_input = Some("winget uninstall X --all-versions".into());
         draw(&editing, 90, 20);
         draw(&editing, 30, 6);
 
@@ -2945,7 +3138,7 @@ mod tests {
     #[test]
     fn selected_ids_skips_rows_with_no_winget_id() {
         // winget sometimes has no Id for a row (manually-installed app it
-        // can't match to a source) — acting on it would send `--exact ""`.
+        // can't match to a source) — acting on it would send an empty id.
         let mut app = App::new();
         app.tab = Tab::Installed;
         app.installed = vec![WingetPackage {
@@ -3153,5 +3346,201 @@ mod tests {
             QueuedAction::InstallWindowsUpdates.label(),
             "install Windows Update"
         );
+    }
+
+    // ----- self-update prompt -----
+
+    fn ok_installer(_tag: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn failing_installer(_tag: &str) -> Result<(), String> {
+        Err("boom".to_string())
+    }
+
+    /// An app that has just been told `v9.9.9` is available. The installer is
+    /// stubbed so no test ever downloads anything or touches the real exe.
+    fn app_with_update_available() -> App {
+        let mut app = App::new();
+        app.update_installer = ok_installer;
+        app.handle_action_result(ActionResult::UpdateAvailable("v9.9.9".to_string()));
+        app
+    }
+
+    fn wait_for_update_result(app: &mut App) {
+        let result = app
+            .action_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("installer thread reports back");
+        app.handle_action_result(result);
+    }
+
+    #[test]
+    fn update_available_opens_the_prompt() {
+        let mut app = app_with_update_available();
+        assert!(
+            !app.update_prompt_open,
+            "opens on the next frame, not mid-event"
+        );
+        app.maybe_open_update_prompt();
+        assert!(app.update_prompt_open);
+        assert_eq!(app.update, UpdateState::Available("v9.9.9".to_string()));
+    }
+
+    #[test]
+    fn update_prompt_waits_until_the_user_stops_typing() {
+        // The prompt arrives asynchronously (network), so it must never pop
+        // up mid-keystroke and have `y`/`n` typed into a filter taken as an
+        // answer.
+        let mut app = app_with_update_available();
+        app.filter_focused = true;
+        app.maybe_open_update_prompt();
+        assert!(!app.update_prompt_open);
+
+        app.filter_focused = false;
+        app.command_input = Some("winget li".into());
+        app.maybe_open_update_prompt();
+        assert!(!app.update_prompt_open);
+
+        app.command_input = None;
+        app.maybe_open_update_prompt();
+        assert!(app.update_prompt_open);
+    }
+
+    #[test]
+    fn declining_the_update_closes_the_prompt_and_does_not_nag_again() {
+        for decline in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut app = app_with_update_available();
+            app.maybe_open_update_prompt();
+            app.handle_key(ke(decline));
+            assert!(!app.update_prompt_open);
+            app.maybe_open_update_prompt();
+            assert!(!app.update_prompt_open, "asked once per launch");
+            assert_eq!(app.update, UpdateState::Available("v9.9.9".to_string()));
+        }
+    }
+
+    #[test]
+    fn accepting_the_update_downloads_then_reports_ready() {
+        let mut app = app_with_update_available();
+        app.maybe_open_update_prompt();
+
+        app.handle_key(ke(KeyCode::Char('y')));
+        assert_eq!(app.update, UpdateState::Downloading("v9.9.9".to_string()));
+
+        wait_for_update_result(&mut app);
+        assert_eq!(app.update, UpdateState::Ready("v9.9.9".to_string()));
+        app.maybe_open_update_prompt();
+        assert!(app.update_prompt_open, "tells the user to restart");
+    }
+
+    #[test]
+    fn a_failed_update_surfaces_the_error() {
+        let mut app = app_with_update_available();
+        app.update_installer = failing_installer;
+        app.maybe_open_update_prompt();
+
+        app.handle_key(ke(KeyCode::Char('y')));
+        wait_for_update_result(&mut app);
+
+        assert_eq!(app.update, UpdateState::Failed("boom".to_string()));
+        app.maybe_open_update_prompt();
+        assert!(app.update_prompt_open);
+        assert!(draw_text(&app, 100, 30).contains("boom"));
+        app.handle_key(ke(KeyCode::Esc));
+        assert!(!app.update_prompt_open);
+    }
+
+    #[test]
+    fn open_prompt_swallows_other_keys_but_ctrl_c_still_quits() {
+        let mut app = app_with_update_available();
+        app.maybe_open_update_prompt();
+        let tab_before = app.tab;
+
+        for k in [
+            KeyCode::Char('j'),
+            KeyCode::Tab,
+            KeyCode::Char('3'),
+            KeyCode::Char('u'),
+        ] {
+            app.handle_key(ke(k));
+        }
+        assert_eq!(app.tab, tab_before);
+        assert!(app.update_prompt_open);
+        assert!(!app.should_quit);
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert!(app.should_quit, "the prompt must never be a trap");
+    }
+
+    #[test]
+    fn ready_prompt_only_quits_on_an_explicit_yes() {
+        // Enter is what people press constantly — it must not quit the app.
+        let mut app = app_with_update_available();
+        app.update = UpdateState::Ready("v9.9.9".to_string());
+        app.update_prompt_open = true;
+
+        app.handle_key(ke(KeyCode::Enter));
+        assert!(!app.should_quit);
+        assert!(app.update_prompt_open);
+
+        app.handle_key(ke(KeyCode::Char('y')));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ready_prompt_can_be_postponed() {
+        let mut app = app_with_update_available();
+        app.update = UpdateState::Ready("v9.9.9".to_string());
+        app.update_prompt_open = true;
+
+        app.handle_key(ke(KeyCode::Esc));
+        assert!(!app.update_prompt_open);
+        assert!(!app.should_quit);
+        assert!(
+            draw_text(&app, 120, 30).contains("restart"),
+            "status chip remains"
+        );
+    }
+
+    #[test]
+    fn update_prompt_renders_in_every_state_and_tiny_frames() {
+        let states = [
+            UpdateState::Available("v9.9.9".to_string()),
+            UpdateState::Downloading("v9.9.9".to_string()),
+            UpdateState::Ready("v9.9.9".to_string()),
+            UpdateState::Failed("boom".to_string()),
+        ];
+        for state in states {
+            let mut app = populated();
+            app.update = state;
+            app.update_prompt_open = true;
+            draw(&app, 110, 32);
+            draw(&app, 40, 10);
+            draw(&app, 8, 4);
+        }
+    }
+
+    #[test]
+    fn available_prompt_names_both_versions_and_the_keys() {
+        let mut app = populated();
+        app.update = UpdateState::Available("v9.9.9".to_string());
+        app.update_prompt_open = true;
+        let text = draw_text(&app, 100, 30);
+        assert!(text.contains("v9.9.9"), "{text}");
+        assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        assert!(text.contains("[y]") && text.contains("[n]"), "{text}");
+    }
+
+    #[test]
+    fn app_new_does_not_check_for_updates_on_its_own() {
+        // Constructing an App (as every test does) must stay offline; only
+        // `run()` kicks off the background check.
+        let app = App::new();
+        assert_eq!(app.update, UpdateState::Idle);
+        assert!(!app.update_prompt_open);
     }
 }

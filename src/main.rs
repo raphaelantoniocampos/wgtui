@@ -1,6 +1,7 @@
 mod bootstrap;
 mod elevation;
 mod tui;
+mod update;
 
 use crossterm::ExecutableCommand;
 use crossterm::terminal::{

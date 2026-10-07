@@ -42,6 +42,18 @@ momento atualiza para a versão mais recente. Prefere conferir o script antes de
 baixar o `.exe` na mão? Veja [`install.ps1`](install.ps1) ou a
 [página de releases](https://github.com/raphaelantoniocampos/wgtui/releases).
 
+### Atualização automática
+
+Ao abrir, o wgtui consulta em segundo plano (sem travar a UI) se existe um release mais novo
+no GitHub. Se existir, aparece um aviso perguntando se você quer atualizar: `y` baixa o novo
+`wgtui.exe` e o coloca no lugar do atual (o antigo vira `wgtui.exe.old` e é apagado na
+próxima abertura); `n`/`Esc` adia até a próxima vez que você abrir. Depois de atualizar, o
+wgtui pede para reiniciar (`y` fecha na hora) — nada é trocado sem o seu `y`, e o aviso
+nunca aparece enquanto você digita no filtro ou no editor `[c]`.
+
+Usa o `curl.exe` que já vem com o Windows 10/11. Para desligar a checagem (máquina offline,
+CI), defina `WGTUI_NO_UPDATE_CHECK=1`.
+
 ## Compilar e rodar
 
 Alternativa para quem quer compilar da fonte (Rust, edition 2024):
@@ -116,13 +128,13 @@ seletor (`F` reabre).
 
 | Campo | Obrigatório | Descrição |
 |---|---|---|
-| `id` | sim | `PackageIdentifier` do winget (usado em `winget install --exact`) |
+| `id` | sim | `PackageIdentifier` do winget (usado em `winget install <id>`) |
 | `name` | não | Nome exibido na lista; se ausente, usa o `id` |
 | `args` | não | Argumentos extras acrescentados ao `winget install` (ex.: `["-a", "x86"]`, ou `["--force"]` quando o winget recusa por hash divergente) |
 | `scope` | não | Vira `--scope <valor>` (`machine` \| `user`); **omitido se ausente** (deixa o winget escolher) |
 | `locale` | não | Vira `--locale <valor>` (ex.: `pt-BR`); só use se o pacote realmente tiver instalador nesse idioma — senão o winget falha com "no applicable installer found" |
 
-Comando montado: `winget install --exact <id> --silent --accept-package-agreements
+Comando montado: `winget install <id> --silent --accept-package-agreements
 --accept-source-agreements [--scope <scope>] [--locale <locale>] [args...]`
 
 **`scripts[]`**
