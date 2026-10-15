@@ -19,12 +19,13 @@ agora exclusivamente winget (Chocolatey/Scoop foram descartados) e em Rust.
   aplicável (forçar `machine` fazia instalações falharem de cara em pacotes sem
   instalador de máquina). Se você quiser `--scope machine` explicitamente num pacote,
   isso pede Administrador; sem elevação a status bar mostra `not admin`.
-- **`W`, na aba Updates, instala as atualizações do Windows** (`winget upgrade` continua
+- **`w`, na aba Updates, instala as atualizações do Windows** (`winget upgrade` continua
   cuidando só dos apps) via o módulo PowerShell **PSWindowsUpdate**, instalado
   automaticamente (por usuário, sem precisar de Administrador) na primeira vez que você
-  aperta `W`. A instalação em si **precisa de Administrador** — não é uma escolha do
-  wgtui, é o próprio `Get-WindowsUpdate` que exige processo elevado; sem elevação o erro
-  aparece no painel de output, igual a qualquer outro comando.
+  aperta `w`. A instalação em si **precisa de Administrador** — não é uma escolha do
+  wgtui, é o próprio `Get-WindowsUpdate` que exige processo elevado; sem elevação aparece
+  uma linha `ERROR: ...` no painel de output. Enquanto roda, o painel mostra as mensagens
+  do módulo (`VERBOSE:`/`WARNING:`) e a tabela de resultados completa, com acentos.
 
 ## Instalação
 
@@ -80,7 +81,13 @@ Referência completa de todas as teclas, por contexto: [docs/HOTKEYS.md](docs/HO
 Navegação global: `Tab`/`Shift+Tab`, `←`/`→` ou `h`/`l` trocam de aba · `1`–`4` pulam para
 a aba · `↑`/`↓` ou `j`/`k` navegam a lista · `/` foca o filtro · `Space` marca/desmarca ·
 `a` marca/desmarca todos · `Enter` mostra detalhes · `PageUp`/`PageDown` rolam o painel
-Output · `q` ou `Esc` saem (pedem confirmação: `y` sai, `n`/`Esc` fica) · `Ctrl+C` sai na hora.
+Output · `q` ou `Esc` saem (pedem confirmação: `y`/`Enter` sai, `n`/`Esc` fica) · `Ctrl+C`
+sai na hora.
+
+**`o` — painel Output:** foca o painel para rolar e ver o histórico. Cada comando novo
+guarda a saída do anterior (até 50). Dentro do modo: `j`/`k` rolam · `PageUp`/`PageDown`
+uma página · `g`/`G` início/fim · `←`/`→` (ou `h`/`l`) andam pelo histórico de execuções ·
+`Esc`/`o`/`q` voltam para a execução atual. Linhas longas quebram em vez de serem cortadas.
 Na coluna à esquerda: `●` = marcado · `✓` = já instalado · `▶` = script.
 
 **`c` — editar comando:** abre o painel Command com o último comando winget executado,

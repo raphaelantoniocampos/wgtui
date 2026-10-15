@@ -116,6 +116,144 @@ fn parse_command_line(line: &str) -> Vec<String> {
 /// Braille spinner frames, shown while a command runs.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// How many finished runs the output panel keeps for `←`/`→` browsing.
+const OUTPUT_HISTORY_CAP: usize = 50;
+
+/// One finished command's output, kept for the output panel's history.
+struct OutputRun {
+    command: String,
+    lines: Vec<String>,
+}
+
+/// Makes one line of child-process output safe to draw. Every character
+/// ends up in a ratatui cell and is written to the real terminal, so control
+/// bytes would act on it: an ESC sequence or a bare CR there wrecks the
+/// layout. Keeps what a terminal would have shown — the text after the last
+/// CR, ANSI styling dropped, tabs expanded to 8-column stops, other control
+/// characters removed, trailing padding trimmed.
+fn sanitize_output_line(line: &str) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let line = line.rsplit('\r').find(|seg| !seg.is_empty()).unwrap_or("");
+    let mut out = String::with_capacity(line.len());
+    let mut col = 0usize;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                // CSI: parameters, then one final byte in @..~.
+                Some('[') => {
+                    for d in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&d) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: up to BEL or ESC \.
+                Some(']') => {
+                    while let Some(d) = chars.next() {
+                        if d == '\x07' {
+                            break;
+                        }
+                        if d == '\x1b' {
+                            chars.next_if_eq(&'\\');
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\t' => {
+                let n = 8 - col % 8;
+                out.extend(std::iter::repeat_n(' ', n));
+                col += n;
+            }
+            c if c.is_control() => {}
+            c => {
+                out.push(c);
+                col += c.width().unwrap_or(0);
+            }
+        }
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+/// Splits `line` into rows at most `width` columns wide, breaking at the
+/// last space where possible and inside a word only when it alone is wider
+/// than a row. `width == 0` means "don't wrap".
+fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if width == 0 || line.width() <= width {
+        return vec![line.to_string()];
+    }
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_w = 0;
+    let mut last_space: Option<usize> = None;
+    for c in line.chars() {
+        let cw = c.width().unwrap_or(0);
+        if row_w + cw > width && !row.is_empty() {
+            if c == ' ' {
+                rows.push(std::mem::take(&mut row));
+                row_w = 0;
+                last_space = None;
+                continue;
+            }
+            if let Some(sp) = last_space.filter(|&sp| sp > 0) {
+                let rest = row[sp + 1..].to_string();
+                row.truncate(sp);
+                rows.push(std::mem::replace(&mut row, rest));
+                row_w = row.width();
+            } else {
+                rows.push(std::mem::take(&mut row));
+                row_w = 0;
+            }
+            last_space = None;
+        }
+        if c == ' ' && row.is_empty() && !rows.is_empty() {
+            continue;
+        }
+        if c == ' ' {
+            last_space = Some(row.len());
+        }
+        row.push(c);
+        row_w += cw;
+    }
+    rows.push(row);
+    rows
+}
+
+/// The first line of a Windows Update run: the command that matters, on one
+/// line. The full `powershell` argument line (UTF-8 preamble, try/catch,
+/// stream labelling) wrapped to ~10 rows and buried the actual output.
+fn windows_update_echo() -> String {
+    "> Get-WindowsUpdate -AcceptAll -Install -IgnoreReboot -Verbose  (PowerShell · PSWindowsUpdate)"
+        .to_string()
+}
+
+/// The line a list refresh (`r`) adds to its run, e.g. "Updates list
+/// refreshed: 3 upgradable."
+fn refreshed_message(what: &str, count: usize, unit: &str) -> String {
+    format!("{what} refreshed: {count} {unit}.")
+}
+
+/// Runs `run` with a sender whose lines are forwarded to the UI as
+/// `OutputLine`s, and returns only once every line has been forwarded. A job
+/// that sends anything afterwards (list refreshes, `CommandDone`) can then
+/// never overtake its own output — before, the relay thread could still be
+/// draining when the next job began, so late lines landed in the wrong run.
+fn relay_output<F: FnOnce(mpsc::Sender<String>)>(tx: &mpsc::Sender<ActionResult>, run: F) {
+    let (lines_tx, lines_rx) = mpsc::channel::<String>();
+    let ui = tx.clone();
+    let relay = thread::spawn(move || {
+        while let Ok(line) = lines_rx.recv() {
+            let _ = ui.send(ActionResult::OutputLine(line));
+        }
+    });
+    run(lines_tx);
+    let _ = relay.join();
+}
+
 /// One place for every colour and reusable style, so the UI reads as one system.
 mod theme {
     use ratatui::style::{Color, Modifier, Style};
@@ -443,6 +581,17 @@ pub struct App {
     last_command: Option<String>,
     /// `Some` while the manual-command editor (`[c]`) is open.
     command_input: Option<String>,
+    /// Finished runs, oldest first (capped at [`OUTPUT_HISTORY_CAP`]). The
+    /// current run is `current_command` + `command_output`.
+    output_history: VecDeque<OutputRun>,
+    /// The output panel has keyboard focus (`o`): scroll and history keys.
+    output_focused: bool,
+    /// Which run the output panel shows: `None` is the current one,
+    /// `Some(i)` is `output_history[i]`.
+    output_view: Option<usize>,
+    /// (wrapped rows, visible rows) of the output panel as last drawn, so
+    /// scroll keys can work in wrapped rows rather than source lines.
+    output_metrics: std::cell::Cell<(usize, usize)>,
     /// Cursor position inside `command_input`, as a *character* index (not a
     /// byte offset). Always clamped to the buffer's length where it's used,
     /// so a stale value can never slice mid-character.
@@ -546,6 +695,10 @@ impl App {
             current_command: None,
             last_command: None,
             command_input: None,
+            output_history: VecDeque::new(),
+            output_focused: false,
+            output_view: None,
+            output_metrics: std::cell::Cell::new((0, 0)),
             command_cursor: 0,
             command_output: vec![],
             output_scroll: usize::MAX,
@@ -663,32 +816,35 @@ impl App {
             ActionResult::Elevation(elevated) => {
                 self.elevated = elevated;
             }
-            ActionResult::SetCommand { command, output } => {
-                self.current_command = Some(command);
-                self.command_output = output.lines().map(|l| l.to_string()).collect();
-                self.output_scroll = usize::MAX;
+            // Both replace the current run's lines (the run itself was begun,
+            // and the previous one archived, when the job started).
+            ActionResult::SetCommand {
+                command,
+                output: text,
             }
-            ActionResult::SetError { command, error } => {
+            | ActionResult::SetError {
+                command,
+                error: text,
+            } => {
                 self.current_command = Some(command);
-                self.command_output = error.lines().map(|l| l.to_string()).collect();
-                self.output_scroll = usize::MAX;
+                self.command_output.clear();
+                for line in text.lines() {
+                    self.push_output_line(line);
+                }
             }
+            // List refreshes only update their list: most arrive at the end
+            // of an install/upgrade/remove, and used to replace that job's
+            // whole output with a one-line "refreshed" message.
             ActionResult::RefreshInstalled(list) => {
                 self.installed = list;
                 self.installed_sel.cursor = 0;
-                self.current_command = Some("winget list --refresh".to_string());
-                self.command_output = vec!["Package list refreshed.".to_string()];
-                self.output_scroll = usize::MAX;
             }
             ActionResult::RefreshUpdates(list) => {
                 self.updates = list;
                 self.updates_sel.cursor = 0;
-                self.current_command = Some("winget upgrade".to_string());
-                self.command_output = vec!["Updates list refreshed.".to_string()];
-                self.output_scroll = usize::MAX;
             }
             ActionResult::OutputLine(line) => {
-                self.command_output.push(line);
+                self.push_output_line(&line);
             }
             ActionResult::CommandDone => {
                 self.busy = false;
@@ -707,6 +863,97 @@ impl App {
                 };
                 self.update_prompt_pending = true;
             }
+        }
+    }
+
+    /// Starts a new run in the output panel: the previous one (if anything
+    /// ran) moves to the history, and the panel shows `command`, empty.
+    fn begin_output(&mut self, command: String) {
+        if self.current_command.is_some() || !self.command_output.is_empty() {
+            self.output_history.push_back(OutputRun {
+                command: self
+                    .current_command
+                    .take()
+                    .unwrap_or_else(|| "output".to_string()),
+                lines: std::mem::take(&mut self.command_output),
+            });
+            if self.output_history.len() > OUTPUT_HISTORY_CAP {
+                self.output_history.pop_front();
+                // Keep the user on the same run they were reading.
+                self.output_view = self.output_view.map(|i| i.saturating_sub(1));
+            }
+        }
+        self.command_output.clear();
+        self.current_command = Some(command);
+        if self.output_view.is_none() {
+            self.output_scroll = usize::MAX;
+        }
+    }
+
+    /// Appends a line to the current run, sanitized, collapsing runs of
+    /// blank lines (PowerShell's formatter emits several in a row).
+    fn push_output_line(&mut self, raw: &str) {
+        let line = sanitize_output_line(raw);
+        if line.is_empty() && self.command_output.last().is_none_or(String::is_empty) {
+            return;
+        }
+        self.command_output.push(line);
+    }
+
+    /// Visible rows of the output panel as last drawn (at least 1).
+    fn output_page(&self) -> usize {
+        self.output_metrics.get().1.saturating_sub(1).max(1)
+    }
+
+    /// Scrolls the output panel by `delta` wrapped rows; reaching the end
+    /// switches back to following new output.
+    fn scroll_output_by(&mut self, delta: isize) {
+        let (rows, visible) = self.output_metrics.get();
+        let max_top = rows.saturating_sub(visible);
+        let top = if self.output_scroll == usize::MAX {
+            max_top
+        } else {
+            self.output_scroll.min(max_top)
+        };
+        let new = top.saturating_add_signed(delta).min(max_top);
+        self.output_scroll = if new >= max_top { usize::MAX } else { new };
+    }
+
+    /// Keys while the output panel is focused (`o`). Everything unrecognised
+    /// is swallowed, like the queue manager.
+    fn handle_output_key(&mut self, key: KeyEvent) {
+        let len = self.output_history.len();
+        let before = self.output_view;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('o' | 'q') => {
+                self.output_focused = false;
+                self.output_view = None;
+                self.output_scroll = usize::MAX;
+                return;
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_output_by(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_output_by(-1),
+            KeyCode::PageDown => self.scroll_output_by(self.output_page() as isize),
+            KeyCode::PageUp => self.scroll_output_by(-(self.output_page() as isize)),
+            KeyCode::Char('g') | KeyCode::Home => self.output_scroll = 0,
+            KeyCode::Char('G') | KeyCode::End => self.output_scroll = usize::MAX,
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.output_view = match self.output_view {
+                    None if len > 0 => Some(len - 1),
+                    Some(i) if i > 0 => Some(i - 1),
+                    v => v,
+                };
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.output_view = match self.output_view {
+                    Some(i) if i + 1 < len => Some(i + 1),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+        if self.output_view != before {
+            self.output_scroll = usize::MAX;
         }
     }
 
@@ -803,10 +1050,13 @@ impl App {
     }
 
     /// Keys while the "Quit wgtui?" confirmation is open. A modal like the
-    /// update prompt: everything unrecognised is swallowed.
+    /// update prompt: everything unrecognised is swallowed. Enter confirms
+    /// here (unlike the update prompt, which can pop up on its own while the
+    /// user is pressing Enter for something else): this prompt only ever
+    /// opens because the user just pressed `q`/`Esc`.
     fn handle_quit_confirm_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('y' | 'Y') => self.should_quit = true,
+            KeyCode::Char('y' | 'Y') | KeyCode::Enter => self.should_quit = true,
             KeyCode::Char('n' | 'N') | KeyCode::Esc => self.quit_confirm_open = false,
             _ => {}
         }
@@ -1149,6 +1399,12 @@ impl App {
             return;
         }
 
+        // The output panel ([o]) captures all input while focused.
+        if self.output_focused {
+            self.handle_output_key(key);
+            return;
+        }
+
         // vim: outside the filter input, `j`/`k` are list Down/Up. While the
         // filter is focused they are plain text (handled below).
         let key = if self.filter_focused {
@@ -1254,25 +1510,9 @@ impl App {
                 self.sel_mut().down(n);
             }
             KeyCode::Enter => self.show_selected(),
-            KeyCode::PageUp => {
-                if !self.command_output.is_empty() {
-                    self.output_scroll = if self.output_scroll == usize::MAX {
-                        self.command_output.len().saturating_sub(1)
-                    } else {
-                        self.output_scroll.saturating_sub(5)
-                    };
-                }
-            }
-            KeyCode::PageDown => {
-                if !self.command_output.is_empty() && self.output_scroll != usize::MAX {
-                    let new_scroll = self.output_scroll + 5;
-                    if new_scroll >= self.command_output.len() {
-                        self.output_scroll = usize::MAX;
-                    } else {
-                        self.output_scroll = new_scroll;
-                    }
-                }
-            }
+            KeyCode::Char('o') => self.output_focused = true,
+            KeyCode::PageUp => self.scroll_output_by(-(self.output_page() as isize)),
+            KeyCode::PageDown => self.scroll_output_by(self.output_page() as isize),
             _ => match self.tab {
                 Tab::Updates => self.handle_updates_key(key),
                 Tab::Search => self.handle_search_key(key),
@@ -1430,7 +1670,7 @@ impl App {
     /// non-streaming read) — `x` in the queue manager is a no-op on it.
     fn run_search(&mut self, query: String) {
         let tx = self.action_tx.clone();
-        self.current_command = Some(format!("winget search \"{}\"", query));
+        self.begin_output(format!("winget search \"{}\"", query));
         let _ = self.begin_job();
         thread::spawn(move || {
             let results = search_packages(&query);
@@ -1450,9 +1690,7 @@ impl App {
 
     fn install_multi_pkg(&mut self, ids: Vec<String>) {
         let tx = self.action_tx.clone();
-        self.command_output.clear();
-        self.output_scroll = usize::MAX;
-        self.current_command = Some(format!("winget install {} packages", ids.len()));
+        self.begin_output(format!("winget install {} packages", ids.len()));
         if let Some(id) = ids.first() {
             self.set_last_command([
                 "winget",
@@ -1471,13 +1709,6 @@ impl App {
                     break;
                 }
                 let _ = tx.send(ActionResult::OutputLine(format!("--- install {} ---", id)));
-                let tx2 = tx.clone();
-                let (string_tx, string_rx) = mpsc::channel::<String>();
-                thread::spawn(move || {
-                    while let Ok(line) = string_rx.recv() {
-                        let _ = tx2.send(ActionResult::OutputLine(line));
-                    }
-                });
                 // No --scope: let winget pick whatever's applicable. Forcing
                 // `machine` here used to make installs fail outright for
                 // packages with no machine-scope installer.
@@ -1488,7 +1719,9 @@ impl App {
                     "--accept-package-agreements",
                     "--accept-source-agreements",
                 ];
-                let _ = run_winget_stdout(&args, string_tx, Some(&pid_slot));
+                relay_output(&tx, |lines| {
+                    let _ = run_winget_stdout(&args, lines, Some(&pid_slot));
+                });
                 let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
             let _ = tx.send(ActionResult::RefreshInstalled(list_installed()));
@@ -1500,9 +1733,7 @@ impl App {
 
     fn show_multi_pkg(&mut self, ids: Vec<String>) {
         let tx = self.action_tx.clone();
-        self.command_output.clear();
-        self.output_scroll = usize::MAX;
-        self.current_command = Some(format!("winget show {} packages", ids.len()));
+        self.begin_output(format!("winget show {} packages", ids.len()));
         let (pid_slot, cancel) = self.begin_job();
         thread::spawn(move || {
             for id in &ids {
@@ -1511,15 +1742,10 @@ impl App {
                     break;
                 }
                 let _ = tx.send(ActionResult::OutputLine(format!("--- {} ---", id)));
-                let tx2 = tx.clone();
-                let (string_tx, string_rx) = mpsc::channel::<String>();
-                thread::spawn(move || {
-                    while let Ok(line) = string_rx.recv() {
-                        let _ = tx2.send(ActionResult::OutputLine(line));
-                    }
-                });
                 let args = ["show", id, "--accept-source-agreements"];
-                let _ = run_winget_stdout(&args, string_tx, Some(&pid_slot));
+                relay_output(&tx, |lines| {
+                    let _ = run_winget_stdout(&args, lines, Some(&pid_slot));
+                });
                 let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
             let _ = tx.send(ActionResult::CommandDone);
@@ -1528,9 +1754,7 @@ impl App {
 
     fn upgrade_multi_pkg(&mut self, ids: Vec<String>) {
         let tx = self.action_tx.clone();
-        self.command_output.clear();
-        self.output_scroll = usize::MAX;
-        self.current_command = Some(format!("winget upgrade {} packages", ids.len()));
+        self.begin_output(format!("winget upgrade {} packages", ids.len()));
         if let Some(id) = ids.first() {
             self.set_last_command([
                 "winget",
@@ -1549,13 +1773,6 @@ impl App {
                     break;
                 }
                 let _ = tx.send(ActionResult::OutputLine(format!("--- upgrade {} ---", id)));
-                let tx2 = tx.clone();
-                let (string_tx, string_rx) = mpsc::channel::<String>();
-                thread::spawn(move || {
-                    while let Ok(line) = string_rx.recv() {
-                        let _ = tx2.send(ActionResult::OutputLine(line));
-                    }
-                });
                 let args = [
                     "upgrade",
                     id,
@@ -1563,7 +1780,9 @@ impl App {
                     "--accept-package-agreements",
                     "--accept-source-agreements",
                 ];
-                let _ = run_winget_stdout(&args, string_tx, Some(&pid_slot));
+                relay_output(&tx, |lines| {
+                    let _ = run_winget_stdout(&args, lines, Some(&pid_slot));
+                });
                 let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
             let updates = list_upgradable();
@@ -1578,44 +1797,26 @@ impl App {
     /// understands double-quote grouping and would mangle this PowerShell
     /// one-liner's semicolons/single quotes if re-run through it — leaving
     /// `[c]` showing the last *winget* command is correct, not an oversight.
-    /// The literal command still streams into the output panel below (same
-    /// as `bootstrap.rs`'s `run_powershell_bootstrap`), so it's visible —
-    /// just not blindly re-runnable through a parser that can't handle it.
+    /// The command that matters streams into the output panel first (see
+    /// [`windows_update_echo`]), so it's visible — just not blindly
+    /// re-runnable through a parser that can't handle it.
     fn install_windows_updates(&mut self) {
         let tx = self.action_tx.clone();
-        self.command_output.clear();
-        self.output_scroll = usize::MAX;
-        self.current_command = Some("Windows Update install".to_string());
+        self.begin_output("Windows Update install".to_string());
         let (pid_slot, _cancel) = self.begin_job();
         thread::spawn(move || {
-            let _ = tx.send(ActionResult::OutputLine(format!(
-                "> powershell -NoProfile -ExecutionPolicy Bypass -Command \"{}\"",
-                wgtui::WINDOWS_UPDATE_INSTALL_PS
-            )));
-            let tx2 = tx.clone();
-            let (string_tx, string_rx) = mpsc::channel::<String>();
-            thread::spawn(move || {
-                while let Ok(line) = string_rx.recv() {
-                    let _ = tx2.send(ActionResult::OutputLine(line));
-                }
+            let script = wgtui::windows_update_install_script();
+            let _ = tx.send(ActionResult::OutputLine(windows_update_echo()));
+            relay_output(&tx, |lines| {
+                let _ = wgtui::run_powershell_stdout(&script, lines, Some(&pid_slot));
             });
-            let args = [
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                wgtui::WINDOWS_UPDATE_INSTALL_PS,
-            ];
-            let _ = wgtui::run_command_stdout("powershell", &args, string_tx, Some(&pid_slot));
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
 
     fn remove_multi_pkg(&mut self, ids: Vec<String>) {
         let tx = self.action_tx.clone();
-        self.command_output.clear();
-        self.output_scroll = usize::MAX;
-        self.current_command = Some(format!("winget uninstall {} packages", ids.len()));
+        self.begin_output(format!("winget uninstall {} packages", ids.len()));
         if let Some(id) = ids.first() {
             self.set_last_command([
                 "winget",
@@ -1636,15 +1837,10 @@ impl App {
                     "--- uninstall {} ---",
                     id
                 )));
-                let tx2 = tx.clone();
-                let (string_tx, string_rx) = mpsc::channel::<String>();
-                thread::spawn(move || {
-                    while let Ok(line) = string_rx.recv() {
-                        let _ = tx2.send(ActionResult::OutputLine(line));
-                    }
-                });
                 let args = ["uninstall", id, "--silent", "--accept-source-agreements"];
-                let _ = run_winget_stdout(&args, string_tx, Some(&pid_slot));
+                relay_output(&tx, |lines| {
+                    let _ = run_winget_stdout(&args, lines, Some(&pid_slot));
+                });
                 let _ = tx.send(ActionResult::OutputLine(String::new()));
             }
             let list = list_installed();
@@ -1655,7 +1851,7 @@ impl App {
 
     fn upgrade_all(&mut self) {
         let tx = self.action_tx.clone();
-        self.current_command = Some("winget upgrade --all --include-unknown".to_string());
+        self.begin_output("winget upgrade --all --include-unknown".to_string());
         self.last_command = Some(
             "winget upgrade --all --include-unknown --silent \
              --accept-package-agreements --accept-source-agreements"
@@ -1687,9 +1883,7 @@ impl App {
 
     fn install_json_multi(&mut self, ids: Vec<String>) {
         let tx = self.action_tx.clone();
-        self.command_output.clear();
-        self.output_scroll = usize::MAX;
-        self.current_command = Some(format!("install/run {} apps/scripts", ids.len()));
+        self.begin_output(format!("install/run {} apps/scripts", ids.len()));
         if let Some(seed) = ids
             .first()
             .and_then(|id| self.packages.iter().find(|p| &p.id == id))
@@ -1724,15 +1918,10 @@ impl App {
                             let cmd = &cmd_args[0];
                             let args: Vec<&str> =
                                 cmd_args[1..].iter().map(|s| s.as_str()).collect();
-                            let tx2 = tx.clone();
-                            let (string_tx, string_rx) = mpsc::channel::<String>();
-                            thread::spawn(move || {
-                                while let Ok(line) = string_rx.recv() {
-                                    let _ = tx2.send(ActionResult::OutputLine(line));
-                                }
+                            relay_output(&tx, |lines| {
+                                let _ =
+                                    wgtui::run_command_stdout(cmd, &args, lines, Some(&pid_slot));
                             });
-                            let _ =
-                                wgtui::run_command_stdout(cmd, &args, string_tx, Some(&pid_slot));
                         }
                     } else {
                         let args = pkg.install_args();
@@ -1740,15 +1929,10 @@ impl App {
                             "--- winget {} ---",
                             args.join(" ")
                         )));
-                        let tx2 = tx.clone();
-                        let (string_tx, string_rx) = mpsc::channel::<String>();
-                        thread::spawn(move || {
-                            while let Ok(line) = string_rx.recv() {
-                                let _ = tx2.send(ActionResult::OutputLine(line));
-                            }
-                        });
                         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                        let _ = run_winget_stdout(&arg_refs, string_tx, Some(&pid_slot));
+                        relay_output(&tx, |lines| {
+                            let _ = run_winget_stdout(&arg_refs, lines, Some(&pid_slot));
+                        });
                     }
                     let _ = tx.send(ActionResult::OutputLine(String::new()));
                 }
@@ -1763,9 +1947,7 @@ impl App {
     fn remove_json_multi(&mut self, ids: Vec<String>) {
         let tx = self.action_tx.clone();
         let tx_refresh = tx.clone();
-        self.command_output.clear();
-        self.output_scroll = usize::MAX;
-        self.current_command = Some(format!("uninstall/remove {} apps/scripts", ids.len()));
+        self.begin_output(format!("uninstall/remove {} apps/scripts", ids.len()));
         let (pid_slot, cancel) = self.begin_job();
         let packages_clone = self.packages.clone();
         thread::spawn(move || {
@@ -1785,15 +1967,10 @@ impl App {
                             "--- uninstall {} ---",
                             id
                         )));
-                        let tx2 = tx.clone();
-                        let (string_tx, string_rx) = mpsc::channel::<String>();
-                        thread::spawn(move || {
-                            while let Ok(line) = string_rx.recv() {
-                                let _ = tx2.send(ActionResult::OutputLine(line));
-                            }
-                        });
                         let args = ["uninstall", id, "--silent", "--accept-source-agreements"];
-                        let _ = run_winget_stdout(&args, string_tx, Some(&pid_slot));
+                        relay_output(&tx, |lines| {
+                            let _ = run_winget_stdout(&args, lines, Some(&pid_slot));
+                        });
                     }
                     let _ = tx.send(ActionResult::OutputLine(String::new()));
                 }
@@ -1807,9 +1984,7 @@ impl App {
 
     fn show_json_package(&mut self, ids: Vec<String>) {
         let tx = self.action_tx.clone();
-        self.command_output.clear();
-        self.output_scroll = usize::MAX;
-        self.current_command = Some(format!("show {} apps/scripts", ids.len()));
+        self.begin_output(format!("show {} apps/scripts", ids.len()));
         let (pid_slot, cancel) = self.begin_job();
         let packages_clone = self.packages.clone();
         thread::spawn(move || {
@@ -1832,15 +2007,10 @@ impl App {
                         }
                     } else {
                         let _ = tx.send(ActionResult::OutputLine(format!("--- {} ---", id)));
-                        let tx2 = tx.clone();
-                        let (string_tx, string_rx) = mpsc::channel::<String>();
-                        thread::spawn(move || {
-                            while let Ok(line) = string_rx.recv() {
-                                let _ = tx2.send(ActionResult::OutputLine(line));
-                            }
-                        });
                         let args = ["show", id, "--accept-source-agreements"];
-                        let _ = run_winget_stdout(&args, string_tx, Some(&pid_slot));
+                        relay_output(&tx, |lines| {
+                            let _ = run_winget_stdout(&args, lines, Some(&pid_slot));
+                        });
                     }
                     let _ = tx.send(ActionResult::OutputLine(String::new()));
                 }
@@ -1853,11 +2023,13 @@ impl App {
     /// queue manager is a no-op on it.
     fn refresh_installed(&mut self) {
         let tx = self.action_tx.clone();
-        self.current_command = Some("winget list --refresh".to_string());
+        self.begin_output("winget list".to_string());
         let _ = self.begin_job();
         thread::spawn(move || {
             let list = list_installed();
+            let msg = refreshed_message("Installed list", list.len(), "packages");
             let _ = tx.send(ActionResult::RefreshInstalled(list));
+            let _ = tx.send(ActionResult::OutputLine(msg));
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
@@ -1866,11 +2038,13 @@ impl App {
     /// mid-flight (a quick, non-streaming read), like `refresh_installed`.
     fn refresh_updates(&mut self) {
         let tx = self.action_tx.clone();
-        self.current_command = Some("winget upgrade".to_string());
+        self.begin_output("winget upgrade".to_string());
         let _ = self.begin_job();
         thread::spawn(move || {
             let list = list_upgradable();
+            let msg = refreshed_message("Updates list", list.len(), "upgradable");
             let _ = tx.send(ActionResult::RefreshUpdates(list));
+            let _ = tx.send(ActionResult::OutputLine(msg));
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
@@ -1893,9 +2067,7 @@ impl App {
             return;
         }
         self.last_command = Some(line.clone());
-        self.command_output.clear();
-        self.output_scroll = usize::MAX;
-        self.current_command = Some(line);
+        self.begin_output(line);
 
         let tx = self.action_tx.clone();
         let (pid_slot, _cancel) = self.begin_job();
@@ -1904,15 +2076,10 @@ impl App {
                 "--- {} ---",
                 argv.join(" ")
             )));
-            let (string_tx, string_rx) = mpsc::channel::<String>();
-            let tx2 = tx.clone();
-            thread::spawn(move || {
-                while let Ok(l) = string_rx.recv() {
-                    let _ = tx2.send(ActionResult::OutputLine(l));
-                }
-            });
             let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
-            let _ = wgtui::run_command_stdout(&argv[0], &args, string_tx, Some(&pid_slot));
+            relay_output(&tx, |lines| {
+                let _ = wgtui::run_command_stdout(&argv[0], &args, lines, Some(&pid_slot));
+            });
             let _ = tx.send(ActionResult::RefreshInstalled(list_installed()));
             let _ = tx.send(ActionResult::UpgradeList(list_upgradable()));
             let _ = tx.send(ActionResult::CommandDone);
@@ -1961,9 +2128,9 @@ impl App {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("[y]", key),
+            Span::styled("[y/enter]", key),
             Span::raw(" quit    "),
-            Span::styled("[n]", key),
+            Span::styled("[n/esc]", key),
             Span::raw(" stay"),
         ]));
 
@@ -2584,6 +2751,18 @@ impl App {
                 Span::styled(rest.collect::<String>(), text),
                 Span::raw(" "),
             ])
+        } else if let Some(run) = self.output_view.and_then(|i| self.output_history.get(i)) {
+            let pos = self.output_view.unwrap_or(0) + 1;
+            Line::from(vec![
+                Span::styled(
+                    format!(" history {pos}/{} ", self.output_history.len()),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {} ", run.command), theme::title(true)),
+            ])
         } else {
             let icon = if busy {
                 SPINNER[self.spinner_frame as usize % SPINNER.len()]
@@ -2599,15 +2778,23 @@ impl App {
             };
             Line::from(vec![
                 Span::styled(format!(" {icon} "), Style::default().fg(theme::ACCENT)),
-                Span::styled(format!("{cmd} "), theme::title(false)),
+                Span::styled(format!("{cmd} "), theme::title(self.output_focused)),
             ])
         };
 
-        let border_col = if editing { theme::WARN } else { theme::MUTED };
+        let border_col = if editing {
+            theme::WARN
+        } else if self.output_focused {
+            theme::ACCENT
+        } else {
+            theme::MUTED
+        };
         let hint = if editing {
             " ←→ move · del · enter run · esc cancel "
+        } else if self.output_focused {
+            " j/k scroll · ←/→ history · g/G top/bottom · esc back "
         } else {
-            " output "
+            " o: scroll · history "
         };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -2621,25 +2808,38 @@ impl App {
             return;
         }
 
-        let total = self.command_output.len();
-        let h = inner.height as usize;
-        let scroll = if self.output_scroll == usize::MAX {
-            total.saturating_sub(h)
-        } else {
-            self.output_scroll.min(total.saturating_sub(1))
+        let lines = match self.output_view.and_then(|i| self.output_history.get(i)) {
+            Some(run) => &run.lines,
+            None => &self.command_output,
         };
-        let body: Vec<Line> = if self.command_output.is_empty() {
+        // Wrapped, so long lines (a Windows Update title, a winget table row)
+        // stay readable instead of being cut at the panel's edge. Scrolling
+        // works in these rows.
+        let rows: Vec<String> = lines
+            .iter()
+            .flat_map(|l| wrap_line(l, inner.width as usize))
+            .collect();
+        let total = rows.len();
+        let h = inner.height as usize;
+        self.output_metrics.set((total, h));
+        let max_top = total.saturating_sub(h);
+        let scroll = if self.output_scroll == usize::MAX {
+            max_top
+        } else {
+            self.output_scroll.min(max_top)
+        };
+        let body: Vec<Line> = if rows.is_empty() {
             vec![Line::from(Span::styled(
                 "winget output shows up here",
                 theme::dim().add_modifier(Modifier::ITALIC),
             ))]
         } else {
-            self.command_output
+            rows[scroll..(scroll + h).min(total)]
                 .iter()
                 .map(|l| Line::raw(l.as_str()))
                 .collect()
         };
-        f.render_widget(Paragraph::new(body).scroll((scroll as u16, 0)), inner);
+        f.render_widget(Paragraph::new(body), inner);
 
         if total > h {
             let mut sb = ScrollbarState::new(total).position(scroll);
@@ -2664,7 +2864,17 @@ impl App {
         };
 
         let mut left: Vec<Span> = Vec::new();
-        if self.queue_focused {
+        if self.output_focused {
+            for (k, d) in [
+                ("j/k", "scroll"),
+                ("←/→", "history"),
+                ("g/G", "top/bottom"),
+                ("PgUp/PgDn", "page"),
+                ("esc", "back"),
+            ] {
+                push_hint(&mut left, k, d);
+            }
+        } else if self.queue_focused {
             for (k, d) in [
                 ("j/k", "move"),
                 ("d", "remove"),
@@ -2683,6 +2893,7 @@ impl App {
                 push_hint(&mut left, k, d);
             }
             push_hint(&mut left, "c", "cmd");
+            push_hint(&mut left, "o", "output");
             if self.queue.is_empty() && self.running_job.is_none() {
                 push_hint(&mut left, "Q", "queue");
             } else {
@@ -2990,7 +3201,7 @@ mod tests {
         let mut app = App::new();
         app.tab = Tab::Updates;
         app.handle_key(ke(KeyCode::Char('q')));
-        for k in [KeyCode::Char('l'), KeyCode::Char('3'), KeyCode::Enter] {
+        for k in [KeyCode::Char('l'), KeyCode::Char('3'), KeyCode::Char('u')] {
             app.handle_key(ke(k));
         }
         assert_eq!(app.tab, Tab::Updates);
@@ -3018,7 +3229,10 @@ mod tests {
         app.quit_confirm_open = true;
         let text = draw_text(&app, 100, 30);
         assert!(text.contains("Quit wgtui?"), "{text}");
-        assert!(text.contains("[y]") && text.contains("[n]"), "{text}");
+        assert!(
+            text.contains("[y/enter]") && text.contains("[n/esc]"),
+            "{text}"
+        );
         draw(&app, 8, 4);
     }
 
@@ -3703,13 +3917,19 @@ mod tests {
     }
 
     #[test]
-    fn refresh_updates_result_replaces_the_list_and_reports_it() {
+    fn refresh_updates_result_replaces_the_list() {
+        // The output side (title + "refreshed" line) now belongs to the
+        // refresh job's own run; the result only carries the list.
         let mut app = App::new();
         app.updates = vec![upkg("old")];
-        app.updates_sel.cursor = 0;
+        app.updates_sel.cursor = 1;
         app.handle_action_result(ActionResult::RefreshUpdates(vec![upkg("a"), upkg("b")]));
         assert_eq!(app.updates.len(), 2);
-        assert_eq!(app.current_command.as_deref(), Some("winget upgrade"));
+        assert_eq!(app.updates_sel.cursor, 0);
+        assert_eq!(
+            refreshed_message("Updates list", 2, "upgradable"),
+            "Updates list refreshed: 2 upgradable."
+        );
     }
 
     #[test]
@@ -3999,5 +4219,349 @@ mod tests {
         let app = App::new();
         assert_eq!(app.update, UpdateState::Idle);
         assert!(!app.update_prompt_open);
+    }
+
+    // ----- quit confirmation: Enter confirms too -----
+
+    #[test]
+    fn enter_confirms_the_quit_prompt_like_y() {
+        let mut app = App::new();
+        app.handle_key(ke(KeyCode::Char('q')));
+        assert!(app.quit_confirm_open);
+        app.handle_key(ke(KeyCode::Enter));
+        assert!(app.should_quit, "Enter confirms, same as y");
+
+        let mut app = App::new();
+        app.handle_key(ke(KeyCode::Esc));
+        app.handle_key(ke(KeyCode::Enter));
+        assert!(app.should_quit, "Esc then Enter quits");
+    }
+
+    #[test]
+    fn quit_prompt_shows_enter_and_esc_alongside_y_and_n() {
+        let mut app = populated();
+        app.quit_confirm_open = true;
+        let text = draw_text(&app, 100, 30);
+        assert!(text.contains("[y/enter]"), "{text}");
+        assert!(text.contains("[n/esc]"), "{text}");
+    }
+
+    // ----- output line cleanup and wrapping -----
+
+    #[test]
+    fn sanitize_strips_terminal_control_sequences() {
+        // Anything a child prints ends up inside ratatui cells; raw ESC/CR
+        // bytes there are sent to the real terminal and wreck the layout.
+        assert_eq!(sanitize_output_line("\x1b[32mok\x1b[0m done"), "ok done");
+        assert_eq!(sanitize_output_line("\x1b]0;title\x07after"), "after");
+        assert_eq!(
+            sanitize_output_line("10%\r20%\r30%"),
+            "30%",
+            "CR overwrites"
+        );
+        assert_eq!(sanitize_output_line("bell\x07 and nul\0"), "bell and nul");
+        assert_eq!(
+            sanitize_output_line("a\tb"),
+            "a       b",
+            "tab to next stop"
+        );
+        assert_eq!(sanitize_output_line("trailing   "), "trailing");
+        assert_eq!(
+            sanitize_output_line("Atualização de inteligência"),
+            "Atualização de inteligência"
+        );
+    }
+
+    #[test]
+    fn wrap_line_breaks_at_spaces_and_hard_breaks_long_words() {
+        assert_eq!(wrap_line("hello world foo", 11), vec!["hello world", "foo"]);
+        assert_eq!(wrap_line("abcdefghijkl", 5), vec!["abcde", "fghij", "kl"]);
+        assert_eq!(wrap_line("short", 20), vec!["short"]);
+        assert_eq!(wrap_line("", 20), vec![""]);
+        assert_eq!(wrap_line("ção ção ção", 7), vec!["ção ção", "ção"]);
+        assert_eq!(
+            wrap_line("anything", 0),
+            vec!["anything"],
+            "no width: no wrap"
+        );
+    }
+
+    #[test]
+    fn output_lines_are_sanitized_and_blank_runs_collapse() {
+        let mut app = App::new();
+        app.begin_output("winget x".to_string());
+        for l in ["", "\x1b[1mbold\x1b[0m", "", "", "  ", "end", ""] {
+            app.handle_action_result(ActionResult::OutputLine(l.to_string()));
+        }
+        assert_eq!(app.command_output, vec!["bold", "", "end", ""]);
+    }
+
+    // ----- output history -----
+
+    fn run_with_output(app: &mut App, command: &str, lines: &[&str]) {
+        app.begin_output(command.to_string());
+        for l in lines {
+            app.handle_action_result(ActionResult::OutputLine((*l).to_string()));
+        }
+    }
+
+    #[test]
+    fn starting_a_command_archives_the_previous_output() {
+        let mut app = App::new();
+        run_with_output(&mut app, "cmd A", &["a1", "a2"]);
+        assert!(
+            app.output_history.is_empty(),
+            "nothing before the first run"
+        );
+
+        run_with_output(&mut app, "cmd B", &["b1"]);
+        assert_eq!(app.output_history.len(), 1);
+        assert_eq!(app.output_history[0].command, "cmd A");
+        assert_eq!(app.output_history[0].lines, vec!["a1", "a2"]);
+        assert_eq!(app.current_command.as_deref(), Some("cmd B"));
+        assert_eq!(app.command_output, vec!["b1"]);
+    }
+
+    #[test]
+    fn output_history_keeps_the_most_recent_runs_only() {
+        let mut app = App::new();
+        for i in 0..OUTPUT_HISTORY_CAP + 10 {
+            run_with_output(&mut app, &format!("cmd {i}"), &["x"]);
+        }
+        assert_eq!(app.output_history.len(), OUTPUT_HISTORY_CAP);
+        assert_eq!(
+            app.output_history[0].command, "cmd 9",
+            "oldest ones dropped"
+        );
+    }
+
+    #[test]
+    fn background_list_refreshes_do_not_wipe_the_command_output() {
+        // Regression: install/upgrade/remove/[c] all refresh the installed
+        // list when they finish, and that replaced their whole output with
+        // "Package list refreshed." — the log of what just ran vanished.
+        let mut app = App::new();
+        run_with_output(
+            &mut app,
+            "winget upgrade 1 packages",
+            &["Successfully installed"],
+        );
+
+        app.handle_action_result(ActionResult::RefreshInstalled(vec![wpkg("a")]));
+        app.handle_action_result(ActionResult::RefreshUpdates(vec![upkg("b")]));
+
+        assert_eq!(app.command_output, vec!["Successfully installed"]);
+        assert_eq!(
+            app.current_command.as_deref(),
+            Some("winget upgrade 1 packages")
+        );
+        assert_eq!(app.installed.len(), 1);
+        assert_eq!(app.updates.len(), 1);
+    }
+
+    #[test]
+    fn relay_output_delivers_every_line_before_returning() {
+        // Anything a job sends after its output (refreshes, CommandDone) must
+        // not overtake the output, or late lines land in the next run.
+        let (tx, rx) = mpsc::channel();
+        relay_output(&tx, |lines| {
+            for i in 0..500 {
+                let _ = lines.send(i.to_string());
+            }
+        });
+        let _ = tx.send(ActionResult::CommandDone);
+        drop(tx);
+        let got: Vec<ActionResult> = rx.iter().collect();
+        assert_eq!(got.len(), 501);
+        assert!(matches!(got.last(), Some(ActionResult::CommandDone)));
+        assert!(
+            got[..500]
+                .iter()
+                .all(|r| matches!(r, ActionResult::OutputLine(_)))
+        );
+    }
+
+    // ----- output panel focus & navigation -----
+
+    #[test]
+    fn o_focuses_the_output_panel_and_esc_o_or_q_leave_it() {
+        for leave in [KeyCode::Esc, KeyCode::Char('o'), KeyCode::Char('q')] {
+            let mut app = App::new();
+            app.handle_key(ke(KeyCode::Char('o')));
+            assert!(app.output_focused);
+            app.handle_key(ke(leave));
+            assert!(!app.output_focused, "{leave:?} leaves");
+            assert!(!app.quit_confirm_open, "{leave:?} doesn't ask to quit");
+        }
+    }
+
+    #[test]
+    fn focused_output_panel_swallows_other_keys() {
+        let mut app = App::new();
+        app.tab = Tab::Updates;
+        app.handle_key(ke(KeyCode::Char('o')));
+        for k in [
+            KeyCode::Char('3'),
+            KeyCode::Tab,
+            KeyCode::Char('U'),
+            KeyCode::Char('c'),
+        ] {
+            app.handle_key(ke(k));
+        }
+        assert_eq!(app.tab, Tab::Updates);
+        assert!(app.queue.is_empty() && !app.busy, "U must not run");
+        assert!(app.command_input.is_none());
+        assert!(app.output_focused);
+    }
+
+    #[test]
+    fn left_and_right_walk_through_the_output_history() {
+        let mut app = App::new();
+        run_with_output(&mut app, "cmd A", &["a"]);
+        run_with_output(&mut app, "cmd B", &["b"]);
+        run_with_output(&mut app, "cmd C (live)", &["c"]);
+        app.handle_key(ke(KeyCode::Char('o')));
+        assert_eq!(app.output_view, None, "starts on the live output");
+
+        press(&mut app, &[KeyCode::Left]);
+        assert_eq!(app.output_view, Some(1), "newest archived run: B");
+        press(&mut app, &[KeyCode::Char('h')]);
+        assert_eq!(app.output_view, Some(0));
+        press(&mut app, &[KeyCode::Left]);
+        assert_eq!(app.output_view, Some(0), "stops at the oldest");
+
+        press(&mut app, &[KeyCode::Right]);
+        assert_eq!(app.output_view, Some(1));
+        press(&mut app, &[KeyCode::Char('l')]);
+        assert_eq!(app.output_view, None, "back to live");
+        press(&mut app, &[KeyCode::Right]);
+        assert_eq!(app.output_view, None);
+
+        press(&mut app, &[KeyCode::Left, KeyCode::Esc]);
+        assert_eq!(app.output_view, None, "leaving focus returns to live");
+    }
+
+    #[test]
+    fn viewing_history_renders_that_run_not_the_live_one() {
+        let mut app = App::new();
+        run_with_output(&mut app, "winget install Old.Pkg", &["OLDLINE"]);
+        run_with_output(&mut app, "winget upgrade New.Pkg", &["LIVELINE"]);
+        app.handle_key(ke(KeyCode::Char('o')));
+        app.handle_key(ke(KeyCode::Left));
+        let text = draw_text(&app, 100, 30);
+        assert!(text.contains("history 1/1"), "{text}");
+        assert!(text.contains("winget install Old.Pkg"), "{text}");
+        assert!(text.contains("OLDLINE"), "{text}");
+        assert!(!text.contains("LIVELINE"), "{text}");
+    }
+
+    #[test]
+    fn focused_output_scrolls_with_jk_and_jumps_with_g() {
+        let mut app = App::new();
+        let lines: Vec<String> = (0..40).map(|i| format!("line{i:02}")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        run_with_output(&mut app, "long", &refs);
+        app.handle_key(ke(KeyCode::Char('o')));
+
+        let text = draw_text(&app, 100, 30);
+        assert!(
+            text.contains("line39") && !text.contains("line00"),
+            "follows the end"
+        );
+
+        press(&mut app, &[KeyCode::Char('g')]);
+        let text = draw_text(&app, 100, 30);
+        assert!(
+            text.contains("line00") && !text.contains("line39"),
+            "g: top"
+        );
+
+        press(&mut app, &[KeyCode::Char('j')]);
+        let text = draw_text(&app, 100, 30);
+        assert!(
+            !text.contains("line00") && text.contains("line01"),
+            "j: down one"
+        );
+        press(&mut app, &[KeyCode::Char('k')]);
+        assert!(draw_text(&app, 100, 30).contains("line00"), "k: up one");
+
+        press(&mut app, &[KeyCode::Char('G')]);
+        assert!(draw_text(&app, 100, 30).contains("line39"), "G: bottom");
+        press(&mut app, &[KeyCode::Home]);
+        assert!(draw_text(&app, 100, 30).contains("line00"), "Home: top");
+        press(&mut app, &[KeyCode::End]);
+        assert!(draw_text(&app, 100, 30).contains("line39"), "End: bottom");
+    }
+
+    #[test]
+    fn page_keys_scroll_the_output_without_focusing_it() {
+        let mut app = App::new();
+        let lines: Vec<String> = (0..40).map(|i| format!("line{i:02}")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        run_with_output(&mut app, "long", &refs);
+        draw(&app, 100, 30);
+        press(&mut app, &[KeyCode::PageUp; 20]);
+        assert!(draw_text(&app, 100, 30).contains("line00"));
+        press(&mut app, &[KeyCode::PageDown; 20]);
+        assert!(draw_text(&app, 100, 30).contains("line39"));
+        assert!(!app.output_focused);
+    }
+
+    #[test]
+    fn long_output_lines_wrap_instead_of_being_cut_off() {
+        // A Windows Update result row (long title) used to be clipped at the
+        // panel's right edge.
+        let mut app = App::new();
+        let long = format!("{} TAILTOKEN", "word ".repeat(40));
+        run_with_output(&mut app, "wu", &[&long]);
+        let text = draw_text(&app, 100, 30);
+        assert!(text.contains("TAILTOKEN"), "{text}");
+    }
+
+    #[test]
+    fn output_panel_shows_how_to_navigate_when_focused() {
+        let mut app = populated();
+        assert!(
+            draw_text(&app, 160, 30).contains("o output"),
+            "status bar hint"
+        );
+        app.handle_key(ke(KeyCode::Char('o')));
+        let text = draw_text(&app, 160, 30);
+        assert!(text.contains("←/→ history"), "{text}");
+        assert!(text.contains("g/G"), "{text}");
+    }
+
+    #[test]
+    fn windows_update_echo_is_one_short_line_naming_the_real_command() {
+        // Found driving the real app: echoing the full powershell argument
+        // line (preamble, try/catch, stream labelling) wrapped to ~10 rows
+        // and filled the panel, pushing the actual output out of view.
+        let echo = windows_update_echo();
+        assert!(!echo.contains('\n'));
+        assert!(echo.chars().count() <= 100, "{echo}");
+        assert!(
+            echo.contains("Get-WindowsUpdate -AcceptAll -Install -IgnoreReboot"),
+            "{echo}"
+        );
+    }
+
+    #[test]
+    fn output_panel_title_says_how_to_focus_it_even_when_the_status_bar_overflows() {
+        // At 120 columns the status bar is cut off before its `o output`
+        // hint (found driving the real app), so the panel says it too.
+        let app = populated();
+        let text = draw_text(&app, 120, 40);
+        assert!(text.contains("o: scroll · history"), "{text}");
+    }
+
+    #[test]
+    fn output_focus_renders_in_tiny_frames() {
+        let mut app = populated();
+        run_with_output(&mut app, "x", &["y"]);
+        app.handle_key(ke(KeyCode::Char('o')));
+        app.handle_key(ke(KeyCode::Left));
+        for (w, h) in [(110, 32), (40, 10), (8, 4), (3, 3)] {
+            draw(&app, w, h);
+        }
     }
 }

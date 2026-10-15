@@ -31,7 +31,7 @@ Aberta por `q` / `Esc` no contexto global. Captura todas as teclas enquanto aber
 
 | Tecla | Ação | Código |
 |---|---|---|
-| `y` / `Y` | Sai do app | `handle_quit_confirm_key` |
+| `y` / `Y` / `Enter` | Sai do app | `handle_quit_confirm_key` |
 | `n` / `N` / `Esc` | Cancela e volta | `handle_quit_confirm_key` |
 
 ## 4. Editor de comando `[c]`
@@ -63,7 +63,23 @@ Captura todas as teclas enquanto focado.
 | `x` | Cancela o comando em execução (mata o processo) | idem |
 | `Esc` / `q` | Volta | idem |
 
-## 6. Seletor de arquivo de manifesto (aba 4)
+## 6. Painel Output focado `[o]`
+
+Captura todas as teclas enquanto focado. O painel guarda as últimas 50 execuções; ao sair,
+volta para a execução atual.
+
+| Tecla | Ação | Código |
+|---|---|---|
+| `j` / `↓` | Rola uma linha para baixo | `handle_output_key` |
+| `k` / `↑` | Rola uma linha para cima | idem |
+| `PageDown` / `PageUp` | Rola uma página | idem |
+| `g` / `Home` | Vai para o início | idem |
+| `G` / `End` | Vai para o fim (e volta a acompanhar a saída) | idem |
+| `←` / `h` | Execução anterior no histórico | idem |
+| `→` / `l` | Execução seguinte (depois da mais recente, volta à atual) | idem |
+| `Esc` / `o` / `q` | Volta | idem |
+
+## 7. Seletor de arquivo de manifesto (aba 4)
 
 Ativo quando há vários `.json` e o seletor está aberto.
 
@@ -74,7 +90,7 @@ Ativo quando há vários `.json` e o seletor está aberto.
 | `Enter` | Carrega o arquivo | idem |
 | `Esc` | Fecha o seletor | idem |
 
-## 7. Filtro focado (`/`)
+## 8. Filtro focado (`/`)
 
 | Tecla | Ação | Código |
 |---|---|---|
@@ -85,7 +101,7 @@ Ativo quando há vários `.json` e o seletor está aberto.
 | `↑` / `↓` | Sai do filtro e move na lista | idem |
 | `Tab` / `Shift+Tab` / `←` / `→` | Trocam de aba (passam direto) | idem |
 
-## 8. Global (lista, fora dos modos acima)
+## 9. Global (lista, fora dos modos acima)
 
 | Tecla | Ação | Código |
 |---|---|---|
@@ -100,10 +116,11 @@ Ativo quando há vários `.json` e o seletor está aberto.
 | `Enter` | Mostra detalhes | idem |
 | `c` | Abre o editor de comando com o último comando | idem |
 | `Q` | Abre o gerenciador de fila (só se houver algo rodando/pendente) | idem |
-| `PageUp` / `PageDown` | Rola o painel Output | idem |
+| `o` | Foca o painel Output (rolagem e histórico de execuções) | idem |
+| `PageUp` / `PageDown` | Rola o painel Output uma página | idem |
 | `q` / `Esc` | Pede confirmação para sair do app | idem |
 
-## 9. Por aba
+## 10. Por aba
 
 Só chegam aqui teclas que o global não tratou.
 
@@ -144,9 +161,12 @@ Só chegam aqui teclas que o global não tratou.
 
 Além do handler, o texto da tecla aparece em vários lugares:
 
-1. **Barra de status**: `Tab::hints()` (por aba) e `render_status_bar` (globais e fila).
-2. **Títulos dos painéis**: dica da fila (`" j/k move · d remove ..."`) e do editor
-   `[c]` (`" ←→ move · del · enter run · esc cancel "`); prompts modais de atualização e de saída (`[y]`/`[n]`/`[esc]`).
+1. **Barra de status**: `Tab::hints()` (por aba) e `render_status_bar` (globais, fila e
+   painel Output focado).
+2. **Títulos dos painéis**: dica da fila (`" j/k move · d remove ..."`), do editor
+   `[c]` (`" ←→ move · del · enter run · esc cancel "`) e do Output (`" o: scroll · history "`,
+   e focado `" j/k scroll · ←/→ history · g/G top/bottom · esc back "`); prompts modais de
+   atualização (`[y]`/`[n]`/`[esc]`) e de saída (`[y/enter]`/`[n/esc]`).
 3. **Testes** em `src/tui.rs` (`mod tests`) que pressionam a tecla antiga.
 4. **README.md**, seção "Abas e teclas".
 5. **Este arquivo.**

@@ -349,12 +349,46 @@ pub fn run_command_stdout(
     tx: mpsc::Sender<String>,
     pid_slot: Option<&PidSlot>,
 ) -> Result<(), String> {
-    let mut child = Command::new(cmd)
-        .args(args)
+    let mut command = Command::new(cmd);
+    command.args(args);
+    stream_command(command, cmd, tx, pid_slot)
+}
+
+/// Sends each line of `reader` through `tx`. Bytes that aren't valid UTF-8
+/// become U+FFFD instead of ending the stream: a child writing in a legacy
+/// code page used to lose every line from the first accented one on.
+fn forward_lines(reader: impl std::io::Read, tx: &mpsc::Sender<String>) {
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                    buf.pop();
+                }
+                if tx.send(String::from_utf8_lossy(&buf).into_owned()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Spawns `command` with stdout and stderr piped and streams both, line by
+/// line, through `tx`. See [`run_command_stdout`] for `pid_slot`.
+fn stream_command(
+    mut command: Command,
+    name: &str,
+    tx: mpsc::Sender<String>,
+    pid_slot: Option<&PidSlot>,
+) -> Result<(), String> {
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to spawn {cmd}: {e}"))?;
+        .map_err(|e| format!("Failed to spawn {name}: {e}"))?;
 
     if let Some(slot) = pid_slot {
         *slot.lock().unwrap() = Some(child.id());
@@ -364,31 +398,8 @@ pub fn run_command_stdout(
     let stderr = child.stderr.take().ok_or("No stderr")?;
 
     let stderr_tx = tx.clone();
-    let stderr_handle = std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            match line {
-                Ok(l) => {
-                    if stderr_tx.send(l).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let reader = BufReader::new(stdout);
-    for line in reader.lines() {
-        match line {
-            Ok(l) => {
-                if tx.send(l).is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
+    let stderr_handle = std::thread::spawn(move || forward_lines(stderr, &stderr_tx));
+    forward_lines(stdout, &tx);
     let _ = stderr_handle.join();
     let _ = child.wait();
     if let Some(slot) = pid_slot {
@@ -456,6 +467,79 @@ pub const WINDOWS_UPDATE_INSTALL_PS: &str = "\
     Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser }; \
     Import-Module PSWindowsUpdate; \
     Get-WindowsUpdate -AcceptAll -Install -IgnoreReboot";
+
+/// Appended to a PowerShell command whose output we show: merges every
+/// stream (errors, warnings, verbose, `Write-Host`) into the output in order,
+/// labels errors/warnings/verbose the way the console would (an error as its
+/// message only — the default view adds the failing statement, which for a
+/// `-Command` script is the entire script), and formats it 512 columns wide.
+/// In a hidden console PowerShell would otherwise format tables to 120
+/// columns and cut long update titles.
+pub const PS_STREAM_FORMAT: &str = "*>&1 | ForEach-Object { \
+    if ($_ -is [System.Management.Automation.ErrorRecord]) { \"ERROR: $_\" } \
+    elseif ($_ -is [System.Management.Automation.WarningRecord]) { \"WARNING: $_\" } \
+    elseif ($_ -is [System.Management.Automation.VerboseRecord]) { \"VERBOSE: $_\" } \
+    else { $_ } } | Out-String -Stream -Width 512";
+
+/// Prepended to every script `run_powershell_stdout` runs. UTF-8 output
+/// because Windows PowerShell otherwise writes piped text in the console's
+/// OEM code page (850 on a pt-BR machine). Progress silenced because it is
+/// drawn on the console rather than written to the pipe.
+const PS_PREAMBLE: &str = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); \
+                           $ProgressPreference = 'SilentlyContinue'; ";
+
+/// The full Windows Update install script (see [`WINDOWS_UPDATE_INSTALL_PS`]),
+/// with `-Verbose` and [`PS_STREAM_FORMAT`] so what the user sees while it
+/// runs is the module's own messages and an untruncated result table.
+#[must_use]
+pub fn windows_update_install_script() -> String {
+    format!("{WINDOWS_UPDATE_INSTALL_PS} -Verbose {PS_STREAM_FORMAT}")
+}
+
+/// `powershell.exe` arguments for `script`: no profile, never prompts
+/// (`-NonInteractive` fails fast instead of waiting on a hidden prompt),
+/// [`PS_PREAMBLE`] first, and the script wrapped so a terminating error is
+/// reported as one `ERROR: <message>` line (exit code 1) rather than
+/// PowerShell's multi-line view quoting the whole one-line script.
+#[must_use]
+pub fn powershell_args(script: &str) -> Vec<String> {
+    [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .chain([format!(
+        "{PS_PREAMBLE}try {{ {script} }} catch {{ \"ERROR: $($_.Exception.Message)\"; exit 1 }}"
+    )])
+    .collect()
+}
+
+/// Runs a PowerShell script, streaming its output like [`run_command_stdout`].
+///
+/// The child gets its own hidden console (`CREATE_NO_WINDOW`) instead of
+/// sharing wgtui's. On a shared console, anything PowerShell draws there
+/// rather than writes to stdout — its progress bar was the visible case,
+/// painting a cyan block over the TUI during a Windows Update install — lands
+/// on top of the interface.
+pub fn run_powershell_stdout(
+    script: &str,
+    tx: mpsc::Sender<String>,
+    pid_slot: Option<&PidSlot>,
+) -> Result<(), String> {
+    let mut cmd = Command::new("powershell");
+    cmd.args(powershell_args(script)).stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    stream_command(cmd, "powershell", tx, pid_slot)
+}
 
 /// Whether the manifest entry `id` / `name` matches something in `installed`.
 ///
@@ -1175,17 +1259,192 @@ Weird Local App                             1.0        2.0
         // PSWindowsUpdate's own error handling for the unelevated case isn't
         // reliable enough to depend on, so check explicitly and fail fast
         // with a clear message before even touching the module.
+        let script = windows_update_install_script();
         assert!(
-            WINDOWS_UPDATE_INSTALL_PS
-                .contains("IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"),
-            "must check elevation explicitly: {WINDOWS_UPDATE_INSTALL_PS}"
+            script.contains("IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"),
+            "must check elevation explicitly: {script}"
         );
-        let admin_idx = WINDOWS_UPDATE_INSTALL_PS
-            .find("IsInRole")
-            .expect("elevation check present");
-        let install_idx = WINDOWS_UPDATE_INSTALL_PS
+        let admin_idx = script.find("IsInRole").expect("elevation check present");
+        let install_idx = script
             .find("Get-WindowsUpdate")
             .expect("Get-WindowsUpdate present");
         assert!(admin_idx < install_idx);
+    }
+
+    #[test]
+    fn windows_update_install_script_streams_every_message_at_full_width() {
+        // The install's own output is the only progress the user sees (the
+        // progress bar is silenced), so verbose/warning/host messages are
+        // merged in, and the result table is formatted wide enough that long
+        // update titles aren't cut by PowerShell's 120-column default.
+        let script = windows_update_install_script();
+        assert!(
+            script.ends_with(&format!(
+                "Get-WindowsUpdate -AcceptAll -Install -IgnoreReboot -Verbose {PS_STREAM_FORMAT}"
+            )),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn powershell_args_are_non_interactive_utf8_and_progress_free() {
+        let args = powershell_args("'hi'");
+        assert!(args.iter().any(|a| a == "-NonInteractive"), "{args:?}");
+        assert!(args.iter().any(|a| a == "-NoProfile"), "{args:?}");
+        let script = args.last().unwrap();
+        assert!(script.contains("UTF8Encoding"), "{script}");
+        assert!(
+            script.contains("$ProgressPreference = 'SilentlyContinue'"),
+            "{script}"
+        );
+        assert!(script.contains("try { 'hi' } catch"), "{script}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_command_stdout_keeps_reading_past_invalid_utf8() {
+        // Regression (found verifying the Windows Update output): Windows
+        // PowerShell writes piped text in the console's OEM code page (850
+        // here, so "ç" is byte 0x87). `lines()` errors on that and the loop
+        // stopped — every line from the first accented one on was lost.
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("cp850.txt");
+        std::fs::write(&raw, [b'A', 0x87, b'\r', b'\n', b'B', b'\r', b'\n']).unwrap();
+        let (tx, rx) = mpsc::channel();
+        run_command_stdout("cmd", &["/C", "type", raw.to_str().unwrap()], tx, None).unwrap();
+        let lines: Vec<String> = rx.iter().collect();
+        assert_eq!(lines, vec!["A\u{FFFD}".to_string(), "B".to_string()]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_powershell_stdout_decodes_accents_and_keeps_every_line() {
+        let (tx, rx) = mpsc::channel();
+        run_powershell_stdout("'Atualização de inteligência'; 'linha final'", tx, None).unwrap();
+        let lines: Vec<String> = rx.iter().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "Atualização de inteligência".to_string(),
+                "linha final".to_string()
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_powershell_stdout_streams_what_the_windows_update_install_prints() {
+        // A stand-in for Get-WindowsUpdate, run through the exact output
+        // formatting the real install script uses: a progress bar, a verbose
+        // message, a warning, Write-Host, and a result row whose title is
+        // long and accented, like the real Defender update title.
+        let title = format!(
+            "Atualização de inteligência de segurança para Microsoft Defender Antivirus \
+             - KB2267602 (versão 1.459.241.0) - Canal atual (amplo) {}",
+            "x".repeat(60)
+        );
+        let script = format!(
+            "function Fake-WU {{ [CmdletBinding()] param() \
+               Write-Progress -Activity 'Download updates for PC' -Status '[0/2]' -PercentComplete 10; \
+               Write-Verbose 'Connecting to Windows Update server'; \
+               Write-Warning 'Reboot is required'; \
+               Write-Host 'host line'; \
+               [pscustomobject]@{{ X = 1; Result = 'Accepted'; KB = 'KB2267602'; Size = '2GB'; Title = '{title}' }} }}; \
+             Fake-WU -Verbose {PS_STREAM_FORMAT}; 'linha final'"
+        );
+        let (tx, rx) = mpsc::channel();
+        run_powershell_stdout(&script, tx, None).unwrap();
+        let lines: Vec<String> = rx.iter().collect();
+        let all = lines.join("\n");
+
+        assert!(
+            lines.contains(&"VERBOSE: Connecting to Windows Update server".to_string()),
+            "verbose progress text must reach the output, labelled: {all}"
+        );
+        assert!(
+            lines.contains(&"WARNING: Reboot is required".to_string()),
+            "{all}"
+        );
+        assert!(lines.iter().any(|l| l.contains("host line")), "{all}");
+        assert!(
+            lines.iter().any(|l| l.contains(&title)),
+            "the full title, untruncated and with its accents: {all}"
+        );
+        assert!(
+            !all.contains("Download updates"),
+            "no progress-bar text: {all}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("linha final"),
+            "{all}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_powershell_stdout_reports_errors_as_one_concise_line() {
+        // PowerShell's default error view prints the failing statement — and
+        // a -Command script is one long line, so that was the whole install
+        // script — plus CategoryInfo/FullyQualifiedErrorId noise. The user
+        // should see the message, e.g. that the install needs Administrator.
+        let (tx, rx) = mpsc::channel();
+        run_powershell_stdout(
+            "'before'; throw 'requires an elevated (Administrator) process.'; 'never'",
+            tx,
+            None,
+        )
+        .unwrap();
+        let lines: Vec<String> = rx.iter().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "before".to_string(),
+                "ERROR: requires an elevated (Administrator) process.".to_string()
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stream_format_labels_non_terminating_errors_concisely() {
+        let (tx, rx) = mpsc::channel();
+        run_powershell_stdout(
+            &format!("& {{ Write-Error 'falhou algo'; 'depois' }} {PS_STREAM_FORMAT}"),
+            tx,
+            None,
+        )
+        .unwrap();
+        let lines: Vec<String> = rx.iter().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines,
+            vec!["ERROR: falhou algo".to_string(), "depois".to_string()]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_powershell_stdout_leaves_the_callers_console_code_page_alone() {
+        // A child sharing wgtui's console can change that console's code page
+        // for good (verified: `chcp 65001` in a child sticks for the next
+        // process), so whatever the PowerShell preamble does to switch its
+        // output to UTF-8 must never leak into the user's terminal.
+        let chcp = || {
+            let out = std::process::Command::new("cmd")
+                .args(["/C", "chcp"])
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            text.split(|c: char| !c.is_ascii_digit())
+                .rfind(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let Some(before) = chcp() else {
+            return; // no console attached to the test process — nothing to leak into
+        };
+        let (tx, rx) = mpsc::channel();
+        run_powershell_stdout("'x'", tx, None).unwrap();
+        let _ = rx.iter().count();
+        assert_eq!(chcp(), Some(before));
     }
 }
