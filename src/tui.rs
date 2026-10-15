@@ -209,7 +209,8 @@ impl Tab {
                 ("a", "all"),
                 ("u", "upgrade"),
                 ("U", "upgrade all"),
-                ("W", "install win updates"),
+                ("w", "install win updates"),
+                ("r", "recheck"),
                 ("enter", "details"),
             ],
             Tab::Search => &[("enter", "search"), ("space", "mark"), ("i", "install")],
@@ -217,14 +218,15 @@ impl Tab {
                 ("space", "mark"),
                 ("a", "all"),
                 ("u", "upgrade"),
-                ("r", "remove"),
-                ("R", "refresh"),
+                ("x", "remove"),
+                ("r", "refresh"),
             ],
             Tab::Packages => &[
                 ("space", "mark"),
                 ("i", "install"),
                 ("I", "all"),
-                ("r", "remove"),
+                ("x", "remove"),
+                ("X", "remove all"),
                 ("F", "file"),
             ],
         }
@@ -250,6 +252,7 @@ enum ActionResult {
         error: String,
     },
     RefreshInstalled(Vec<WingetPackage>),
+    RefreshUpdates(Vec<UpgradablePackage>),
     OutputLine(String),
     CommandDone,
     /// The startup check found a release newer than this build (its tag).
@@ -283,6 +286,7 @@ enum QueuedAction {
     RemoveJsonMulti(Vec<String>),
     ShowJsonPackage(Vec<String>),
     RefreshInstalled,
+    RefreshUpdates,
     ManualCommand(String),
     Search(String),
     InstallWindowsUpdates,
@@ -312,6 +316,7 @@ impl QueuedAction {
             }
             QueuedAction::UpgradeAll => "upgrade all packages".to_string(),
             QueuedAction::RefreshInstalled => "refresh installed list".to_string(),
+            QueuedAction::RefreshUpdates => "refresh updates list".to_string(),
             QueuedAction::ManualCommand(line) => line.clone(),
             QueuedAction::Search(query) => format!("search \"{query}\""),
             QueuedAction::InstallWindowsUpdates => "install Windows Update".to_string(),
@@ -472,6 +477,8 @@ pub struct App {
     /// The prompt has something new to say but hasn't opened yet — it waits
     /// for the user to stop typing so a stray `y`/`n` is never an answer.
     update_prompt_pending: bool,
+    /// The "Quit wgtui?" confirmation (`q`/`Esc`) is on screen and capturing keys.
+    quit_confirm_open: bool,
     /// Downloads and installs a release by tag. A field so tests can stub it
     /// instead of hitting the network and replacing the real exe.
     update_installer: fn(&str) -> Result<(), String>,
@@ -552,6 +559,7 @@ impl App {
             update: UpdateState::Idle,
             update_prompt_open: false,
             update_prompt_pending: false,
+            quit_confirm_open: false,
             update_installer: update::download_and_install,
             spinner_frame: 0,
             action_tx: tx,
@@ -672,6 +680,13 @@ impl App {
                 self.command_output = vec!["Package list refreshed.".to_string()];
                 self.output_scroll = usize::MAX;
             }
+            ActionResult::RefreshUpdates(list) => {
+                self.updates = list;
+                self.updates_sel.cursor = 0;
+                self.current_command = Some("winget upgrade".to_string());
+                self.command_output = vec!["Updates list refreshed.".to_string()];
+                self.output_scroll = usize::MAX;
+            }
             ActionResult::OutputLine(line) => {
                 self.command_output.push(line);
             }
@@ -784,6 +799,16 @@ impl App {
                 }
             }
             UpdateState::Idle => self.update_prompt_open = false,
+        }
+    }
+
+    /// Keys while the "Quit wgtui?" confirmation is open. A modal like the
+    /// update prompt: everything unrecognised is swallowed.
+    fn handle_quit_confirm_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => self.should_quit = true,
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => self.quit_confirm_open = false,
+            _ => {}
         }
     }
 
@@ -993,6 +1018,7 @@ impl App {
             QueuedAction::RemoveJsonMulti(ids) => self.remove_json_multi(ids),
             QueuedAction::ShowJsonPackage(ids) => self.show_json_package(ids),
             QueuedAction::RefreshInstalled => self.refresh_installed(),
+            QueuedAction::RefreshUpdates => self.refresh_updates(),
             QueuedAction::ManualCommand(line) => self.run_manual_command(line),
             QueuedAction::Search(query) => self.run_search(query),
             QueuedAction::InstallWindowsUpdates => self.install_windows_updates(),
@@ -1085,6 +1111,12 @@ impl App {
         // The update prompt is a modal: it owns the keyboard while open.
         if self.update_prompt_open {
             self.handle_update_key(key);
+            return;
+        }
+
+        // So is the quit confirmation (`q`/`Esc`).
+        if self.quit_confirm_open {
+            self.handle_quit_confirm_key(key);
             return;
         }
 
@@ -1195,7 +1227,7 @@ impl App {
                 self.command_cursor = seed.chars().count();
                 self.command_input = Some(seed);
             }
-            KeyCode::Char('q') if !self.queue.is_empty() || self.running_job.is_some() => {
+            KeyCode::Char('Q') if !self.queue.is_empty() || self.running_job.is_some() => {
                 self.queue_focused = true;
                 self.queue_sel.clamp(self.queue.len());
             }
@@ -1209,8 +1241,8 @@ impl App {
             KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => {
                 self.switch_tab(self.tab.next());
             }
-            KeyCode::Esc | KeyCode::Char('Q') => {
-                self.should_quit = true;
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.quit_confirm_open = true;
             }
             KeyCode::Up => {
                 if self.sel_mut().up() {
@@ -1270,8 +1302,11 @@ impl App {
             KeyCode::Char('U') => {
                 self.dispatch(QueuedAction::UpgradeAll);
             }
-            KeyCode::Char('W') => {
+            KeyCode::Char('w') => {
                 self.dispatch(QueuedAction::InstallWindowsUpdates);
+            }
+            KeyCode::Char('r') => {
+                self.dispatch(QueuedAction::RefreshUpdates);
             }
             _ => {}
         }
@@ -1293,7 +1328,7 @@ impl App {
 
     fn handle_installed_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('r') => {
+            KeyCode::Char('x') => {
                 let ids = self.selected_ids();
                 if !ids.is_empty() {
                     self.dispatch(QueuedAction::RemoveMulti(ids));
@@ -1305,7 +1340,7 @@ impl App {
                     self.dispatch(QueuedAction::UpgradeMulti(ids));
                 }
             }
-            KeyCode::Char('R') => {
+            KeyCode::Char('r') => {
                 self.dispatch(QueuedAction::RefreshInstalled);
             }
             _ => {}
@@ -1362,13 +1397,13 @@ impl App {
                     self.dispatch(QueuedAction::InstallJsonMulti(all_ids));
                 }
             }
-            KeyCode::Char('r') => {
+            KeyCode::Char('x') => {
                 let ids = self.selected_ids();
                 if !ids.is_empty() {
                     self.dispatch(QueuedAction::RemoveJsonMulti(ids));
                 }
             }
-            KeyCode::Char('R') => {
+            KeyCode::Char('X') => {
                 let all_ids: Vec<String> = self.packages.iter().map(|p| p.id.clone()).collect();
                 if !all_ids.is_empty() {
                     self.dispatch(QueuedAction::RemoveJsonMulti(all_ids));
@@ -1827,6 +1862,19 @@ impl App {
         });
     }
 
+    /// Re-runs `winget upgrade` to re-check what's upgradable. Not cancellable
+    /// mid-flight (a quick, non-streaming read), like `refresh_installed`.
+    fn refresh_updates(&mut self) {
+        let tx = self.action_tx.clone();
+        self.current_command = Some("winget upgrade".to_string());
+        let _ = self.begin_job();
+        thread::spawn(move || {
+            let list = list_upgradable();
+            let _ = tx.send(ActionResult::RefreshUpdates(list));
+            let _ = tx.send(ActionResult::CommandDone);
+        });
+    }
+
     /// Records the exact command line last run, so `[c]` can seed its editor.
     fn set_last_command<S: AsRef<str>>(&mut self, parts: impl IntoIterator<Item = S>) {
         let joined = parts
@@ -1895,6 +1943,51 @@ impl App {
         if self.update_prompt_open {
             self.render_update_prompt(f, f.area());
         }
+        if self.quit_confirm_open {
+            self.render_quit_confirm(f, f.area());
+        }
+    }
+
+    /// Centered "Quit wgtui?" modal opened by `q`/`Esc`.
+    fn render_quit_confirm(&self, f: &mut Frame<'_>, area: Rect) {
+        let key = Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD);
+        let mut lines = vec![Line::from(""), Line::from("Quit wgtui?")];
+        if self.running_job.is_some() || !self.queue.is_empty() {
+            lines.push(Line::from(
+                "A command is running or queued — quitting abandons it.",
+            ));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("[y]", key),
+            Span::raw(" quit    "),
+            Span::styled("[n]", key),
+            Span::raw(" stay"),
+        ]));
+
+        let width = 64.min(area.width);
+        let height = (lines.len() as u16 + 2).min(area.height);
+        let popup = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + (area.height - height) / 2,
+            width,
+            height,
+        };
+        f.render_widget(Clear, popup);
+        f.render_widget(
+            Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .border_style(theme::border(true))
+                        .title(Span::styled(" Quit ", theme::title(true))),
+                ),
+            popup,
+        );
     }
 
     /// Centered modal for the self-update flow.
@@ -2398,7 +2491,7 @@ impl App {
         let hint = if focused {
             " j/k move · d remove · D clear · J/K reorder · x cancel · esc back "
         } else {
-            " q to manage "
+            " Q to manage "
         };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -2591,14 +2684,14 @@ impl App {
             }
             push_hint(&mut left, "c", "cmd");
             if self.queue.is_empty() && self.running_job.is_none() {
-                push_hint(&mut left, "q", "queue");
+                push_hint(&mut left, "Q", "queue");
             } else {
                 let label = if self.queue.is_empty() {
                     " queue·running".to_string()
                 } else {
                     format!(" queue·{}", self.queue.len())
                 };
-                left.push(Span::styled("  q", key));
+                left.push(Span::styled("  Q", key));
                 left.push(Span::styled(
                     label,
                     Style::default()
@@ -2868,8 +2961,65 @@ mod tests {
         assert!(!app.should_quit);
 
         app.filter_focused = false;
-        app.handle_key(ke(KeyCode::Char('Q')));
+        app.handle_key(ke(KeyCode::Char('q')));
+        assert!(app.quit_confirm_open, "q asks before quitting");
+        assert!(!app.should_quit);
+        app.handle_key(ke(KeyCode::Char('y')));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn esc_also_asks_before_quitting_and_n_or_esc_cancel() {
+        for cancel in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+            let mut app = App::new();
+            app.handle_key(ke(KeyCode::Esc));
+            assert!(app.quit_confirm_open);
+            app.handle_key(ke(cancel));
+            assert!(!app.quit_confirm_open, "{cancel:?} cancels");
+            assert!(!app.should_quit, "{cancel:?} cancels");
+        }
+
+        let mut app = App::new();
+        app.handle_key(ke(KeyCode::Esc));
+        app.handle_key(ke(KeyCode::Char('Y')));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn quit_confirm_swallows_other_keys_but_ctrl_c_still_quits() {
+        let mut app = App::new();
+        app.tab = Tab::Updates;
+        app.handle_key(ke(KeyCode::Char('q')));
+        for k in [KeyCode::Char('l'), KeyCode::Char('3'), KeyCode::Enter] {
+            app.handle_key(ke(k));
+        }
+        assert_eq!(app.tab, Tab::Updates);
+        assert!(app.quit_confirm_open);
+        assert!(!app.should_quit);
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn capital_q_no_longer_quits() {
+        let mut app = App::new();
+        app.handle_key(ke(KeyCode::Char('Q')));
+        assert!(!app.should_quit);
+        assert!(!app.quit_confirm_open);
+    }
+
+    #[test]
+    fn quit_confirm_renders_its_keys_and_survives_tiny_frames() {
+        let mut app = populated();
+        app.quit_confirm_open = true;
+        let text = draw_text(&app, 100, 30);
+        assert!(text.contains("Quit wgtui?"), "{text}");
+        assert!(text.contains("[y]") && text.contains("[n]"), "{text}");
+        draw(&app, 8, 4);
     }
 
     #[test]
@@ -3314,8 +3464,8 @@ mod tests {
         assert_eq!(app.queue.len(), 1, "Search's `i` must enqueue");
 
         app.tab = Tab::Installed;
-        app.handle_key(ke(KeyCode::Char('r')));
-        assert_eq!(app.queue.len(), 2, "Installed's `r` must enqueue");
+        app.handle_key(ke(KeyCode::Char('x')));
+        assert_eq!(app.queue.len(), 2, "Installed's `x` must enqueue");
 
         app.tab = Tab::Packages;
         app.handle_key(ke(KeyCode::Char('i')));
@@ -3342,7 +3492,7 @@ mod tests {
         app.installed_sel.cursor = 0;
         assert!(app.selected_ids().is_empty());
 
-        app.handle_key(ke(KeyCode::Char('r')));
+        app.handle_key(ke(KeyCode::Char('x')));
         assert!(app.queue.is_empty(), "no id -> nothing to remove, no-op");
     }
 
@@ -3462,17 +3612,20 @@ mod tests {
     }
 
     #[test]
-    fn q_toggles_queue_focus_only_when_there_is_something_to_show() {
+    fn capital_q_opens_queue_focus_only_when_there_is_something_to_show() {
         let mut app = App::new();
-        app.handle_key(ke(KeyCode::Char('q')));
+        app.handle_key(ke(KeyCode::Char('Q')));
         assert!(!app.queue_focused, "nothing queued or running: no-op");
 
         app.queue.push_back(QueuedAction::RefreshInstalled);
-        app.handle_key(ke(KeyCode::Char('q')));
+        app.handle_key(ke(KeyCode::Char('Q')));
         assert!(app.queue_focused);
+        app.handle_key(ke(KeyCode::Char('Q')));
+        assert!(app.queue_focused, "Q only opens, never closes");
         app.handle_key(ke(KeyCode::Char('q')));
-        assert!(!app.queue_focused);
-        app.handle_key(ke(KeyCode::Char('q')));
+        assert!(!app.queue_focused, "q goes back");
+        assert!(!app.quit_confirm_open, "...without asking to quit");
+        app.handle_key(ke(KeyCode::Char('Q')));
 
         // Non-queue keys are swallowed while focused.
         app.handle_key(ke(KeyCode::Char('i')));
@@ -3516,7 +3669,7 @@ mod tests {
     }
 
     #[test]
-    fn capital_w_dispatches_install_windows_updates() {
+    fn w_dispatches_install_windows_updates() {
         // Must go through dispatch()'s queueing path, never start_action()'s
         // real one: this action spawns powershell.exe and, on first use,
         // would try to install PSWindowsUpdate over the network. busy=true
@@ -3526,9 +3679,107 @@ mod tests {
         app.busy = true;
 
         app.handle_key(ke(KeyCode::Char('W')));
+        assert!(app.queue.is_empty(), "W is no longer bound");
+        app.handle_key(ke(KeyCode::Char('w')));
         assert!(matches!(
             app.queue.back(),
             Some(QueuedAction::InstallWindowsUpdates)
+        ));
+    }
+
+    // ----- per-tab keys (docs/HOTKEYS.md) -----
+
+    #[test]
+    fn updates_r_rechecks_updates() {
+        let mut app = App::new();
+        app.tab = Tab::Updates;
+        app.busy = true; // enqueue, don't spawn winget
+        app.handle_key(ke(KeyCode::Char('r')));
+        assert!(matches!(
+            app.queue.back(),
+            Some(QueuedAction::RefreshUpdates)
+        ));
+        assert_eq!(QueuedAction::RefreshUpdates.label(), "refresh updates list");
+    }
+
+    #[test]
+    fn refresh_updates_result_replaces_the_list_and_reports_it() {
+        let mut app = App::new();
+        app.updates = vec![upkg("old")];
+        app.updates_sel.cursor = 0;
+        app.handle_action_result(ActionResult::RefreshUpdates(vec![upkg("a"), upkg("b")]));
+        assert_eq!(app.updates.len(), 2);
+        assert_eq!(app.current_command.as_deref(), Some("winget upgrade"));
+    }
+
+    #[test]
+    fn status_bar_hints_use_the_new_keys() {
+        let keys = |t: Tab| t.hints().iter().map(|(k, _)| *k).collect::<Vec<_>>();
+        assert!(keys(Tab::Updates).contains(&"w") && keys(Tab::Updates).contains(&"r"));
+        assert!(!keys(Tab::Updates).contains(&"W"));
+        assert!(keys(Tab::Installed).contains(&"x") && keys(Tab::Installed).contains(&"r"));
+        assert!(!keys(Tab::Installed).contains(&"R"));
+        assert!(keys(Tab::Packages).contains(&"x") && keys(Tab::Packages).contains(&"X"));
+        assert!(!keys(Tab::Packages).contains(&"r"));
+
+        let mut app = populated();
+        app.queue.push_back(QueuedAction::RefreshInstalled);
+        let text = draw_text(&app, 160, 30);
+        assert!(text.contains("Q queue"), "{text}");
+    }
+
+    #[test]
+    fn search_r_does_nothing() {
+        let mut app = App::new();
+        app.tab = Tab::Search;
+        app.search_results = vec![wpkg("a")];
+        app.busy = true;
+        app.handle_key(ke(KeyCode::Char('r')));
+        assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn installed_x_removes_and_r_refreshes() {
+        let mut app = App::new();
+        app.tab = Tab::Installed;
+        app.installed = vec![wpkg("a")];
+        app.busy = true;
+
+        app.handle_key(ke(KeyCode::Char('R')));
+        assert!(app.queue.is_empty(), "R is no longer bound");
+
+        app.handle_key(ke(KeyCode::Char('r')));
+        assert!(matches!(
+            app.queue.back(),
+            Some(QueuedAction::RefreshInstalled)
+        ));
+        app.handle_key(ke(KeyCode::Char('x')));
+        assert!(matches!(
+            app.queue.back(),
+            Some(QueuedAction::RemoveMulti(ids)) if ids == &["a.a".to_string()]
+        ));
+    }
+
+    #[test]
+    fn packages_x_removes_selected_and_shift_x_removes_all() {
+        let mut app = App::new();
+        app.tab = Tab::Packages;
+        app.packages = vec![jpkg("a"), jpkg("b")];
+        app.busy = true;
+
+        app.handle_key(ke(KeyCode::Char('r')));
+        app.handle_key(ke(KeyCode::Char('R')));
+        assert!(app.queue.is_empty(), "r/R are no longer bound");
+
+        app.handle_key(ke(KeyCode::Char('x')));
+        assert!(matches!(
+            app.queue.back(),
+            Some(QueuedAction::RemoveJsonMulti(ids)) if ids.len() == 1
+        ));
+        app.handle_key(ke(KeyCode::Char('X')));
+        assert!(matches!(
+            app.queue.back(),
+            Some(QueuedAction::RemoveJsonMulti(ids)) if ids.len() == 2
         ));
     }
 

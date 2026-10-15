@@ -68,17 +68,19 @@ Cada push/PR roda `fmt` + `clippy -D warnings` + `cargo test` no CI. Um push de 
 
 ## Abas e teclas
 
+Referência completa de todas as teclas, por contexto: [docs/HOTKEYS.md](docs/HOTKEYS.md).
+
 | Aba | Conteúdo | Ações |
 |---|---|---|
-| **[1] Updates** | `winget upgrade` (lista) | `u` atualizar selecionado(s) · `U` atualizar todos · `W` instalar atualizações do Windows · `Enter` detalhes |
+| **[1] Updates** | `winget upgrade` (lista) | `u` atualizar selecionado(s) · `U` atualizar todos · `w` instalar atualizações do Windows · `r` verificar atualizações de novo · `Enter` detalhes |
 | **[2] Search** | `winget search` | digite + `Enter` para buscar · `i` instalar · `Enter` detalhes |
-| **[3] Installed** | `winget list` | `u` atualizar · `r` remover · `R` recarregar · `Enter` detalhes |
-| **[4] Apps/Scripts** | manifesto JSON | `i` instalar/rodar selecionado(s) · `I` todos · `r`/`R` remover · `F` trocar de arquivo |
+| **[3] Installed** | `winget list` | `u` atualizar · `x` remover · `r` recarregar · `Enter` detalhes |
+| **[4] Apps/Scripts** | manifesto JSON | `i` instalar/rodar selecionado(s) · `I` todos · `x` remover selecionado(s) · `X` remover todos · `F` trocar de arquivo |
 
 Navegação global: `Tab`/`Shift+Tab`, `←`/`→` ou `h`/`l` trocam de aba · `1`–`4` pulam para
 a aba · `↑`/`↓` ou `j`/`k` navegam a lista · `/` foca o filtro · `Space` marca/desmarca ·
 `a` marca/desmarca todos · `Enter` mostra detalhes · `PageUp`/`PageDown` rolam o painel
-Output · `Q`, `Esc` ou `Ctrl+C` saem.
+Output · `q` ou `Esc` saem (pedem confirmação: `y` sai, `n`/`Esc` fica) · `Ctrl+C` sai na hora.
 Na coluna à esquerda: `●` = marcado · `✓` = já instalado · `▶` = script.
 
 **`c` — editar comando:** abre o painel Command com o último comando winget executado,
@@ -89,7 +91,7 @@ o winget reclama de múltiplas versões instaladas). Edite onde quiser: `←`/`�
 comando roda — só um comando executa por vez, então uma segunda ação (instalar, atualizar,
 remover, buscar, `[c]`...) entra numa **fila** silenciosa e roda assim que a atual termina.
 
-**`q` — gerenciar a fila:** aparece na status bar quando há algo rodando ou pendente; abre
+**`Q` — gerenciar a fila:** aparece na status bar quando há algo rodando ou pendente; abre
 um painel de fila acima do Output com o item em execução e os pendentes numerados.
 Dentro do modo: `j`/`k` navegam os pendentes · `d` remove o pendente selecionado ·
 `D` limpa todos os pendentes · `J`/`K` reordenam o item selecionado (desce/sobe) ·
