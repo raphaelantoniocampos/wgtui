@@ -104,11 +104,12 @@ pub fn upgrade_all_packages(pid_slot: Option<&PidSlot>) -> Result<String, String
         .spawn()
         .map_err(|e| format!("Failed to run winget upgrade --all --include-unknown: {e}"))?;
 
-    publish_pid(pid_slot, Some(child.id()));
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to wait on winget upgrade --all --include-unknown: {e}"))?;
-    publish_pid(pid_slot, None);
+    let output = {
+        let _pid = PidGuard::publish(pid_slot, child.id());
+        child
+            .wait_with_output()
+            .map_err(|e| format!("Failed to wait on winget upgrade --all --include-unknown: {e}"))?
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -327,10 +328,25 @@ fn parse_winget_table(output: &str) -> Vec<WingetPackage> {
 /// [`kill_process_tree`]). `None` when nothing is running.
 pub type PidSlot = Arc<Mutex<Option<u32>>>;
 
-/// Stores `pid` in `slot`, if there is one.
-fn publish_pid(slot: Option<&PidSlot>, pid: Option<u32>) {
-    if let Some(slot) = slot {
-        *slot.lock().unwrap() = pid;
+/// Keeps a child's PID in a [`PidSlot`] while the guard lives and clears it
+/// on drop, so every return path — early `?`s included — leaves the slot
+/// empty instead of holding a PID Windows may hand to another process.
+struct PidGuard<'a>(Option<&'a PidSlot>);
+
+impl<'a> PidGuard<'a> {
+    fn publish(slot: Option<&'a PidSlot>, pid: u32) -> Self {
+        if let Some(slot) = slot {
+            *slot.lock().unwrap() = Some(pid);
+        }
+        Self(slot)
+    }
+}
+
+impl Drop for PidGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.0 {
+            *slot.lock().unwrap() = None;
+        }
     }
 }
 
@@ -387,7 +403,7 @@ fn stream_command(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn {name}: {e}"))?;
-    publish_pid(pid_slot, Some(child.id()));
+    let _pid = PidGuard::publish(pid_slot, child.id());
 
     let stdout = child.stdout.take().ok_or("No stdout")?;
     let stderr = child.stderr.take().ok_or("No stderr")?;
@@ -397,7 +413,6 @@ fn stream_command(
     forward_lines(stdout, &tx);
     let _ = stderr_handle.join();
     let _ = child.wait();
-    publish_pid(pid_slot, None);
     Ok(())
 }
 
@@ -793,6 +808,20 @@ pub fn load_export_packages(dir: &Path) -> Vec<JsonPackage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pid_guard_clears_the_slot_on_every_exit() {
+        // An early `?` return must not leave the PID behind: once the child
+        // is gone Windows can reuse it, and a cancel would kill that process.
+        let slot = PidSlot::default();
+        let fails_midway = || -> Result<(), String> {
+            let _pid = PidGuard::publish(Some(&slot), 42);
+            assert_eq!(*slot.lock().unwrap(), Some(42));
+            Err("No stdout".into())
+        };
+        assert!(fails_midway().is_err());
+        assert_eq!(*slot.lock().unwrap(), None);
+    }
 
     #[cfg(windows)]
     #[test]

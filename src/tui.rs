@@ -21,8 +21,8 @@ use ratatui::widgets::{
 
 use wgtui::{
     JsonPackage, PidSlot, UpgradablePackage, WingetPackage, find_package_json_files, is_installed,
-    kill_process_tree, list_installed, list_upgradable, load_packages_from_file, run_winget_stdout,
-    search_packages, update_sources, upgrade_all_packages,
+    kill_process_tree, list_installed, list_upgradable, load_packages_from_file, search_packages,
+    update_sources, upgrade_all_packages,
 };
 
 use crate::elevation::{elevation_warning, is_elevated};
@@ -261,12 +261,11 @@ fn send_line(tx: &mpsc::Sender<ActionResult>, line: impl Into<String>) {
 
 /// Streams `winget <args>` into the current run.
 fn stream_winget(tx: &mpsc::Sender<ActionResult>, args: &[impl AsRef<str>], pid_slot: &PidSlot) {
-    let args: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
-    let mut result = Ok(());
-    relay_output(tx, |lines| {
-        result = run_winget_stdout(&args, lines, Some(pid_slot));
-    });
-    report_failure(tx, result);
+    let argv: Vec<String> = std::iter::once("winget")
+        .chain(args.iter().map(AsRef::as_ref))
+        .map(String::from)
+        .collect();
+    stream_argv(tx, &argv, pid_slot);
 }
 
 /// Adds the error to the run when a command couldn't be started, so a spawn
@@ -619,14 +618,15 @@ struct RunningJob {
 
 /// Cursor + multi-selection state for one list.
 ///
-/// Indices refer to the tab's **filtered** view, so navigation methods take the
-/// current filtered length.
+/// The cursor is a row of the tab's **filtered** view, so navigation methods
+/// take the current filtered length. Marks are package ids, not rows, so
+/// they stay on their packages when the list is filtered or refreshed.
 #[derive(Default)]
 pub struct Selection {
     /// Cursor row.
     pub cursor: usize,
-    /// Multi-selected rows. Empty means "act on the cursor row".
-    pub marked: HashSet<usize>,
+    /// Ids of the multi-selected packages. Empty means "act on the cursor row".
+    pub marked: HashSet<String>,
 }
 
 impl Selection {
@@ -653,21 +653,28 @@ impl Selection {
         }
     }
 
-    fn toggle_current(&mut self) {
-        if !self.marked.remove(&self.cursor) {
-            self.marked.insert(self.cursor);
+    /// Marks `id`, or unmarks it if it already is. A row winget couldn't
+    /// give an id can't be acted on, so it isn't marked.
+    fn toggle(&mut self, id: &str) {
+        if !id.is_empty() && !self.marked.remove(id) {
+            self.marked.insert(id.to_string());
         }
     }
 
-    /// Selects every row, or clears if all `len` rows are already selected.
-    fn toggle_all(&mut self, len: usize) {
-        if len == 0 {
+    /// Marks every id in `visible`, or clears all marks if they already are.
+    fn toggle_all(&mut self, visible: &[&str]) {
+        let ids: Vec<&str> = visible
+            .iter()
+            .copied()
+            .filter(|id| !id.is_empty())
+            .collect();
+        if ids.is_empty() {
             return;
         }
-        if self.marked.len() >= len {
+        if ids.iter().all(|id| self.marked.contains(*id)) {
             self.marked.clear();
         } else {
-            self.marked = (0..len).collect();
+            self.marked = ids.into_iter().map(String::from).collect();
         }
     }
 
@@ -675,18 +682,33 @@ impl Selection {
         self.cursor = 0;
         self.marked.clear();
     }
+}
 
-    /// Row indices to act on: the marked set (sorted), or `[cursor]` when
-    /// nothing is marked.
-    fn active(&self) -> Vec<usize> {
-        if self.marked.is_empty() {
-            vec![self.cursor]
-        } else {
-            let mut v: Vec<usize> = self.marked.iter().copied().collect();
-            v.sort_unstable();
-            v
-        }
+/// A list row that names a winget package (or manifest entry) by id.
+trait HasId {
+    fn id(&self) -> &str;
+}
+
+impl HasId for WingetPackage {
+    fn id(&self) -> &str {
+        &self.id
     }
+}
+
+impl HasId for UpgradablePackage {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl HasId for JsonPackage {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+fn ids_of<'a, T: HasId + 'a>(rows: impl IntoIterator<Item = &'a T>) -> Vec<&'a str> {
+    rows.into_iter().map(HasId::id).collect()
 }
 
 /// Main application state.
@@ -941,16 +963,18 @@ impl App {
 
     fn handle_action_result(&mut self, action: ActionResult) {
         match action {
-            // Marks are row indices: once a list is replaced they would
-            // point at different packages, so every refresh drops them.
+            // A new search is a new list: nothing from the last one carries over.
             ActionResult::SearchResults(list) => {
                 self.search_results = list;
                 self.search_sel.reset();
             }
-            ActionResult::UpgradeList(list) => {
+            // Refreshes often land while the user is working in that tab
+            // (any job that changes packages re-reads both lists), so the
+            // selection stays on its packages.
+            ActionResult::UpgradeList(list) | ActionResult::RefreshUpdates(list) => {
+                let cursor = self.cursor_id(Tab::Updates);
                 self.updates = list;
-                self.updates_sel.marked.clear();
-                self.updates_sel.clamp(self.updates.len());
+                self.keep_selection(Tab::Updates, cursor);
             }
             ActionResult::InitialInstalled(list) => {
                 self.installed = list;
@@ -983,12 +1007,9 @@ impl App {
             // of an install/upgrade/remove, and used to replace that job's
             // whole output with a one-line "refreshed" message.
             ActionResult::RefreshInstalled(list) => {
+                let cursor = self.cursor_id(Tab::Installed);
                 self.installed = list;
-                self.installed_sel.reset();
-            }
-            ActionResult::RefreshUpdates(list) => {
-                self.updates = list;
-                self.updates_sel.reset();
+                self.keep_selection(Tab::Installed, cursor);
             }
             ActionResult::OutputLine(line) => {
                 self.push_output_line(&line);
@@ -1241,13 +1262,6 @@ impl App {
         true
     }
 
-    fn filtered_search_results(&self) -> Vec<&WingetPackage> {
-        self.search_results
-            .iter()
-            .filter(|p| Self::matches_filter(&p.name, &self.filter_query))
-            .collect()
-    }
-
     fn filtered_installed(&self) -> Vec<&WingetPackage> {
         self.installed
             .iter()
@@ -1262,9 +1276,8 @@ impl App {
             .collect()
     }
 
-    /// The current tab's selection state.
-    fn sel(&self) -> &Selection {
-        match self.tab {
+    fn sel_of(&self, tab: Tab) -> &Selection {
+        match tab {
             Tab::Search => &self.search_sel,
             Tab::Updates => &self.updates_sel,
             Tab::Installed => &self.installed_sel,
@@ -1272,8 +1285,8 @@ impl App {
         }
     }
 
-    fn sel_mut(&mut self) -> &mut Selection {
-        match self.tab {
+    fn sel_of_mut(&mut self, tab: Tab) -> &mut Selection {
+        match tab {
             Tab::Search => &mut self.search_sel,
             Tab::Updates => &mut self.updates_sel,
             Tab::Installed => &mut self.installed_sel,
@@ -1281,66 +1294,103 @@ impl App {
         }
     }
 
-    /// Number of rows visible in the current tab (after filtering).
-    fn filtered_len(&self) -> usize {
-        self.filtered_ids().len()
+    /// The current tab's selection state.
+    fn sel_mut(&mut self) -> &mut Selection {
+        self.sel_of_mut(self.tab)
     }
 
-    fn clamp_selected(&mut self) {
-        let (s, u, i, p) = (
-            self.filtered_search_results().len(),
-            self.filtered_updates().len(),
-            self.filtered_installed().len(),
-            self.filtered_packages().len(),
-        );
-        self.search_sel.clamp(s);
-        self.updates_sel.clamp(u);
-        self.installed_sel.clamp(i);
-        self.packages_sel.clamp(p);
-    }
-
-    /// Ids of the current tab's visible rows, in display order.
-    fn filtered_ids(&self) -> Vec<&str> {
-        match self.tab {
-            Tab::Search => self
-                .filtered_search_results()
-                .into_iter()
-                .map(|p| p.id.as_str())
-                .collect(),
-            Tab::Updates => self
-                .filtered_updates()
-                .into_iter()
-                .map(|p| p.id.as_str())
-                .collect(),
-            Tab::Installed => self
-                .filtered_installed()
-                .into_iter()
-                .map(|p| p.id.as_str())
-                .collect(),
-            Tab::Packages => self
-                .filtered_packages()
-                .into_iter()
-                .map(|p| p.id.as_str())
-                .collect(),
+    /// Ids of every row in `tab`'s list, filtered or not, in list order.
+    fn list_ids(&self, tab: Tab) -> Vec<&str> {
+        match tab {
+            Tab::Search => ids_of(&self.search_results),
+            Tab::Updates => ids_of(&self.updates),
+            Tab::Installed => ids_of(&self.installed),
+            Tab::Packages => ids_of(&self.packages),
         }
     }
 
-    fn selected_ids(&self) -> Vec<String> {
-        let ids = self.filtered_ids();
-        // winget sometimes reports no Id at all for a package (e.g. a
-        // manually-installed app it can't match to a source) — skip those
-        // rather than act on an empty id.
-        self.sel()
-            .active()
-            .into_iter()
-            .filter_map(|i| ids.get(i))
-            .filter(|id| !id.is_empty())
+    /// Ids of `tab`'s visible rows, in display order. Search results are
+    /// never filtered: the Search bar holds winget's query, and winget also
+    /// matches on id and tags, which the name filter would hide.
+    fn filtered_ids(&self, tab: Tab) -> Vec<&str> {
+        match tab {
+            Tab::Search => ids_of(&self.search_results),
+            Tab::Updates => ids_of(self.filtered_updates()),
+            Tab::Installed => ids_of(self.filtered_installed()),
+            Tab::Packages => ids_of(self.filtered_packages()),
+        }
+    }
+
+    /// Number of rows visible in `tab` (after filtering).
+    fn filtered_len(&self, tab: Tab) -> usize {
+        match tab {
+            Tab::Search => self.search_results.len(),
+            Tab::Updates => self.filtered_updates().len(),
+            Tab::Installed => self.filtered_installed().len(),
+            Tab::Packages => self.filtered_packages().len(),
+        }
+    }
+
+    fn clamp_selected(&mut self) {
+        for tab in Tab::ALL {
+            let len = self.filtered_len(tab);
+            self.sel_of_mut(tab).clamp(len);
+        }
+    }
+
+    /// Id of the package under `tab`'s cursor, if there is one.
+    fn cursor_id(&self, tab: Tab) -> Option<String> {
+        self.filtered_ids(tab)
+            .get(self.sel_of(tab).cursor)
             .map(|id| id.to_string())
+    }
+
+    /// After `tab`'s list was replaced: drops marks of packages that are
+    /// gone and puts the cursor back on `cursor_id`'s package, or keeps its
+    /// row (in range) when that package is gone.
+    fn keep_selection(&mut self, tab: Tab, cursor_id: Option<String>) {
+        let listed: HashSet<String> = self.list_ids(tab).into_iter().map(String::from).collect();
+        let row = cursor_id.and_then(|id| self.filtered_ids(tab).iter().position(|r| *r == id));
+        let len = self.filtered_len(tab);
+        let sel = self.sel_of_mut(tab);
+        sel.marked.retain(|id| listed.contains(id));
+        if let Some(row) = row {
+            sel.cursor = row;
+        }
+        sel.clamp(len);
+    }
+
+    /// Ids to act on in the current tab: the marked packages, in list order
+    /// (marks hidden by the filter included — filtering is how the user
+    /// finds the next one to mark), or the cursor row's when nothing is
+    /// marked. winget sometimes reports no Id at all for a package (e.g. a
+    /// manually-installed app it can't match to a source); those are skipped
+    /// rather than acted on with an empty id.
+    fn selected_ids(&self) -> Vec<String> {
+        let sel = self.sel_of(self.tab);
+        let ids: Vec<&str> = if sel.marked.is_empty() {
+            self.filtered_ids(self.tab)
+                .get(sel.cursor)
+                .copied()
+                .into_iter()
+                .collect()
+        } else {
+            let mut seen = HashSet::new();
+            self.list_ids(self.tab)
+                .into_iter()
+                .filter(|id| sel.marked.contains(*id) && seen.insert(*id))
+                .collect()
+        };
+        ids.into_iter()
+            .filter(|id| !id.is_empty())
+            .map(String::from)
             .collect()
     }
 
     fn toggle_selection(&mut self) {
-        self.sel_mut().toggle_current();
+        if let Some(id) = self.cursor_id(self.tab) {
+            self.sel_mut().toggle(&id);
+        }
     }
 
     fn clear_selections(&mut self) {
@@ -1354,11 +1404,16 @@ impl App {
         }
     }
 
-    /// Selects every visible row in the current tab, or clears if all are
-    /// already selected.
+    /// Marks every visible row in the current tab, or clears if all are
+    /// already marked.
     fn toggle_select_all(&mut self) {
-        let n = self.filtered_len();
-        self.sel_mut().toggle_all(n);
+        let visible: Vec<String> = self
+            .filtered_ids(self.tab)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let visible: Vec<&str> = visible.iter().map(String::as_str).collect();
+        self.sel_mut().toggle_all(&visible);
     }
 
     /// Switches to `tab`, resetting the shared filter and every tab's marks.
@@ -1646,7 +1701,7 @@ impl App {
                 }
             }
             KeyCode::Down => {
-                let n = self.filtered_len();
+                let n = self.filtered_len(self.tab);
                 self.sel_mut().down(n);
             }
             KeyCode::Enter => self.show_selected(),
@@ -1891,6 +1946,9 @@ impl App {
     fn install_json_multi(&mut self, ids: Vec<String>) {
         self.begin_output(format!("install/run {} apps/scripts", ids.len()));
         let packages = self.resolve_packages(&ids);
+        if packages.is_empty() {
+            return;
+        }
         if let Some(pkg) = packages.first() {
             self.last_command = Some(if pkg.is_script {
                 pkg.command.clone().unwrap_or_default().join(" ")
@@ -1921,6 +1979,9 @@ impl App {
     fn remove_json_multi(&mut self, ids: Vec<String>) {
         self.begin_output(format!("uninstall/remove {} apps/scripts", ids.len()));
         let packages = self.resolve_packages(&ids);
+        if packages.is_empty() {
+            return;
+        }
         let tx = self.action_tx.clone();
         let (pid_slot, cancel) = self.begin_job();
         thread::spawn(move || {
@@ -1946,6 +2007,9 @@ impl App {
     fn show_json_multi(&mut self, ids: Vec<String>) {
         self.begin_output(format!("show {} apps/scripts", ids.len()));
         let packages = self.resolve_packages(&ids);
+        if packages.is_empty() {
+            return;
+        }
         let tx = self.action_tx.clone();
         let (pid_slot, cancel) = self.begin_job();
         thread::spawn(move || {
@@ -2296,10 +2360,9 @@ impl App {
         let rows: Vec<Row> = self
             .search_results
             .iter()
-            .enumerate()
-            .map(|(i, p)| {
+            .map(|p| {
                 Row::new(vec![
-                    Self::gutter(self.search_sel.marked.contains(&i), " ", theme::dim()),
+                    Self::gutter(self.search_sel.marked.contains(&p.id), " ", theme::dim()),
                     Cell::from(p.name.clone()),
                     Cell::from(Span::styled(p.id.clone(), theme::dim())),
                     Cell::from(Span::styled(
@@ -2336,10 +2399,9 @@ impl App {
         let filtered = self.filtered_updates();
         let rows: Vec<Row> = filtered
             .iter()
-            .enumerate()
-            .map(|(i, p)| {
+            .map(|p| {
                 Row::new(vec![
-                    Self::gutter(self.updates_sel.marked.contains(&i), " ", theme::dim()),
+                    Self::gutter(self.updates_sel.marked.contains(&p.id), " ", theme::dim()),
                     Cell::from(p.name.clone()),
                     Cell::from(Span::styled(p.installed_version.clone(), theme::dim())),
                     Cell::from(Span::styled("→", Style::default().fg(theme::ACCENT))),
@@ -2378,10 +2440,9 @@ impl App {
         let filtered = self.filtered_installed();
         let rows: Vec<Row> = filtered
             .iter()
-            .enumerate()
-            .map(|(i, p)| {
+            .map(|p| {
                 Row::new(vec![
-                    Self::gutter(self.installed_sel.marked.contains(&i), " ", theme::dim()),
+                    Self::gutter(self.installed_sel.marked.contains(&p.id), " ", theme::dim()),
                     Cell::from(p.name.clone()),
                     Cell::from(Span::styled(p.id.clone(), theme::dim())),
                     Cell::from(Span::styled(
@@ -2438,9 +2499,8 @@ impl App {
 
         let rows: Vec<Row> = filtered
             .iter()
-            .enumerate()
-            .map(|(i, pkg)| {
-                let marked = self.packages_sel.marked.contains(&i);
+            .map(|pkg| {
+                let marked = self.packages_sel.marked.contains(&pkg.id);
                 let (glyph, gstyle) = if pkg.is_script {
                     ("▶", Style::default().fg(theme::ACCENT))
                 } else if is_installed(&pkg.id, &pkg.name, &self.installed) {
@@ -2882,11 +2942,12 @@ mod tests {
     fn toggle_selection_adds_then_removes_current_row() {
         let mut app = App::new();
         app.tab = Tab::Installed;
+        app.installed = vec![wpkg("a"), wpkg("b"), wpkg("c")];
         app.installed_sel.cursor = 2;
         app.toggle_selection();
-        assert!(app.installed_sel.marked.contains(&2));
+        assert!(app.installed_sel.marked.contains("c.c"));
         app.toggle_selection();
-        assert!(!app.installed_sel.marked.contains(&2));
+        assert!(!app.installed_sel.marked.contains("c.c"));
     }
 
     #[test]
@@ -2960,30 +3021,146 @@ mod tests {
         }
     }
 
+    fn ids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| format!("{n}.{n}")).collect()
+    }
+
     #[test]
-    fn list_refreshes_drop_stale_marks() {
-        // Marks are row indices: once a list is replaced they point at
-        // different packages, so acting on them would hit the wrong ones.
+    fn background_refresh_keeps_marks_on_their_packages() {
+        // A job finishing elsewhere re-reads the Updates list while the user
+        // is still marking rows there: the marks must survive, on the same
+        // packages, minus any package that's gone.
         let mut app = App::new();
-        app.installed = vec![wpkg("a"), wpkg("b"), wpkg("c")];
-        app.installed_sel.marked = [0, 2].into_iter().collect();
-        app.handle_action_result(ActionResult::RefreshInstalled(vec![wpkg("b")]));
-        assert!(app.installed_sel.marked.is_empty());
-
+        app.tab = Tab::Updates;
         app.updates = vec![upkg("a"), upkg("b"), upkg("c")];
-        app.updates_sel.marked = [1].into_iter().collect();
-        app.updates_sel.cursor = 2;
-        app.handle_action_result(ActionResult::UpgradeList(vec![upkg("c")]));
-        assert!(app.updates_sel.marked.is_empty());
-        assert_eq!(app.updates_sel.cursor, 0, "cursor clamped to the new list");
+        app.updates_sel.marked = ids(&["a", "c"]).into_iter().collect();
 
-        app.updates_sel.marked = [0].into_iter().collect();
-        app.handle_action_result(ActionResult::RefreshUpdates(vec![upkg("d")]));
-        assert!(app.updates_sel.marked.is_empty());
+        app.handle_action_result(ActionResult::UpgradeList(vec![
+            upkg("x"),
+            upkg("a"),
+            upkg("c"),
+        ]));
+        assert_eq!(app.selected_ids(), ids(&["a", "c"]));
 
-        app.search_sel.marked = [0].into_iter().collect();
-        app.handle_action_result(ActionResult::SearchResults(vec![wpkg("e")]));
-        assert!(app.search_sel.marked.is_empty());
+        app.handle_action_result(ActionResult::RefreshUpdates(vec![upkg("c")]));
+        assert_eq!(app.selected_ids(), ids(&["c"]));
+        assert_eq!(app.updates_sel.marked.len(), 1, "gone packages unmarked");
+
+        app.tab = Tab::Installed;
+        app.installed = vec![wpkg("a"), wpkg("b")];
+        app.installed_sel.marked = ids(&["b"]).into_iter().collect();
+        app.handle_action_result(ActionResult::RefreshInstalled(vec![wpkg("b"), wpkg("a")]));
+        assert_eq!(app.selected_ids(), ids(&["b"]));
+    }
+
+    #[test]
+    fn refresh_keeps_the_cursor_on_its_package() {
+        let mut app = App::new();
+        app.tab = Tab::Updates;
+        app.updates = vec![upkg("a"), upkg("b"), upkg("c")];
+        app.updates_sel.cursor = 2; // c
+        app.handle_action_result(ActionResult::UpgradeList(vec![
+            upkg("b"),
+            upkg("c"),
+            upkg("d"),
+        ]));
+        assert_eq!(app.updates_sel.cursor, 1);
+        assert_eq!(app.selected_ids(), ids(&["c"]));
+
+        // Its package gone: the cursor stays on its row, kept in range of
+        // what the filter shows.
+        app.filter_query = "b".into();
+        app.handle_action_result(ActionResult::UpgradeList(vec![upkg("b"), upkg("d")]));
+        assert_eq!(app.updates_sel.cursor, 0);
+        assert_eq!(app.selected_ids(), ids(&["b"]));
+    }
+
+    #[test]
+    fn marks_stay_on_their_packages_when_the_filter_changes() {
+        let mut app = App::new();
+        app.tab = Tab::Installed;
+        app.installed = vec![wpkg("chrome"), wpkg("git"), wpkg("vscode")];
+        app.installed_sel.cursor = 0;
+        app.toggle_selection();
+        app.installed_sel.cursor = 1;
+        app.toggle_selection();
+
+        app.filter_query = "vs".into();
+        app.clamp_selected();
+        assert_eq!(app.selected_ids(), ids(&["chrome", "git"]));
+    }
+
+    #[test]
+    fn rows_without_an_id_cannot_be_marked() {
+        let mut app = App::new();
+        app.tab = Tab::Installed;
+        let mut no_id = wpkg("manual");
+        no_id.id.clear();
+        app.installed = vec![no_id, wpkg("git")];
+        app.toggle_selection();
+        assert!(app.installed_sel.marked.is_empty());
+    }
+
+    #[test]
+    fn search_tab_acts_on_the_row_it_draws() {
+        // The Search bar holds winget's query, not a filter: a result whose
+        // name doesn't fuzzy-match the query (matched by id/tag) is drawn,
+        // so it must also be what the cursor acts on.
+        let mut app = App::new();
+        app.tab = Tab::Search;
+        app.filter_query = "vscode".into();
+        app.search_results = vec![wpkg("Microsoft Visual Studio Code"), wpkg("vscodium")];
+        app.search_sel.cursor = 0;
+        assert_eq!(app.selected_ids(), ids(&["Microsoft Visual Studio Code"]));
+        app.toggle_select_all();
+        assert_eq!(app.search_sel.marked.len(), 2);
+    }
+
+    #[test]
+    fn winget_verb_args_are_pinned() {
+        assert_eq!(
+            WingetVerb::Install.args("A.B"),
+            [
+                "install",
+                "A.B",
+                "--silent",
+                "--accept-package-agreements",
+                "--accept-source-agreements"
+            ]
+        );
+        assert_eq!(
+            WingetVerb::Upgrade.args("A.B"),
+            [
+                "upgrade",
+                "A.B",
+                "--silent",
+                "--accept-package-agreements",
+                "--accept-source-agreements"
+            ]
+        );
+        assert_eq!(
+            WingetVerb::Uninstall.args("A.B"),
+            ["uninstall", "A.B", "--silent", "--accept-source-agreements"]
+        );
+        assert_eq!(
+            WingetVerb::Show.args("A.B"),
+            ["show", "A.B", "--accept-source-agreements"]
+        );
+    }
+
+    #[test]
+    fn json_job_with_nothing_left_to_run_does_not_start() {
+        // Every queued id gone (`f` switched manifests): report the skips,
+        // but don't hold the queue for two winget list scans.
+        let mut app = App::new();
+        app.packages = vec![jpkg("a")];
+        app.start_action(QueuedAction::InstallJsonMulti(vec!["gone".into()]));
+        assert!(!app.busy);
+        assert!(
+            app.command_output
+                .iter()
+                .any(|l| l.contains("skipped gone"))
+        );
     }
 
     #[test]
@@ -3481,7 +3658,7 @@ mod tests {
             s
         }];
         app.command_output = vec!["--- install X ---".into(), "Found X".into()];
-        app.updates_sel.marked.insert(0);
+        app.updates_sel.marked.insert("Chrome.Chrome".into());
         app
     }
 
@@ -3838,7 +4015,7 @@ mod tests {
         // refresh job's own run; the result only carries the list.
         let mut app = App::new();
         app.updates = vec![upkg("old")];
-        app.updates_sel.cursor = 1;
+        app.updates_sel.cursor = 0;
         app.handle_action_result(ActionResult::RefreshUpdates(vec![upkg("a"), upkg("b")]));
         assert_eq!(app.updates.len(), 2);
         assert_eq!(app.updates_sel.cursor, 0);
