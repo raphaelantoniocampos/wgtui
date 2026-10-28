@@ -54,7 +54,7 @@ Captura todas as teclas enquanto focado.
 
 | Tecla | Ação | Código |
 |---|---|---|
-| `j` / `↓` | Desce na lista de pendentes | `handle_key` (bloco `queue_focused`) |
+| `j` / `↓` | Desce na lista de pendentes | `handle_queue_key` |
 | `k` / `↑` | Sobe na lista de pendentes | idem |
 | `d` | Remove o pendente selecionado | idem |
 | `D` | Limpa todos os pendentes | idem |

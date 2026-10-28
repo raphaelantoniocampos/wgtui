@@ -41,19 +41,26 @@ pub fn update_sources() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Runs winget with `args` and returns its stdout, or an empty string if it
+/// couldn't be started (which every table parser reads as "no rows").
+fn winget_stdout(args: &[&str]) -> String {
+    Command::new("winget")
+        .args(args)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
 /// Runs `winget search <query>` and parses the tabular output into a list of packages.
 ///
 /// Returns an empty vec on error.
 #[must_use]
 pub fn search_packages(query: &str) -> Vec<WingetPackage> {
-    let output = Command::new("winget")
-        .args(["search", query, "--accept-source-agreements"])
-        .output();
-
-    match output {
-        Ok(output) => parse_winget_table(&String::from_utf8_lossy(&output.stdout)),
-        Err(_) => vec![],
-    }
+    parse_winget_table(&winget_stdout(&[
+        "search",
+        query,
+        "--accept-source-agreements",
+    ]))
 }
 
 /// Runs `winget list` and parses the tabular output into a list of installed packages.
@@ -61,14 +68,7 @@ pub fn search_packages(query: &str) -> Vec<WingetPackage> {
 /// Returns an empty vec on error.
 #[must_use]
 pub fn list_installed() -> Vec<WingetPackage> {
-    let output = Command::new("winget")
-        .args(["list", "--accept-source-agreements"])
-        .output();
-
-    match output {
-        Ok(output) => parse_winget_table(&String::from_utf8_lossy(&output.stdout)),
-        Err(_) => vec![],
-    }
+    parse_winget_table(&winget_stdout(&["list", "--accept-source-agreements"]))
 }
 
 /// A package with an available upgrade, returned by `winget upgrade` (list mode).
@@ -84,14 +84,7 @@ pub struct UpgradablePackage {
 /// Runs `winget upgrade` (list mode) to list packages with available upgrades.
 #[must_use]
 pub fn list_upgradable() -> Vec<UpgradablePackage> {
-    let output = Command::new("winget")
-        .args(["upgrade", "--accept-source-agreements"])
-        .output();
-
-    match output {
-        Ok(output) => parse_upgrade_table(&String::from_utf8_lossy(&output.stdout)),
-        Err(_) => vec![],
-    }
+    parse_upgrade_table(&winget_stdout(&["upgrade", "--accept-source-agreements"]))
 }
 
 /// Runs `winget upgrade --all --include-unknown` to upgrade every package
@@ -111,17 +104,11 @@ pub fn upgrade_all_packages(pid_slot: Option<&PidSlot>) -> Result<String, String
         .spawn()
         .map_err(|e| format!("Failed to run winget upgrade --all --include-unknown: {e}"))?;
 
-    if let Some(slot) = pid_slot {
-        *slot.lock().unwrap() = Some(child.id());
-    }
-
+    publish_pid(pid_slot, Some(child.id()));
     let output = child
         .wait_with_output()
         .map_err(|e| format!("Failed to wait on winget upgrade --all --include-unknown: {e}"))?;
-
-    if let Some(slot) = pid_slot {
-        *slot.lock().unwrap() = None;
-    }
+    publish_pid(pid_slot, None);
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -236,9 +223,8 @@ fn parse_upgrade_table(output: &str) -> Vec<UpgradablePackage> {
     let Some(header_idx) = find_header(&lines) else {
         return vec![];
     };
-    let header = lines[header_idx];
     let Some(offsets) = locate_columns(
-        header,
+        lines[header_idx],
         &[
             &["Name", "Nome"],
             &["Id"],
@@ -250,25 +236,37 @@ fn parse_upgrade_table(output: &str) -> Vec<UpgradablePackage> {
         return vec![];
     };
 
-    let mut packages = Vec::new();
-    for line in &lines[header_idx + 1..] {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("---") || !looks_like_row(line) {
-            continue;
-        }
-        let cols = slice_columns(line, &offsets);
-        if cols[0].is_empty() {
-            continue; // no name at all — not a usable row
-        }
-        packages.push(UpgradablePackage {
+    table_rows(&lines[header_idx + 1..], &offsets)
+        .map(|cols| UpgradablePackage {
             name: cols[0].to_string(),
             id: cols[1].to_string(),
             installed_version: cols[2].to_string(),
             available_version: cols[3].to_string(),
-            source: Some(cols[4].to_string()).filter(|s| !s.is_empty()),
-        });
-    }
-    packages
+            source: non_empty(cols[4]),
+        })
+        .collect()
+}
+
+/// The data rows under a table header, each sliced into columns at
+/// `offsets`. Skips blank lines, the `---` rule, prose that isn't a row (see
+/// [`looks_like_row`]) and rows with no name at all.
+fn table_rows<'a>(
+    lines: &'a [&'a str],
+    offsets: &'a [usize],
+) -> impl Iterator<Item = Vec<&'a str>> + 'a {
+    lines
+        .iter()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with("---") && looks_like_row(line)
+        })
+        .map(move |line| slice_columns(line, offsets))
+        .filter(|cols| !cols[0].is_empty())
+}
+
+/// `Some(cell)` unless the cell is empty.
+fn non_empty(cell: &str) -> Option<String> {
+    (!cell.is_empty()).then(|| cell.to_string())
 }
 
 /// Parses the tabular output of `winget search` / `winget list` into structured records.
@@ -295,13 +293,16 @@ fn parse_winget_table(output: &str) -> Vec<WingetPackage> {
         return vec![];
     };
     let header = lines[header_idx];
-    let name_off = find_ci(header, "Name").or_else(|| find_ci(header, "Nome"));
-    let id_off = find_ci(header, "ID").or_else(|| find_ci(header, "Id"));
-    let version_off = find_ci(header, "Version").or_else(|| find_ci(header, "Versão"));
-    let source_off = find_ci(header, "Source").or_else(|| find_ci(header, "Origem"));
-    let (Some(name_off), Some(id_off), Some(version_off), Some(source_off)) =
-        (name_off, id_off, version_off, source_off)
-    else {
+    let Some(&[name_off, id_off, version_off, source_off]) = locate_columns(
+        header,
+        &[
+            &["Name", "Nome"],
+            &["Id"],
+            &["Version", "Versão"],
+            &["Source", "Origem"],
+        ],
+    )
+    .as_deref() else {
         return vec![];
     };
     let version_end = ["Available", "Disponível", "Match", "Correspondência"]
@@ -311,30 +312,27 @@ fn parse_winget_table(output: &str) -> Vec<WingetPackage> {
         .unwrap_or(source_off);
     let offsets = [name_off, id_off, version_off, version_end, source_off];
 
-    let mut packages = Vec::new();
-    for line in &lines[header_idx + 1..] {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("---") || !looks_like_row(line) {
-            continue;
-        }
-        let cols = slice_columns(line, &offsets);
-        if cols[0].is_empty() {
-            continue; // no name at all — not a usable row
-        }
-        packages.push(WingetPackage {
+    table_rows(&lines[header_idx + 1..], &offsets)
+        .map(|cols| WingetPackage {
             name: cols[0].to_string(),
             id: cols[1].to_string(),
-            version: Some(cols[2].to_string()).filter(|s| !s.is_empty()),
-            source: Some(cols[4].to_string()).filter(|s| !s.is_empty()),
-        });
-    }
-    packages
+            version: non_empty(cols[2]),
+            source: non_empty(cols[4]),
+        })
+        .collect()
 }
 
 /// Shared slot the PID of a currently-running child process is published
 /// into, so another thread can look it up and kill it (see
 /// [`kill_process_tree`]). `None` when nothing is running.
 pub type PidSlot = Arc<Mutex<Option<u32>>>;
+
+/// Stores `pid` in `slot`, if there is one.
+fn publish_pid(slot: Option<&PidSlot>, pid: Option<u32>) {
+    if let Some(slot) = slot {
+        *slot.lock().unwrap() = pid;
+    }
+}
 
 /// Runs a command and sends its output lines live through the sender.
 ///
@@ -389,10 +387,7 @@ fn stream_command(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn {name}: {e}"))?;
-
-    if let Some(slot) = pid_slot {
-        *slot.lock().unwrap() = Some(child.id());
-    }
+    publish_pid(pid_slot, Some(child.id()));
 
     let stdout = child.stdout.take().ok_or("No stdout")?;
     let stderr = child.stderr.take().ok_or("No stderr")?;
@@ -402,9 +397,7 @@ fn stream_command(
     forward_lines(stdout, &tx);
     let _ = stderr_handle.join();
     let _ = child.wait();
-    if let Some(slot) = pid_slot {
-        *slot.lock().unwrap() = None;
-    }
+    publish_pid(pid_slot, None);
     Ok(())
 }
 
@@ -583,6 +576,32 @@ pub struct JsonPackage {
 }
 
 impl JsonPackage {
+    /// A winget package entry with no extra install options.
+    fn winget(id: String, name: Option<String>) -> Self {
+        Self {
+            name: name.unwrap_or_else(|| id.clone()),
+            id,
+            command: None,
+            is_script: false,
+            args: Vec::new(),
+            scope: None,
+            locale: None,
+        }
+    }
+
+    /// A script entry; its name doubles as its id.
+    fn script(name: String, command: Vec<String>) -> Self {
+        Self {
+            id: name.clone(),
+            name,
+            command: Some(command),
+            is_script: true,
+            args: Vec::new(),
+            scope: None,
+            locale: None,
+        }
+    }
+
     /// The full `winget` argument list to install this package.
     ///
     /// Only meaningful for non-script entries.
@@ -682,9 +701,8 @@ fn looks_like_manifest(content: &str) -> bool {
 /// Never panics — returns an empty vec on any error.
 #[must_use]
 pub fn find_package_json_files(dir: &Path) -> Vec<std::path::PathBuf> {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return vec![],
+    let Ok(entries) = fs::read_dir(dir) else {
+        return vec![];
     };
 
     let mut files = Vec::new();
@@ -709,68 +727,52 @@ pub fn find_package_json_files(dir: &Path) -> Vec<std::path::PathBuf> {
 /// `winget export` file. Returns an empty vec for anything else.
 #[must_use]
 pub fn load_packages_from_file(path: &Path) -> Vec<JsonPackage> {
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return vec![],
+    let Ok(content) = fs::read_to_string(path) else {
+        return vec![];
     };
 
     // Canonical wgtui manifest (at least one of `packages` / `scripts` present).
     if let Ok(manifest) = serde_json::from_str::<Manifest>(&content)
         && (manifest.packages.is_some() || manifest.scripts.is_some())
     {
-        let mut result = Vec::new();
-        for pkg in manifest.packages.unwrap_or_default() {
-            let name = pkg.name.unwrap_or_else(|| pkg.id.clone());
-            result.push(JsonPackage {
-                id: pkg.id,
-                name,
-                command: None,
-                is_script: false,
-                args: pkg.args,
-                scope: pkg.scope,
-                locale: pkg.locale,
+        let packages = manifest
+            .packages
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| JsonPackage {
+                args: p.args,
+                scope: p.scope,
+                locale: p.locale,
+                ..JsonPackage::winget(p.id, p.name)
             });
-        }
-        for script in manifest.scripts.unwrap_or_default() {
-            result.push(JsonPackage {
-                id: script.name.clone(),
-                name: script.name,
-                command: Some(script.command),
-                is_script: true,
-                args: Vec::new(),
-                scope: None,
-                locale: None,
-            });
-        }
-        return result;
+        let scripts = manifest
+            .scripts
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| JsonPackage::script(s.name, s.command));
+        return packages.chain(scripts).collect();
     }
 
     // winget export import.
     if let Ok(root) = serde_json::from_str::<ExportRoot>(&content) {
-        let mut seen = std::collections::HashSet::new();
-        let mut result = Vec::new();
-        for source in root.sources {
-            for pkg in source.packages {
-                if seen.insert(pkg.package_identifier.clone()) {
-                    let name = pkg
-                        .package_name
-                        .unwrap_or_else(|| pkg.package_identifier.clone());
-                    result.push(JsonPackage {
-                        id: pkg.package_identifier,
-                        name,
-                        command: None,
-                        is_script: false,
-                        args: Vec::new(),
-                        scope: None,
-                        locale: None,
-                    });
-                }
-            }
-        }
-        return result;
+        let packages = root
+            .sources
+            .into_iter()
+            .flat_map(|source| source.packages)
+            .map(|p| JsonPackage::winget(p.package_identifier, p.package_name));
+        return dedup_by_id(packages);
     }
 
     vec![]
+}
+
+/// `packages` with every repeat of an already-seen id dropped, order kept.
+fn dedup_by_id(packages: impl IntoIterator<Item = JsonPackage>) -> Vec<JsonPackage> {
+    let mut seen = std::collections::HashSet::new();
+    packages
+        .into_iter()
+        .filter(|p| seen.insert(p.id.clone()))
+        .collect()
 }
 
 /// Scans `dir` for `*.json` files that match the schemas
@@ -778,25 +780,14 @@ pub fn load_packages_from_file(path: &Path) -> Vec<JsonPackage> {
 /// Never panics — returns an empty vec on any error.
 #[must_use]
 pub fn load_export_packages(dir: &Path) -> Vec<JsonPackage> {
-    let mut seen = std::collections::HashSet::new();
-    let mut result = Vec::new();
-
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return result,
+    let Ok(entries) = fs::read_dir(dir) else {
+        return vec![];
     };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let pkgs = load_packages_from_file(&path);
-        for pkg in pkgs {
-            if seen.insert(pkg.id.clone()) {
-                result.push(pkg);
-            }
-        }
-    }
-
-    result
+    dedup_by_id(
+        entries
+            .flatten()
+            .flat_map(|entry| load_packages_from_file(&entry.path())),
+    )
 }
 
 #[cfg(test)]

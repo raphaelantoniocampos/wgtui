@@ -254,6 +254,141 @@ fn relay_output<F: FnOnce(mpsc::Sender<String>)>(tx: &mpsc::Sender<ActionResult>
     let _ = relay.join();
 }
 
+/// Adds one line to the current run's output.
+fn send_line(tx: &mpsc::Sender<ActionResult>, line: impl Into<String>) {
+    let _ = tx.send(ActionResult::OutputLine(line.into()));
+}
+
+/// Streams `winget <args>` into the current run.
+fn stream_winget(tx: &mpsc::Sender<ActionResult>, args: &[impl AsRef<str>], pid_slot: &PidSlot) {
+    let args: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
+    let mut result = Ok(());
+    relay_output(tx, |lines| {
+        result = run_winget_stdout(&args, lines, Some(pid_slot));
+    });
+    report_failure(tx, result);
+}
+
+/// Adds the error to the run when a command couldn't be started, so a spawn
+/// failure doesn't look like a silent success.
+fn report_failure(tx: &mpsc::Sender<ActionResult>, result: Result<(), String>) {
+    if let Err(e) = result {
+        send_line(tx, format!("error: {e}"));
+    }
+}
+
+/// Streams the program `argv[0]` run with the rest of `argv` into the current
+/// run. An empty `argv` runs nothing.
+fn stream_argv(tx: &mpsc::Sender<ActionResult>, argv: &[String], pid_slot: &PidSlot) {
+    let Some((program, rest)) = argv.split_first() else {
+        return;
+    };
+    let args: Vec<&str> = rest.iter().map(String::as_str).collect();
+    let mut result = Ok(());
+    relay_output(tx, |lines| {
+        result = wgtui::run_command_stdout(program, &args, lines, Some(pid_slot));
+    });
+    report_failure(tx, result);
+}
+
+/// Runs `step` on each item in turn, following each with a blank separator
+/// line, and stops early with a "cancelled" line once `cancel` is set.
+fn for_each_step<T>(
+    tx: &mpsc::Sender<ActionResult>,
+    cancel: &AtomicBool,
+    items: &[T],
+    mut step: impl FnMut(&T),
+) {
+    for item in items {
+        if cancel.load(Ordering::Relaxed) {
+            send_line(tx, "--- cancelled ---");
+            break;
+        }
+        step(item);
+        send_line(tx, "");
+    }
+}
+
+/// Re-reads the installed and upgradable lists after a job changed them.
+fn send_refreshed_lists(tx: &mpsc::Sender<ActionResult>) {
+    let _ = tx.send(ActionResult::RefreshInstalled(list_installed()));
+    let _ = tx.send(ActionResult::UpgradeList(list_upgradable()));
+}
+
+/// A winget subcommand the multi-package jobs run once per id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WingetVerb {
+    Install,
+    Show,
+    Upgrade,
+    Uninstall,
+}
+
+impl WingetVerb {
+    fn name(self) -> &'static str {
+        match self {
+            WingetVerb::Install => "install",
+            WingetVerb::Show => "show",
+            WingetVerb::Upgrade => "upgrade",
+            WingetVerb::Uninstall => "uninstall",
+        }
+    }
+
+    /// The `winget` arguments for `id`. Installs pass no `--scope`, so winget
+    /// picks whatever applies: forcing `machine` used to make installs fail
+    /// outright for packages with no machine-scope installer.
+    fn args(self, id: &str) -> Vec<&str> {
+        let flags: &[&'static str] = match self {
+            WingetVerb::Install | WingetVerb::Upgrade => &[
+                "--silent",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+            ],
+            WingetVerb::Uninstall => &["--silent", "--accept-source-agreements"],
+            WingetVerb::Show => &["--accept-source-agreements"],
+        };
+        [self.name(), id]
+            .into_iter()
+            .chain(flags.iter().copied())
+            .collect()
+    }
+
+    /// Whether running this verb can change what's installed or upgradable,
+    /// so both lists need re-reading afterwards.
+    fn changes_packages(self) -> bool {
+        self != WingetVerb::Show
+    }
+
+    /// The output line that opens one id's section of a run.
+    fn banner(self, id: &str) -> String {
+        match self {
+            WingetVerb::Show => format!("--- {id} ---"),
+            _ => format!("--- {} {id} ---", self.name()),
+        }
+    }
+}
+
+/// Draws a vertical scrollbar (no end arrows) on `area`'s right border for
+/// `total` rows scrolled to `position`.
+fn render_scrollbar(
+    f: &mut Frame<'_>,
+    area: Rect,
+    total: usize,
+    position: usize,
+    thumb: Color,
+    track: Option<Style>,
+) {
+    let mut bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .thumb_style(Style::default().fg(thumb));
+    if let Some(track) = track {
+        bar = bar.track_style(track);
+    }
+    let mut state = ScrollbarState::new(total).position(position);
+    f.render_stateful_widget(bar, area.inner(Margin::new(0, 1)), &mut state);
+}
+
 /// One place for every colour and reusable style, so the UI reads as one system.
 mod theme {
     use ratatui::style::{Color, Modifier, Style};
@@ -288,9 +423,19 @@ mod theme {
 
     /// The row under the cursor.
     pub fn cursor_row() -> Style {
+        chip(ACCENT)
+    }
+
+    /// A key in a hint or prompt (`[y]`, `q`).
+    pub fn key() -> Style {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    }
+
+    /// A solid badge: bold black text on `bg`.
+    pub fn chip(bg: Color) -> Style {
         Style::default()
-            .bg(ACCENT)
             .fg(Color::Black)
+            .bg(bg)
             .add_modifier(Modifier::BOLD)
     }
 
@@ -422,7 +567,7 @@ enum QueuedAction {
     UpgradeAll,
     InstallJsonMulti(Vec<String>),
     RemoveJsonMulti(Vec<String>),
-    ShowJsonPackage(Vec<String>),
+    ShowJsonMulti(Vec<String>),
     RefreshInstalled,
     RefreshUpdates,
     ManualCommand(String),
@@ -445,7 +590,7 @@ impl QueuedAction {
             QueuedAction::InstallMulti(ids) | QueuedAction::InstallJsonMulti(ids) => {
                 ids_label("install", ids)
             }
-            QueuedAction::ShowMulti(ids) | QueuedAction::ShowJsonPackage(ids) => {
+            QueuedAction::ShowMulti(ids) | QueuedAction::ShowJsonMulti(ids) => {
                 ids_label("show", ids)
             }
             QueuedAction::UpgradeMulti(ids) => ids_label("upgrade", ids),
@@ -503,7 +648,7 @@ impl Selection {
     }
 
     fn down(&mut self, len: usize) {
-        if len > 0 && self.cursor + 1 < len {
+        if self.cursor + 1 < len {
             self.cursor += 1;
         }
     }
@@ -642,10 +787,6 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        // Package lists are loaded off-thread (see `begin_initial_load`) so the
-        // first frame paints immediately.
-        let installed = Vec::new();
-        let updates = Vec::new();
         let (tx, rx) = mpsc::channel();
 
         // Discover JSON package files.
@@ -682,9 +823,11 @@ impl App {
             filter_query: String::new(),
             search_results: vec![],
             search_sel: Selection::default(),
-            updates,
+            // Package lists are loaded off-thread (see `begin_initial_load`)
+            // so the first frame paints immediately.
+            updates: vec![],
             updates_sel: Selection::default(),
-            installed,
+            installed: vec![],
             installed_sel: Selection::default(),
             package_files,
             package_file_selected: 0,
@@ -798,12 +941,16 @@ impl App {
 
     fn handle_action_result(&mut self, action: ActionResult) {
         match action {
+            // Marks are row indices: once a list is replaced they would
+            // point at different packages, so every refresh drops them.
             ActionResult::SearchResults(list) => {
                 self.search_results = list;
-                self.search_sel.cursor = 0;
+                self.search_sel.reset();
             }
             ActionResult::UpgradeList(list) => {
                 self.updates = list;
+                self.updates_sel.marked.clear();
+                self.updates_sel.clamp(self.updates.len());
             }
             ActionResult::InitialInstalled(list) => {
                 self.installed = list;
@@ -837,11 +984,11 @@ impl App {
             // whole output with a one-line "refreshed" message.
             ActionResult::RefreshInstalled(list) => {
                 self.installed = list;
-                self.installed_sel.cursor = 0;
+                self.installed_sel.reset();
             }
             ActionResult::RefreshUpdates(list) => {
                 self.updates = list;
-                self.updates_sel.cursor = 0;
+                self.updates_sel.reset();
             }
             ActionResult::OutputLine(line) => {
                 self.push_output_line(&line);
@@ -1136,12 +1283,7 @@ impl App {
 
     /// Number of rows visible in the current tab (after filtering).
     fn filtered_len(&self) -> usize {
-        match self.tab {
-            Tab::Search => self.filtered_search_results().len(),
-            Tab::Updates => self.filtered_updates().len(),
-            Tab::Installed => self.filtered_installed().len(),
-            Tab::Packages => self.filtered_packages().len(),
-        }
+        self.filtered_ids().len()
     }
 
     fn clamp_selected(&mut self) {
@@ -1157,43 +1299,44 @@ impl App {
         self.packages_sel.clamp(p);
     }
 
+    /// Ids of the current tab's visible rows, in display order.
+    fn filtered_ids(&self) -> Vec<&str> {
+        match self.tab {
+            Tab::Search => self
+                .filtered_search_results()
+                .into_iter()
+                .map(|p| p.id.as_str())
+                .collect(),
+            Tab::Updates => self
+                .filtered_updates()
+                .into_iter()
+                .map(|p| p.id.as_str())
+                .collect(),
+            Tab::Installed => self
+                .filtered_installed()
+                .into_iter()
+                .map(|p| p.id.as_str())
+                .collect(),
+            Tab::Packages => self
+                .filtered_packages()
+                .into_iter()
+                .map(|p| p.id.as_str())
+                .collect(),
+        }
+    }
+
     fn selected_ids(&self) -> Vec<String> {
-        let idx = self.sel().active();
+        let ids = self.filtered_ids();
         // winget sometimes reports no Id at all for a package (e.g. a
         // manually-installed app it can't match to a source) — skip those
         // rather than act on an empty id.
-        let pick = |ids: Vec<String>| -> Vec<String> {
-            idx.iter()
-                .filter_map(|&i| ids.get(i).cloned())
-                .filter(|id| !id.is_empty())
-                .collect()
-        };
-        match self.tab {
-            Tab::Search => pick(
-                self.filtered_search_results()
-                    .iter()
-                    .map(|p| p.id.clone())
-                    .collect(),
-            ),
-            Tab::Updates => pick(
-                self.filtered_updates()
-                    .iter()
-                    .map(|p| p.id.clone())
-                    .collect(),
-            ),
-            Tab::Installed => pick(
-                self.filtered_installed()
-                    .iter()
-                    .map(|p| p.id.clone())
-                    .collect(),
-            ),
-            Tab::Packages => pick(
-                self.filtered_packages()
-                    .iter()
-                    .map(|p| p.id.clone())
-                    .collect(),
-            ),
-        }
+        self.sel()
+            .active()
+            .into_iter()
+            .filter_map(|i| ids.get(i))
+            .filter(|id| !id.is_empty())
+            .map(|id| id.to_string())
+            .collect()
     }
 
     fn toggle_selection(&mut self) {
@@ -1229,13 +1372,25 @@ impl App {
 
     /// `winget show` (or script details) for the current selection.
     fn show_selected(&mut self) {
-        let ids = self.selected_ids();
-        if ids.is_empty() {
-            return;
-        }
         match self.tab {
-            Tab::Packages => self.dispatch(QueuedAction::ShowJsonPackage(ids)),
-            _ => self.dispatch(QueuedAction::ShowMulti(ids)),
+            Tab::Packages => self.dispatch_selected(QueuedAction::ShowJsonMulti),
+            _ => self.dispatch_selected(QueuedAction::ShowMulti),
+        }
+    }
+
+    /// Dispatches `action` on the current selection's ids, if there are any.
+    fn dispatch_selected(&mut self, action: fn(Vec<String>) -> QueuedAction) {
+        let ids = self.selected_ids();
+        if !ids.is_empty() {
+            self.dispatch(action(ids));
+        }
+    }
+
+    /// Dispatches `action` on every loaded manifest entry, if there are any.
+    fn dispatch_all_packages(&mut self, action: fn(Vec<String>) -> QueuedAction) {
+        let ids: Vec<String> = self.packages.iter().map(|p| p.id.clone()).collect();
+        if !ids.is_empty() {
+            self.dispatch(action(ids));
         }
     }
 
@@ -1259,14 +1414,14 @@ impl App {
     /// finished) — never while `self.busy` is already true.
     fn start_action(&mut self, action: QueuedAction) {
         match action {
-            QueuedAction::InstallMulti(ids) => self.install_multi_pkg(ids),
-            QueuedAction::ShowMulti(ids) => self.show_multi_pkg(ids),
-            QueuedAction::UpgradeMulti(ids) => self.upgrade_multi_pkg(ids),
-            QueuedAction::RemoveMulti(ids) => self.remove_multi_pkg(ids),
+            QueuedAction::InstallMulti(ids) => self.winget_multi(WingetVerb::Install, ids),
+            QueuedAction::ShowMulti(ids) => self.winget_multi(WingetVerb::Show, ids),
+            QueuedAction::UpgradeMulti(ids) => self.winget_multi(WingetVerb::Upgrade, ids),
+            QueuedAction::RemoveMulti(ids) => self.winget_multi(WingetVerb::Uninstall, ids),
             QueuedAction::UpgradeAll => self.upgrade_all(),
             QueuedAction::InstallJsonMulti(ids) => self.install_json_multi(ids),
             QueuedAction::RemoveJsonMulti(ids) => self.remove_json_multi(ids),
-            QueuedAction::ShowJsonPackage(ids) => self.show_json_package(ids),
+            QueuedAction::ShowJsonMulti(ids) => self.show_json_multi(ids),
             QueuedAction::RefreshInstalled => self.refresh_installed(),
             QueuedAction::RefreshUpdates => self.refresh_updates(),
             QueuedAction::ManualCommand(line) => self.run_manual_command(line),
@@ -1380,22 +1535,7 @@ impl App {
 
         // The queue manager ([Q]) captures all input while focused.
         if self.queue_focused {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.queue_focused = false,
-                KeyCode::Char('j') | KeyCode::Down => {
-                    let n = self.queue.len();
-                    self.queue_sel.down(n);
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.queue_sel.up();
-                }
-                KeyCode::Char('d') => self.remove_queue_item_at_cursor(),
-                KeyCode::Char('D') => self.clear_pending_queue(),
-                KeyCode::Char('J') => self.move_queue_item_down(),
-                KeyCode::Char('K') => self.move_queue_item_up(),
-                KeyCode::Char('x') => self.cancel_running(),
-                _ => {}
-            }
+            self.handle_queue_key(key);
             return;
         }
 
@@ -1522,67 +1662,55 @@ impl App {
         }
     }
 
-    fn handle_search_key(&mut self, key: KeyEvent) {
-        if let KeyCode::Char('i') = key.code {
-            let ids = self.selected_ids();
-            if !ids.is_empty() {
-                self.dispatch(QueuedAction::InstallMulti(ids));
+    /// Keys while the queue manager (`Q`) is focused. Everything unrecognised
+    /// is swallowed.
+    fn handle_queue_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.queue_focused = false,
+            KeyCode::Char('j') | KeyCode::Down => self.queue_sel.down(self.queue.len()),
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.queue_sel.up();
             }
+            KeyCode::Char('d') => self.remove_queue_item_at_cursor(),
+            KeyCode::Char('D') => self.clear_pending_queue(),
+            KeyCode::Char('J') => self.move_queue_item_down(),
+            KeyCode::Char('K') => self.move_queue_item_up(),
+            KeyCode::Char('x') => self.cancel_running(),
+            _ => {}
+        }
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('i') {
+            self.dispatch_selected(QueuedAction::InstallMulti);
         }
     }
 
     fn handle_updates_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('u') => {
-                let ids = self.selected_ids();
-                if !ids.is_empty() {
-                    self.dispatch(QueuedAction::UpgradeMulti(ids));
-                }
-            }
-            KeyCode::Char('U') => {
-                self.dispatch(QueuedAction::UpgradeAll);
-            }
-            KeyCode::Char('w') => {
-                self.dispatch(QueuedAction::InstallWindowsUpdates);
-            }
-            KeyCode::Char('r') => {
-                self.dispatch(QueuedAction::RefreshUpdates);
-            }
+            KeyCode::Char('u') => self.dispatch_selected(QueuedAction::UpgradeMulti),
+            KeyCode::Char('U') => self.dispatch(QueuedAction::UpgradeAll),
+            KeyCode::Char('w') => self.dispatch(QueuedAction::InstallWindowsUpdates),
+            KeyCode::Char('r') => self.dispatch(QueuedAction::RefreshUpdates),
             _ => {}
         }
     }
 
     fn filtered_packages(&self) -> Vec<&JsonPackage> {
-        if self.filter_query.is_empty() {
-            self.packages.iter().collect()
-        } else {
-            self.packages
-                .iter()
-                .filter(|p| {
-                    Self::matches_filter(&p.name, &self.filter_query)
-                        || Self::matches_filter(&p.id, &self.filter_query)
-                })
-                .collect()
-        }
+        self.packages
+            .iter()
+            .filter(|p| {
+                Self::matches_filter(&p.name, &self.filter_query)
+                    || Self::matches_filter(&p.id, &self.filter_query)
+            })
+            .collect()
     }
 
     fn handle_installed_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('x') => {
-                let ids = self.selected_ids();
-                if !ids.is_empty() {
-                    self.dispatch(QueuedAction::RemoveMulti(ids));
-                }
-            }
-            KeyCode::Char('u') | KeyCode::Char('U') => {
-                let ids = self.selected_ids();
-                if !ids.is_empty() {
-                    self.dispatch(QueuedAction::UpgradeMulti(ids));
-                }
-            }
-            KeyCode::Char('r') => {
-                self.dispatch(QueuedAction::RefreshInstalled);
-            }
+            KeyCode::Char('x') => self.dispatch_selected(QueuedAction::RemoveMulti),
+            KeyCode::Char('u' | 'U') => self.dispatch_selected(QueuedAction::UpgradeMulti),
+            KeyCode::Char('r') => self.dispatch(QueuedAction::RefreshInstalled),
             _ => {}
         }
     }
@@ -1625,33 +1753,11 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char('i') => {
-                let ids = self.selected_ids();
-                if !ids.is_empty() {
-                    self.dispatch(QueuedAction::InstallJsonMulti(ids));
-                }
-            }
-            KeyCode::Char('I') => {
-                let all_ids: Vec<String> = self.packages.iter().map(|p| p.id.clone()).collect();
-                if !all_ids.is_empty() {
-                    self.dispatch(QueuedAction::InstallJsonMulti(all_ids));
-                }
-            }
-            KeyCode::Char('x') => {
-                let ids = self.selected_ids();
-                if !ids.is_empty() {
-                    self.dispatch(QueuedAction::RemoveJsonMulti(ids));
-                }
-            }
-            KeyCode::Char('X') => {
-                let all_ids: Vec<String> = self.packages.iter().map(|p| p.id.clone()).collect();
-                if !all_ids.is_empty() {
-                    self.dispatch(QueuedAction::RemoveJsonMulti(all_ids));
-                }
-            }
-            KeyCode::Char('f') | KeyCode::Char('F')
-                if !self.packages_file_picker && self.package_files.len() > 1 =>
-            {
+            KeyCode::Char('i') => self.dispatch_selected(QueuedAction::InstallJsonMulti),
+            KeyCode::Char('I') => self.dispatch_all_packages(QueuedAction::InstallJsonMulti),
+            KeyCode::Char('x') => self.dispatch_selected(QueuedAction::RemoveJsonMulti),
+            KeyCode::Char('X') => self.dispatch_all_packages(QueuedAction::RemoveJsonMulti),
+            KeyCode::Char('f' | 'F') if self.package_files.len() > 1 => {
                 self.packages_file_picker = true;
                 self.packages.clear();
                 self.packages_sel.reset();
@@ -1688,106 +1794,25 @@ impl App {
         });
     }
 
-    fn install_multi_pkg(&mut self, ids: Vec<String>) {
-        let tx = self.action_tx.clone();
-        self.begin_output(format!("winget install {} packages", ids.len()));
-        if let Some(id) = ids.first() {
-            self.set_last_command([
-                "winget",
-                "install",
-                id.as_str(),
-                "--silent",
-                "--accept-package-agreements",
-                "--accept-source-agreements",
-            ]);
+    /// Runs `winget <verb>` for each id in turn, streaming its output, then
+    /// refreshes whichever lists the verb can have changed.
+    fn winget_multi(&mut self, verb: WingetVerb, ids: Vec<String>) {
+        self.begin_output(format!("winget {} {} packages", verb.name(), ids.len()));
+        if verb.changes_packages()
+            && let Some(id) = ids.first()
+        {
+            self.set_last_command(std::iter::once("winget").chain(verb.args(id)));
         }
-        let (pid_slot, cancel) = self.begin_job();
-        thread::spawn(move || {
-            for id in &ids {
-                if cancel.load(Ordering::Relaxed) {
-                    let _ = tx.send(ActionResult::OutputLine("--- cancelled ---".to_string()));
-                    break;
-                }
-                let _ = tx.send(ActionResult::OutputLine(format!("--- install {} ---", id)));
-                // No --scope: let winget pick whatever's applicable. Forcing
-                // `machine` here used to make installs fail outright for
-                // packages with no machine-scope installer.
-                let args = [
-                    "install",
-                    id,
-                    "--silent",
-                    "--accept-package-agreements",
-                    "--accept-source-agreements",
-                ];
-                relay_output(&tx, |lines| {
-                    let _ = run_winget_stdout(&args, lines, Some(&pid_slot));
-                });
-                let _ = tx.send(ActionResult::OutputLine(String::new()));
-            }
-            let _ = tx.send(ActionResult::RefreshInstalled(list_installed()));
-            let updates = list_upgradable();
-            let _ = tx.send(ActionResult::UpgradeList(updates));
-            let _ = tx.send(ActionResult::CommandDone);
-        });
-    }
-
-    fn show_multi_pkg(&mut self, ids: Vec<String>) {
         let tx = self.action_tx.clone();
-        self.begin_output(format!("winget show {} packages", ids.len()));
         let (pid_slot, cancel) = self.begin_job();
         thread::spawn(move || {
-            for id in &ids {
-                if cancel.load(Ordering::Relaxed) {
-                    let _ = tx.send(ActionResult::OutputLine("--- cancelled ---".to_string()));
-                    break;
-                }
-                let _ = tx.send(ActionResult::OutputLine(format!("--- {} ---", id)));
-                let args = ["show", id, "--accept-source-agreements"];
-                relay_output(&tx, |lines| {
-                    let _ = run_winget_stdout(&args, lines, Some(&pid_slot));
-                });
-                let _ = tx.send(ActionResult::OutputLine(String::new()));
+            for_each_step(&tx, &cancel, &ids, |id| {
+                send_line(&tx, verb.banner(id));
+                stream_winget(&tx, &verb.args(id), &pid_slot);
+            });
+            if verb.changes_packages() {
+                send_refreshed_lists(&tx);
             }
-            let _ = tx.send(ActionResult::CommandDone);
-        });
-    }
-
-    fn upgrade_multi_pkg(&mut self, ids: Vec<String>) {
-        let tx = self.action_tx.clone();
-        self.begin_output(format!("winget upgrade {} packages", ids.len()));
-        if let Some(id) = ids.first() {
-            self.set_last_command([
-                "winget",
-                "upgrade",
-                id.as_str(),
-                "--silent",
-                "--accept-package-agreements",
-                "--accept-source-agreements",
-            ]);
-        }
-        let (pid_slot, cancel) = self.begin_job();
-        thread::spawn(move || {
-            for id in &ids {
-                if cancel.load(Ordering::Relaxed) {
-                    let _ = tx.send(ActionResult::OutputLine("--- cancelled ---".to_string()));
-                    break;
-                }
-                let _ = tx.send(ActionResult::OutputLine(format!("--- upgrade {} ---", id)));
-                let args = [
-                    "upgrade",
-                    id,
-                    "--silent",
-                    "--accept-package-agreements",
-                    "--accept-source-agreements",
-                ];
-                relay_output(&tx, |lines| {
-                    let _ = run_winget_stdout(&args, lines, Some(&pid_slot));
-                });
-                let _ = tx.send(ActionResult::OutputLine(String::new()));
-            }
-            let updates = list_upgradable();
-            let _ = tx.send(ActionResult::UpgradeList(updates));
-            let _ = tx.send(ActionResult::RefreshInstalled(list_installed()));
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
@@ -1806,45 +1831,10 @@ impl App {
         let (pid_slot, _cancel) = self.begin_job();
         thread::spawn(move || {
             let script = wgtui::windows_update_install_script();
-            let _ = tx.send(ActionResult::OutputLine(windows_update_echo()));
+            send_line(&tx, windows_update_echo());
             relay_output(&tx, |lines| {
                 let _ = wgtui::run_powershell_stdout(&script, lines, Some(&pid_slot));
             });
-            let _ = tx.send(ActionResult::CommandDone);
-        });
-    }
-
-    fn remove_multi_pkg(&mut self, ids: Vec<String>) {
-        let tx = self.action_tx.clone();
-        self.begin_output(format!("winget uninstall {} packages", ids.len()));
-        if let Some(id) = ids.first() {
-            self.set_last_command([
-                "winget",
-                "uninstall",
-                id.as_str(),
-                "--silent",
-                "--accept-source-agreements",
-            ]);
-        }
-        let (pid_slot, cancel) = self.begin_job();
-        thread::spawn(move || {
-            for id in &ids {
-                if cancel.load(Ordering::Relaxed) {
-                    let _ = tx.send(ActionResult::OutputLine("--- cancelled ---".to_string()));
-                    break;
-                }
-                let _ = tx.send(ActionResult::OutputLine(format!(
-                    "--- uninstall {} ---",
-                    id
-                )));
-                let args = ["uninstall", id, "--silent", "--accept-source-agreements"];
-                relay_output(&tx, |lines| {
-                    let _ = run_winget_stdout(&args, lines, Some(&pid_slot));
-                });
-                let _ = tx.send(ActionResult::OutputLine(String::new()));
-            }
-            let list = list_installed();
-            let _ = tx.send(ActionResult::RefreshInstalled(list));
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
@@ -1859,162 +1849,117 @@ impl App {
         );
         let (pid_slot, _cancel) = self.begin_job();
         thread::spawn(move || {
-            let cmd = "winget upgrade --all --include-unknown".to_string();
+            let command = "winget upgrade --all --include-unknown".to_string();
             match upgrade_all_packages(Some(&pid_slot)) {
-                Ok(msg) => {
-                    let _ = tx.send(ActionResult::SetCommand {
-                        command: cmd,
-                        output: msg.clone(),
-                    });
-                    let updates = list_upgradable();
-                    let _ = tx.send(ActionResult::UpgradeList(updates));
-                    let _ = tx.send(ActionResult::RefreshInstalled(list_installed()));
+                Ok(output) => {
+                    let _ = tx.send(ActionResult::SetCommand { command, output });
+                    send_refreshed_lists(&tx);
                 }
-                Err(msg) => {
-                    let _ = tx.send(ActionResult::SetError {
-                        command: cmd,
-                        error: msg,
-                    });
+                Err(error) => {
+                    let _ = tx.send(ActionResult::SetError { command, error });
                 }
             }
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
 
-    fn install_json_multi(&mut self, ids: Vec<String>) {
-        let tx = self.action_tx.clone();
-        self.begin_output(format!("install/run {} apps/scripts", ids.len()));
-        if let Some(seed) = ids
-            .first()
-            .and_then(|id| self.packages.iter().find(|p| &p.id == id))
-            .map(|pkg| {
-                if pkg.is_script {
-                    pkg.command.clone().unwrap_or_default().join(" ")
-                } else {
-                    format!("winget {}", pkg.install_args().join(" "))
-                }
-            })
-        {
-            self.last_command = Some(seed);
-        }
-        let (pid_slot, cancel) = self.begin_job();
-        let tx_clone = tx.clone();
-        let packages_clone = self.packages.clone();
-        thread::spawn(move || {
-            for id in &ids {
-                if cancel.load(Ordering::Relaxed) {
-                    let _ = tx.send(ActionResult::OutputLine("--- cancelled ---".to_string()));
-                    break;
-                }
-                if let Some(pkg) = packages_clone.iter().find(|p| p.id == *id) {
-                    if pkg.is_script {
-                        let _ = tx.send(ActionResult::OutputLine(format!(
-                            "--- run script: {} ---",
-                            pkg.name
-                        )));
-                        if let Some(ref cmd_args) = pkg.command
-                            && !cmd_args.is_empty()
-                        {
-                            let cmd = &cmd_args[0];
-                            let args: Vec<&str> =
-                                cmd_args[1..].iter().map(|s| s.as_str()).collect();
-                            relay_output(&tx, |lines| {
-                                let _ =
-                                    wgtui::run_command_stdout(cmd, &args, lines, Some(&pid_slot));
-                            });
-                        }
-                    } else {
-                        let args = pkg.install_args();
-                        let _ = tx.send(ActionResult::OutputLine(format!(
-                            "--- winget {} ---",
-                            args.join(" ")
-                        )));
-                        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                        relay_output(&tx, |lines| {
-                            let _ = run_winget_stdout(&arg_refs, lines, Some(&pid_slot));
-                        });
-                    }
-                    let _ = tx.send(ActionResult::OutputLine(String::new()));
-                }
+    /// The manifest entries for `ids`, in order, and the ids that are no
+    /// longer loaded.
+    fn packages_for(&self, ids: &[String]) -> (Vec<JsonPackage>, Vec<String>) {
+        let mut found = Vec::new();
+        let mut missing = Vec::new();
+        for id in ids {
+            match self.packages.iter().find(|p| &p.id == id) {
+                Some(pkg) => found.push(pkg.clone()),
+                None => missing.push(id.clone()),
             }
-            let _ = tx_clone.send(ActionResult::RefreshInstalled(list_installed()));
-            let updates = list_upgradable();
-            let _ = tx_clone.send(ActionResult::UpgradeList(updates));
+        }
+        (found, missing)
+    }
+
+    /// [`Self::packages_for`], noting in the current run every id that's
+    /// no longer loaded (e.g. `f` switched manifests while the job was
+    /// queued) instead of dropping it silently.
+    fn resolve_packages(&mut self, ids: &[String]) -> Vec<JsonPackage> {
+        let (found, missing) = self.packages_for(ids);
+        for id in missing {
+            self.push_output_line(&format!("--- skipped {id}: not in the loaded manifest ---"));
+        }
+        found
+    }
+
+    fn install_json_multi(&mut self, ids: Vec<String>) {
+        self.begin_output(format!("install/run {} apps/scripts", ids.len()));
+        let packages = self.resolve_packages(&ids);
+        if let Some(pkg) = packages.first() {
+            self.last_command = Some(if pkg.is_script {
+                pkg.command.clone().unwrap_or_default().join(" ")
+            } else {
+                format!("winget {}", pkg.install_args().join(" "))
+            });
+        }
+        let tx = self.action_tx.clone();
+        let (pid_slot, cancel) = self.begin_job();
+        thread::spawn(move || {
+            for_each_step(&tx, &cancel, &packages, |pkg| {
+                if pkg.is_script {
+                    send_line(&tx, format!("--- run script: {} ---", pkg.name));
+                    if let Some(argv) = &pkg.command {
+                        stream_argv(&tx, argv, &pid_slot);
+                    }
+                } else {
+                    let args = pkg.install_args();
+                    send_line(&tx, format!("--- winget {} ---", args.join(" ")));
+                    stream_winget(&tx, &args, &pid_slot);
+                }
+            });
+            send_refreshed_lists(&tx);
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
 
     fn remove_json_multi(&mut self, ids: Vec<String>) {
-        let tx = self.action_tx.clone();
-        let tx_refresh = tx.clone();
         self.begin_output(format!("uninstall/remove {} apps/scripts", ids.len()));
+        let packages = self.resolve_packages(&ids);
+        let tx = self.action_tx.clone();
         let (pid_slot, cancel) = self.begin_job();
-        let packages_clone = self.packages.clone();
         thread::spawn(move || {
-            for id in &ids {
-                if cancel.load(Ordering::Relaxed) {
-                    let _ = tx.send(ActionResult::OutputLine("--- cancelled ---".to_string()));
-                    break;
-                }
-                if let Some(pkg) = packages_clone.iter().find(|p| p.id == *id) {
-                    if pkg.is_script {
-                        let _ = tx.send(ActionResult::OutputLine(format!(
+            for_each_step(&tx, &cancel, &packages, |pkg| {
+                if pkg.is_script {
+                    send_line(
+                        &tx,
+                        format!(
                             "--- remove/uninstall not supported for script: {} ---",
                             pkg.name
-                        )));
-                    } else {
-                        let _ = tx.send(ActionResult::OutputLine(format!(
-                            "--- uninstall {} ---",
-                            id
-                        )));
-                        let args = ["uninstall", id, "--silent", "--accept-source-agreements"];
-                        relay_output(&tx, |lines| {
-                            let _ = run_winget_stdout(&args, lines, Some(&pid_slot));
-                        });
-                    }
-                    let _ = tx.send(ActionResult::OutputLine(String::new()));
+                        ),
+                    );
+                } else {
+                    send_line(&tx, WingetVerb::Uninstall.banner(&pkg.id));
+                    stream_winget(&tx, &WingetVerb::Uninstall.args(&pkg.id), &pid_slot);
                 }
-            }
-            let _ = tx_refresh.send(ActionResult::RefreshInstalled(list_installed()));
-            let updates = list_upgradable();
-            let _ = tx_refresh.send(ActionResult::UpgradeList(updates));
+            });
+            send_refreshed_lists(&tx);
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
 
-    fn show_json_package(&mut self, ids: Vec<String>) {
-        let tx = self.action_tx.clone();
+    fn show_json_multi(&mut self, ids: Vec<String>) {
         self.begin_output(format!("show {} apps/scripts", ids.len()));
+        let packages = self.resolve_packages(&ids);
+        let tx = self.action_tx.clone();
         let (pid_slot, cancel) = self.begin_job();
-        let packages_clone = self.packages.clone();
         thread::spawn(move || {
-            for id in &ids {
-                if cancel.load(Ordering::Relaxed) {
-                    let _ = tx.send(ActionResult::OutputLine("--- cancelled ---".to_string()));
-                    break;
-                }
-                if let Some(pkg) = packages_clone.iter().find(|p| p.id == *id) {
-                    if pkg.is_script {
-                        let _ = tx.send(ActionResult::OutputLine(format!(
-                            "--- script: {} ---",
-                            pkg.name
-                        )));
-                        if let Some(ref cmd_args) = pkg.command {
-                            let _ = tx.send(ActionResult::OutputLine(format!(
-                                "Command: {}",
-                                cmd_args.join(" ")
-                            )));
-                        }
-                    } else {
-                        let _ = tx.send(ActionResult::OutputLine(format!("--- {} ---", id)));
-                        let args = ["show", id, "--accept-source-agreements"];
-                        relay_output(&tx, |lines| {
-                            let _ = run_winget_stdout(&args, lines, Some(&pid_slot));
-                        });
+            for_each_step(&tx, &cancel, &packages, |pkg| {
+                if pkg.is_script {
+                    send_line(&tx, format!("--- script: {} ---", pkg.name));
+                    if let Some(argv) = &pkg.command {
+                        send_line(&tx, format!("Command: {}", argv.join(" ")));
                     }
-                    let _ = tx.send(ActionResult::OutputLine(String::new()));
+                } else {
+                    send_line(&tx, WingetVerb::Show.banner(&pkg.id));
+                    stream_winget(&tx, &WingetVerb::Show.args(&pkg.id), &pid_slot);
                 }
-            }
+            });
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
@@ -2072,16 +2017,9 @@ impl App {
         let tx = self.action_tx.clone();
         let (pid_slot, _cancel) = self.begin_job();
         thread::spawn(move || {
-            let _ = tx.send(ActionResult::OutputLine(format!(
-                "--- {} ---",
-                argv.join(" ")
-            )));
-            let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
-            relay_output(&tx, |lines| {
-                let _ = wgtui::run_command_stdout(&argv[0], &args, lines, Some(&pid_slot));
-            });
-            let _ = tx.send(ActionResult::RefreshInstalled(list_installed()));
-            let _ = tx.send(ActionResult::UpgradeList(list_upgradable()));
+            send_line(&tx, format!("--- {} ---", argv.join(" ")));
+            stream_argv(&tx, &argv, &pid_slot);
+            send_refreshed_lists(&tx);
             let _ = tx.send(ActionResult::CommandDone);
         });
     }
@@ -2089,6 +2027,11 @@ impl App {
     // -----------------------------------------------------------------------
     // Rendering
     // -----------------------------------------------------------------------
+
+    /// The spinner glyph for the current animation frame.
+    fn spinner(&self) -> &'static str {
+        SPINNER[self.spinner_frame as usize % SPINNER.len()]
+    }
 
     fn render(&self, f: &mut Frame<'_>) {
         let rows = Layout::vertical([
@@ -2117,9 +2060,7 @@ impl App {
 
     /// Centered "Quit wgtui?" modal opened by `q`/`Esc`.
     fn render_quit_confirm(&self, f: &mut Frame<'_>, area: Rect) {
-        let key = Style::default()
-            .fg(theme::ACCENT)
-            .add_modifier(Modifier::BOLD);
+        let key = theme::key();
         let mut lines = vec![Line::from(""), Line::from("Quit wgtui?")];
         if self.running_job.is_some() || !self.queue.is_empty() {
             lines.push(Line::from(
@@ -2133,7 +2074,11 @@ impl App {
             Span::styled("[n/esc]", key),
             Span::raw(" stay"),
         ]));
+        Self::render_modal(f, area, " Quit ", lines);
+    }
 
+    /// Draws `lines` centered in a bordered popup over the middle of `area`.
+    fn render_modal(f: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_>>) {
         let width = 64.min(area.width);
         let height = (lines.len() as u16 + 2).min(area.height);
         let popup = Rect {
@@ -2151,7 +2096,7 @@ impl App {
                     Block::bordered()
                         .border_type(BorderType::Rounded)
                         .border_style(theme::border(true))
-                        .title(Span::styled(" Quit ", theme::title(true))),
+                        .title(Span::styled(title, theme::title(true))),
                 ),
             popup,
         );
@@ -2159,9 +2104,7 @@ impl App {
 
     /// Centered modal for the self-update flow.
     fn render_update_prompt(&self, f: &mut Frame<'_>, area: Rect) {
-        let key = Style::default()
-            .fg(theme::ACCENT)
-            .add_modifier(Modifier::BOLD);
+        let key = theme::key();
         let current = env!("CARGO_PKG_VERSION");
         let (title, mut lines): (&str, Vec<Line>) = match &self.update {
             UpdateState::Available(tag) => (
@@ -2180,10 +2123,7 @@ impl App {
             UpdateState::Downloading(tag) => (
                 " Updating ",
                 vec![
-                    Line::from(format!(
-                        "{} Downloading {tag}…",
-                        SPINNER[self.spinner_frame as usize % SPINNER.len()]
-                    )),
+                    Line::from(format!("{} Downloading {tag}…", self.spinner())),
                     Line::from(""),
                     Line::from(vec![Span::styled("[esc]", key), Span::raw(" hide")]),
                 ],
@@ -2212,28 +2152,7 @@ impl App {
             UpdateState::Idle => return,
         };
         lines.insert(0, Line::from(""));
-
-        let width = 64.min(area.width);
-        let height = (lines.len() as u16 + 2).min(area.height);
-        let popup = Rect {
-            x: area.x + (area.width - width) / 2,
-            y: area.y + (area.height - height) / 2,
-            width,
-            height,
-        };
-        f.render_widget(Clear, popup);
-        f.render_widget(
-            Paragraph::new(lines)
-                .alignment(Alignment::Center)
-                .wrap(ratatui::widgets::Wrap { trim: true })
-                .block(
-                    Block::bordered()
-                        .border_type(BorderType::Rounded)
-                        .border_style(theme::border(true))
-                        .title(Span::styled(title, theme::title(true))),
-                ),
-            popup,
-        );
+        Self::render_modal(f, area, title, lines);
     }
 
     fn render_tabs(&self, f: &mut Frame<'_>, area: Rect) {
@@ -2244,19 +2163,12 @@ impl App {
                     .border_style(theme::border(false))
                     .title(Span::styled(
                         concat!(" wgtui v", env!("CARGO_PKG_VERSION"), " "),
-                        Style::default()
-                            .fg(theme::ACCENT)
-                            .add_modifier(Modifier::BOLD),
+                        theme::key(),
                     ))
                     .title_alignment(Alignment::Center),
             )
             .style(theme::dim())
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(theme::ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .highlight_style(theme::chip(theme::ACCENT))
             .divider(Span::styled("│", theme::dim()))
             .select(self.tab as usize);
         f.render_widget(tabs, area);
@@ -2360,25 +2272,23 @@ impl App {
         f.render_stateful_widget(table, area, &mut ts);
 
         if shown > area.height.saturating_sub(4) as usize {
-            let mut sb = ScrollbarState::new(shown).position(sel.cursor);
-            f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(None)
-                    .end_symbol(None)
-                    .thumb_style(Style::default().fg(theme::ACCENT))
-                    .track_style(theme::dim()),
-                area.inner(Margin::new(0, 1)),
-                &mut sb,
+            render_scrollbar(
+                f,
+                area,
+                shown,
+                sel.cursor,
+                theme::ACCENT,
+                Some(theme::dim()),
             );
         }
     }
 
-    /// One-cell gutter: `●` when the row is multi-selected, else `fallback`.
-    fn gutter(marked: bool, fallback: &'static str) -> Cell<'static> {
+    /// One-cell gutter: `●` when the row is multi-selected, else `glyph`.
+    fn gutter(marked: bool, glyph: &'static str, style: Style) -> Cell<'static> {
         if marked {
             Cell::from(Span::styled("●", Style::default().fg(theme::MARK)))
         } else {
-            Cell::from(Span::styled(fallback, theme::dim()))
+            Cell::from(Span::styled(glyph, style))
         }
     }
 
@@ -2389,7 +2299,7 @@ impl App {
             .enumerate()
             .map(|(i, p)| {
                 Row::new(vec![
-                    Self::gutter(self.search_sel.marked.contains(&i), " "),
+                    Self::gutter(self.search_sel.marked.contains(&i), " ", theme::dim()),
                     Cell::from(p.name.clone()),
                     Cell::from(Span::styled(p.id.clone(), theme::dim())),
                     Cell::from(Span::styled(
@@ -2429,7 +2339,7 @@ impl App {
             .enumerate()
             .map(|(i, p)| {
                 Row::new(vec![
-                    Self::gutter(self.updates_sel.marked.contains(&i), " "),
+                    Self::gutter(self.updates_sel.marked.contains(&i), " ", theme::dim()),
                     Cell::from(p.name.clone()),
                     Cell::from(Span::styled(p.installed_version.clone(), theme::dim())),
                     Cell::from(Span::styled("→", Style::default().fg(theme::ACCENT))),
@@ -2471,7 +2381,7 @@ impl App {
             .enumerate()
             .map(|(i, p)| {
                 Row::new(vec![
-                    Self::gutter(self.installed_sel.marked.contains(&i), " "),
+                    Self::gutter(self.installed_sel.marked.contains(&i), " ", theme::dim()),
                     Cell::from(p.name.clone()),
                     Cell::from(Span::styled(p.id.clone(), theme::dim())),
                     Cell::from(Span::styled(
@@ -2538,13 +2448,8 @@ impl App {
                 } else {
                     ("·", theme::dim())
                 };
-                let gutter = if marked {
-                    Cell::from(Span::styled("●", Style::default().fg(theme::MARK)))
-                } else {
-                    Cell::from(Span::styled(glyph, gstyle))
-                };
                 Row::new(vec![
-                    gutter,
+                    Self::gutter(marked, glyph, gstyle),
                     Cell::from(pkg.name.clone()),
                     Cell::from(Span::styled(
                         if pkg.is_script {
@@ -2621,8 +2526,6 @@ impl App {
         f.render_stateful_widget(table, area, &mut ts);
     }
 
-    /// The bottom panel: the running command as the pane title, its live output
-    /// as the body. Doubles as the `[c]` command editor.
     /// The bottom panel: just the command/output pane when the queue is
     /// empty, idle, and unfocused (pixel-identical to before this feature);
     /// otherwise a compact queue strip above it.
@@ -2674,16 +2577,11 @@ impl App {
 
         let mut lines: Vec<Line> = Vec::new();
         if self.running_job.is_some() {
-            let icon = SPINNER[self.spinner_frame as usize % SPINNER.len()];
+            let icon = self.spinner();
             let cmd = self.current_command.as_deref().unwrap_or("running…");
             lines.push(Line::from(vec![
                 Span::styled(format!("{icon} "), Style::default().fg(theme::ACCENT)),
-                Span::styled(
-                    cmd.to_string(),
-                    Style::default()
-                        .fg(theme::ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(cmd.to_string(), theme::key()),
             ]));
         }
         if self.queue.is_empty() && self.running_job.is_none() {
@@ -2714,15 +2612,7 @@ impl App {
         f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), inner);
 
         if total > h {
-            let mut sb = ScrollbarState::new(total).position(scroll);
-            f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(None)
-                    .end_symbol(None)
-                    .thumb_style(Style::default().fg(theme::ACCENT)),
-                area.inner(Margin::new(0, 1)),
-                &mut sb,
-            );
+            render_scrollbar(f, area, total, scroll, theme::ACCENT, None);
         }
     }
 
@@ -2738,13 +2628,7 @@ impl App {
             let mut rest = input.chars().skip(cur);
             let at_cursor = rest.next().map_or(" ".to_string(), String::from);
             Line::from(vec![
-                Span::styled(
-                    " edit ",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(theme::WARN)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(" edit ", theme::chip(theme::WARN)),
                 Span::raw(" "),
                 Span::styled(input.chars().take(cur).collect::<String>(), text),
                 Span::styled(at_cursor, text.add_modifier(Modifier::REVERSED)),
@@ -2756,19 +2640,12 @@ impl App {
             Line::from(vec![
                 Span::styled(
                     format!(" history {pos}/{} ", self.output_history.len()),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(theme::ACCENT)
-                        .add_modifier(Modifier::BOLD),
+                    theme::chip(theme::ACCENT),
                 ),
                 Span::styled(format!(" {} ", run.command), theme::title(true)),
             ])
         } else {
-            let icon = if busy {
-                SPINNER[self.spinner_frame as usize % SPINNER.len()]
-            } else {
-                "❯"
-            };
+            let icon = if busy { self.spinner() } else { "❯" };
             let cmd = if busy && self.current_command.is_none() {
                 "loading package lists…".to_string()
             } else {
@@ -2842,22 +2719,12 @@ impl App {
         f.render_widget(Paragraph::new(body), inner);
 
         if total > h {
-            let mut sb = ScrollbarState::new(total).position(scroll);
-            f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(None)
-                    .end_symbol(None)
-                    .thumb_style(Style::default().fg(theme::MUTED)),
-                area.inner(Margin::new(0, 1)),
-                &mut sb,
-            );
+            render_scrollbar(f, area, total, scroll, theme::MUTED, None);
         }
     }
 
     fn render_status_bar(&self, f: &mut Frame<'_>, area: Rect) {
-        let key = Style::default()
-            .fg(theme::ACCENT)
-            .add_modifier(Modifier::BOLD);
+        let key = theme::key();
         let push_hint = |spans: &mut Vec<Span<'static>>, k: &'static str, d: &'static str| {
             spans.push(Span::styled(format!("  {k}"), key));
             spans.push(Span::styled(format!(" {d}"), theme::dim()));
@@ -2903,12 +2770,7 @@ impl App {
                     format!(" queue·{}", self.queue.len())
                 };
                 left.push(Span::styled("  Q", key));
-                left.push(Span::styled(
-                    label,
-                    Style::default()
-                        .fg(theme::ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ));
+                left.push(Span::styled(label, theme::key()));
             }
         }
 
@@ -2921,24 +2783,12 @@ impl App {
             _ => None,
         };
         if let Some(chip) = update_chip {
-            right.push(Span::styled(
-                chip,
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(theme::ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            right.push(Span::styled(chip, theme::chip(theme::ACCENT)));
         }
         if let Some(hint) = elevation_warning(self.elevated) {
-            right.push(Span::styled(
-                hint,
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(theme::WARN)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            right.push(Span::styled(hint, theme::chip(theme::WARN)));
         }
-        right.push(Span::styled("  Q", key));
+        right.push(Span::styled("  q", key));
         right.push(Span::styled(" quit  ", theme::dim()));
 
         let rw: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
@@ -3108,6 +2958,72 @@ mod tests {
             scope: None,
             locale: None,
         }
+    }
+
+    #[test]
+    fn list_refreshes_drop_stale_marks() {
+        // Marks are row indices: once a list is replaced they point at
+        // different packages, so acting on them would hit the wrong ones.
+        let mut app = App::new();
+        app.installed = vec![wpkg("a"), wpkg("b"), wpkg("c")];
+        app.installed_sel.marked = [0, 2].into_iter().collect();
+        app.handle_action_result(ActionResult::RefreshInstalled(vec![wpkg("b")]));
+        assert!(app.installed_sel.marked.is_empty());
+
+        app.updates = vec![upkg("a"), upkg("b"), upkg("c")];
+        app.updates_sel.marked = [1].into_iter().collect();
+        app.updates_sel.cursor = 2;
+        app.handle_action_result(ActionResult::UpgradeList(vec![upkg("c")]));
+        assert!(app.updates_sel.marked.is_empty());
+        assert_eq!(app.updates_sel.cursor, 0, "cursor clamped to the new list");
+
+        app.updates_sel.marked = [0].into_iter().collect();
+        app.handle_action_result(ActionResult::RefreshUpdates(vec![upkg("d")]));
+        assert!(app.updates_sel.marked.is_empty());
+
+        app.search_sel.marked = [0].into_iter().collect();
+        app.handle_action_result(ActionResult::SearchResults(vec![wpkg("e")]));
+        assert!(app.search_sel.marked.is_empty());
+    }
+
+    #[test]
+    fn every_changing_winget_verb_refreshes_both_lists() {
+        // An uninstalled package must also leave the Updates tab.
+        assert!(WingetVerb::Install.changes_packages());
+        assert!(WingetVerb::Upgrade.changes_packages());
+        assert!(WingetVerb::Uninstall.changes_packages());
+        assert!(!WingetVerb::Show.changes_packages());
+    }
+
+    #[test]
+    fn stream_argv_reports_a_program_that_fails_to_start() {
+        let (tx, rx) = mpsc::channel();
+        let pid_slot = PidSlot::default();
+        stream_argv(&tx, &["wgtui-no-such-program-xyz".to_string()], &pid_slot);
+        drop(tx);
+        let lines: Vec<String> = rx
+            .try_iter()
+            .filter_map(|r| match r {
+                ActionResult::OutputLine(l) => Some(l),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("wgtui-no-such-program-xyz")),
+            "spawn failure must be visible, got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn packages_for_reports_ids_no_longer_loaded() {
+        let mut app = App::new();
+        app.packages = vec![jpkg("a")];
+        let (found, missing) = app.packages_for(&["a.a".to_string(), "gone".to_string()]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "a.a");
+        assert_eq!(missing, vec!["gone".to_string()]);
     }
 
     #[test]

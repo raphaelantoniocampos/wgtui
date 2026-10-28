@@ -5,7 +5,7 @@
 //! the same way the rest of the app shells out to `winget`/`powershell` —
 //! no HTTP dependency. The decision logic (version comparison, URL parsing,
 //! download validation, the exe swap) is pure and unit-tested; only
-//! `latest_release_tag` and `download_release` touch the network.
+//! `latest_release_tag` and `download_and_install` touch the network.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
